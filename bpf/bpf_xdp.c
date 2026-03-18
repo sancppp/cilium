@@ -186,6 +186,8 @@ int tail_lb_ipv4(struct __ctx_buff *ctx)
 no_encap:
 #endif /* ENABLE_DSR && !ENABLE_DSR_BYUSER && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE */
 
+		// check完成后，调用nodeport_lb4
+
 		ret = nodeport_lb4(ctx, ip4, l3_off, UNKNOWN_ID, &punt_to_stack, &ext_err, &is_dsr);
 	}
 

@@ -2918,6 +2918,7 @@ static __always_inline int nodeport_svc_lb4(struct __ctx_buff *ctx,
 	}
 
 	/* TX request to remote backend: */
+	// 目的地是远端node的请求，转发到远端node，可能有DSR
 	edt_set_aggregate(ctx, 0);
 	if (nodeport_uses_dsr4(svc)) {
 #if DSR_ENCAP_MODE == DSR_ENCAP_IPIP
@@ -2990,6 +2991,7 @@ skip_service_lookup:
 	 * packet from a remote backend, in which case we need to perform
 	 * the reverse NAT.
 	 */
+	 // 目的地不是svc，说明是来自其他node中pod的响应流量，需要进行反向SNAT
 	ctx_set_xfer(ctx, XFER_PKT_NO_SVC);
 
 #ifdef ENABLE_DSR

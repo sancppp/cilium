@@ -103,7 +103,7 @@ func PluginMain(opts ...Option) {
 	logger := logging.DefaultSlogLogger.With(logfields.LogSubsys, "cilium-cni")
 	cmd := &Cmd{
 		logger:  logger,
-		version: "Cilium CNI plugin " + version.Version,
+		version: "tzx's Cilium CNI plugin " + version.Version,
 		cfg:     &DefaultConfigurator{},
 	}
 	for _, opt := range opts {
