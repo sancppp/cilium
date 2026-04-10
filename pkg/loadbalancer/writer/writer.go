@@ -385,17 +385,29 @@ func (w *Writer) RefreshFrontends(txn WriteTxn, name loadbalancer.ServiceName) e
 	return nil
 }
 
+func matchesFrontend(be *loadbalancer.Backend, fe *loadbalancer.Frontend) bool {
+	if fe == nil {
+		return true
+	}
+	if fe.Address.Protocol() != be.Address.Protocol() {
+		return false
+	}
+	if be.Address.IsIPv6() != fe.Address.IsIPv6() {
+		return false
+	}
+	if fe.PortName != "" && len(be.PortNames) > 0 {
+		if !slices.Contains(be.PortNames, string(fe.PortName)) {
+			return false
+		}
+	}
+	return true
+}
+
 func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadbalancer.Backend, statedb.Revision], svc *loadbalancer.Service, fe *loadbalancer.Frontend) iter.Seq2[*loadbalancer.Backend, statedb.Revision] {
 	onlyLocal := false
-	ipv4, ipv6 := true, true
 	isLocalProxyDelegation := func(loadbalancer.L3n4Addr) bool { return true }
 	if fe != nil {
 		onlyLocal = shouldUseLocalBackends(fe)
-		if fe.Address.IsIPv6() {
-			ipv4, ipv6 = false, true
-		} else {
-			ipv4, ipv6 = true, false
-		}
 	} else {
 		onlyLocal = svc.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal
 
@@ -405,6 +417,37 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 			if node, _, found := w.nodes.Get(txn, node.LocalNodeQuery); found {
 				isLocalProxyDelegation = func(addr loadbalancer.L3n4Addr) bool {
 					return node.IsNodeIP(addr.Addr()) != ""
+				}
+			}
+		}
+	}
+
+	// Check for preferSameNode first
+	if w.config.EnableServiceTopology && fe != nil && fe.Service.TrafficDistribution == loadbalancer.TrafficDistributionPreferSameNode {
+		candidatesFound := false
+		for be := range bes {
+			if be.NodeName != w.nodeName {
+				continue
+			}
+			if !matchesFrontend(be, fe) {
+				continue
+			}
+			candidatesFound = true
+			break
+		}
+
+		if candidatesFound {
+			return func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+				for be, rev := range bes {
+					if be.NodeName != w.nodeName {
+						continue
+					}
+					if !matchesFrontend(be, fe) {
+						continue
+					}
+					if !yield(be, rev) {
+						return
+					}
 				}
 			}
 		}
@@ -422,12 +465,25 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 	if w.config.EnableServiceTopology &&
 		thisZone != nil &&
 		fe != nil && fe.RedirectTo == nil &&
-		fe.Service.TrafficDistribution == loadbalancer.TrafficDistributionPreferClose {
+		(fe.Service.TrafficDistribution == loadbalancer.TrafficDistributionPreferClose ||
+			fe.Service.TrafficDistribution == loadbalancer.TrafficDistributionPreferSameZone) {
 		// Topology-aware routing enabled. See if we can find any backends fitting
 		// for our zone. If we don't find any we fall back to default behaviour.
 		// https://kubernetes.io/docs/concepts/services-networking/topology-aware-routing/#safeguards
 		candidatesFound, missingHints := false, false
 		for be := range bes {
+			if !matchesFrontend(be, fe) {
+				continue
+			}
+			if onlyLocal {
+				if len(be.NodeName) != 0 && be.NodeName != w.nodeName {
+					continue
+				}
+				if !isLocalProxyDelegation(be.Address) {
+					continue
+				}
+			}
+
 			if be.Zone != nil && len(be.Zone.ForZones) > 0 {
 				if !candidatesFound && slices.Contains(be.Zone.ForZones, *thisZone) {
 					candidatesFound = true
@@ -444,14 +500,7 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 		// NOTE: [txn] is no longer valid here. Use it outside this closure.
 
 		for be, rev := range bes {
-			if fe != nil && fe.Address.Protocol() != be.Address.Protocol() {
-				continue
-			}
-			if be.Address.IsIPv6() {
-				if !ipv6 {
-					continue
-				}
-			} else if !ipv4 {
+			if !matchesFrontend(be, fe) {
 				continue
 			}
 			if onlyLocal {
@@ -464,15 +513,6 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 			}
 			if checkZoneHints && !slices.Contains(be.Zone.ForZones, *thisZone) {
 				continue
-			}
-			if fe != nil {
-				if fe.PortName != "" && len(be.PortNames) > 0 {
-					// A backend with specific port name requested. Look up what this backend
-					// is called for this service when the backend has multiple (named) ports.
-					if !slices.Contains(be.PortNames, string(fe.PortName)) {
-						continue
-					}
-				}
 			}
 			if !yield(be, rev) {
 				return

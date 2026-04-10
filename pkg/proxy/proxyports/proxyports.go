@@ -18,7 +18,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/spf13/pflag"
 
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/datapath/iptables"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
@@ -120,7 +120,7 @@ type ProxyPorts struct {
 func NewProxyPorts(
 	logger *slog.Logger,
 	config ProxyPortsConfig,
-	datapathUpdater datapath.IptablesManager,
+	datapathUpdater iptables.Manager,
 ) *ProxyPorts {
 	return &ProxyPorts{
 		logger:                       logger,
@@ -168,17 +168,17 @@ func defaultProxyPortMap() proxyPortsMap {
 			ProxyType: types.ProxyTypeHTTP,
 			Ingress:   true,
 		},
+		"cilium-tls-egress": {
+			ProxyType: types.ProxyTypeTLS,
+			Ingress:   false,
+		},
+		"cilium-tls-ingress": {
+			ProxyType: types.ProxyTypeTLS,
+			Ingress:   true,
+		},
 		types.DNSProxyName: {
 			ProxyType: types.ProxyTypeDNS,
 			Ingress:   false,
-		},
-		"cilium-generic-egress": {
-			ProxyType: types.ProxyTypeAny,
-			Ingress:   false,
-		},
-		"cilium-generic-ingress": {
-			ProxyType: types.ProxyTypeAny,
-			Ingress:   true,
 		},
 	}
 }
@@ -531,10 +531,8 @@ func (p *ProxyPorts) FindByTypeWithReference(l7Type types.ProxyType, listener st
 			logfields.ProxyPort, p.proxyPorts,
 		)
 		return "", nil
-	case types.ProxyTypeDNS, types.ProxyTypeHTTP:
+	case types.ProxyTypeDNS, types.ProxyTypeHTTP, types.ProxyTypeTLS:
 		// Look up by the given type
-	default:
-		portType = types.ProxyTypeAny
 	}
 	// proxyPorts is small enough to not bother indexing it.
 	for name, pp := range p.proxyPorts {

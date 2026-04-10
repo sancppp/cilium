@@ -14,7 +14,6 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
-	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/testutils"
 	"github.com/cilium/cilium/pkg/testutils/netns"
 )
@@ -26,9 +25,10 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 	tests := []struct {
 		name              string
 		l2mode            bool
-		cfg               types.LinkConfig
+		cfg               LinkConfig
 		expectedMode      netlink.NetkitMode
 		expectedHwAddrLen int
+		shouldAssertScrub bool
 		shouldSkip        bool
 	}{
 		{
@@ -38,6 +38,7 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 			expectedMode:      netlink.NETKIT_MODE_L3,
 			expectedHwAddrLen: 0,
 			shouldSkip:        !hostSupportsNetkit(),
+			shouldAssertScrub: hostSupportsNetkitScrub(),
 		},
 		{
 			name:              "netkit+tbm",
@@ -46,6 +47,7 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 			expectedMode:      netlink.NETKIT_MODE_L3,
 			expectedHwAddrLen: 0,
 			shouldSkip:        !hostSupportsNetkitTunedBufferMargins(),
+			shouldAssertScrub: hostSupportsNetkitScrub(),
 		},
 		{
 			name:              "netkit-l2",
@@ -54,6 +56,7 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 			expectedMode:      netlink.NETKIT_MODE_L2,
 			expectedHwAddrLen: 6,
 			shouldSkip:        !hostSupportsNetkit(),
+			shouldAssertScrub: hostSupportsNetkitScrub(),
 		},
 		{
 			name:              "netkit-l2+tbm",
@@ -62,6 +65,7 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 			expectedMode:      netlink.NETKIT_MODE_L2,
 			expectedHwAddrLen: 6,
 			shouldSkip:        !hostSupportsNetkitTunedBufferMargins(),
+			shouldAssertScrub: hostSupportsNetkitScrub(),
 		},
 	}
 
@@ -99,7 +103,9 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 			require.NotNil(t, hostNetkit)
 			assert.Equal(t, tt.expectedMode, hostNetkit.Mode)
 			assert.Equal(t, netlink.NETKIT_POLICY_FORWARD, hostNetkit.Policy)
-			assert.Equal(t, netlink.NETKIT_SCRUB_NONE, hostNetkit.Scrub)
+			if tt.shouldAssertScrub {
+				assert.Equal(t, netlink.NETKIT_SCRUB_NONE, hostNetkit.Scrub)
+			}
 			assert.Equal(t, tt.cfg.DeviceHeadroom, hostNetkit.Headroom)
 			assert.Equal(t, tt.cfg.DeviceTailroom, hostNetkit.Tailroom)
 			assert.Len(t, hostLink2.Attrs().HardwareAddr, tt.expectedHwAddrLen)
@@ -110,7 +116,9 @@ func TestPrivilegedSetupNetkitPair(t *testing.T) {
 			require.NotNil(t, peerNetkit)
 			assert.Equal(t, tt.expectedMode, peerNetkit.Mode)
 			assert.Equal(t, netlink.NETKIT_POLICY_BLACKHOLE, peerNetkit.Policy)
-			assert.Equal(t, netlink.NETKIT_SCRUB_DEFAULT, peerNetkit.Scrub)
+			if tt.shouldAssertScrub {
+				assert.Equal(t, netlink.NETKIT_SCRUB_DEFAULT, peerNetkit.Scrub)
+			}
 			assert.Equal(t, tt.cfg.DeviceHeadroom, peerNetkit.Headroom)
 			assert.Equal(t, tt.cfg.DeviceTailroom, peerNetkit.Tailroom)
 			assert.Len(t, peerLink2.Attrs().HardwareAddr, tt.expectedHwAddrLen)

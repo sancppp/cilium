@@ -199,7 +199,7 @@ static __always_inline int __per_packet_lb_svc_xlate_4(void *ctx, struct iphdr *
 		 * Wildcard lookup is applied only for new connections.
 		 */
 		if (!ct_has_egress_entry4(get_ct_map4(&tmp), &tmp)) {
-			svc = lb4_lookup_wildcard_nodeport_service(&key);
+			svc = lb4_lookup_wildcard_service(&key);
 			if (svc) {
 				struct nodeport_nat_info nat_info = {};
 				__u32 zero = 0;
@@ -377,7 +377,7 @@ static __always_inline int __per_packet_lb_svc_xlate_6(void *ctx, struct ipv6hdr
 		 * Wildcard lookup is applied only for new connections.
 		 */
 		if (!ct_has_egress_entry6(get_ct_map6(&tmp), &tmp)) {
-			svc = lb6_lookup_wildcard_nodeport_service(&key);
+			svc = lb6_lookup_wildcard_service(&key);
 			if (svc) {
 				struct nodeport_nat_info nat_info = {};
 				__u32 zero = 0;
@@ -716,13 +716,12 @@ ipv6_forward_to_destination(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 		return lxc_deliver_to_host(ctx, SECLABEL_IPV6);
 #endif /* ENABLE_HOST_FIREWALL && !ENABLE_ROUTING */
 
-#ifdef ENABLE_IDENTITY_MARK
 	/* Always encode the source identity when forwarding the packet.
 	 * This prevents loss of identity if the packet is later SNATed,
 	 * or the endpoint is torn down.
 	 */
-	set_identity_mark(ctx, SECLABEL_IPV6, MARK_MAGIC_IDENTITY);
-#endif
+	if (CONFIG(enable_identity_mark))
+		set_identity_mark(ctx, SECLABEL_IPV6, MARK_MAGIC_IDENTITY);
 
 	if (is_defined(ENABLE_ROUTING) || hairpin_flow || is_defined(ENABLE_HOST_ROUTING)) {
 		const struct endpoint_info *ep;
@@ -788,6 +787,13 @@ ipv6_forward_to_destination(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 		__u32 tbid = CONFIG(fib_table_id);
 
 		ret = fib_redirect_v6(ctx, ETH_HLEN, ip6, false, false, ext_err, &oif, tbid);
+		/*
+		 * if the endpoint is configured with an explicit table id,
+		 * be strict and drop the traffic if we are not redirected.
+		 */
+		if (tbid && ret != CTX_ACT_REDIRECT)
+			return ret;
+
 		switch (ret) {
 		case CTX_ACT_REDIRECT:
 			send_trace_notify(ctx, TRACE_TO_NETWORK, SECLABEL_IPV6,
@@ -951,7 +957,7 @@ static __always_inline int handle_ipv6_from_lxc(struct __ctx_buff *ctx, __u32 *d
 
 			auth_type = (__u8)*ext_err;
 			if (info)
-				tunnel_endpoint = info->tunnel_endpoint.ip4;
+				tunnel_endpoint = info->tunnel_endpoint.ip4.be32;
 			verdict = auth_lookup(ctx, SECLABEL_IPV6, *dst_sec_identity,
 					      tunnel_endpoint, auth_type);
 		}
@@ -1198,13 +1204,12 @@ ipv4_forward_to_destination(struct __ctx_buff *ctx, struct iphdr *ip4,
 		return lxc_deliver_to_host(ctx, SECLABEL_IPV4);
 #endif /* ENABLE_HOST_FIREWALL && !ENABLE_ROUTING */
 
-#ifdef ENABLE_IDENTITY_MARK
 	/* Always encode the source identity when forwarding the packet.
 	 * This prevents loss of identity if the packet is later SNATed,
 	 * or the endpoint is torn down.
 	 */
-	set_identity_mark(ctx, SECLABEL_IPV4, MARK_MAGIC_IDENTITY);
-#endif
+	if (CONFIG(enable_identity_mark))
+		set_identity_mark(ctx, SECLABEL_IPV4, MARK_MAGIC_IDENTITY);
 
 	/* Allow a hairpin packet to be redirected even if ENABLE_ROUTING is
 	 * disabled (for example, with per-endpoint routes). Otherwise, the
@@ -1279,7 +1284,7 @@ ipv4_forward_to_destination(struct __ctx_buff *ctx, struct iphdr *ip4,
 		if (vtep && vtep->vtep_mac && vtep->tunnel_endpoint) {
 			if (eth_store_daddr(ctx, (__u8 *)&vtep->vtep_mac, 0) < 0)
 				return DROP_WRITE_ERROR;
-			fake_info.tunnel_endpoint.ip4 = vtep->tunnel_endpoint;
+			fake_info.tunnel_endpoint.ip4.be32 = vtep->tunnel_endpoint;
 			fake_info.flag_has_tunnel_ep = true;
 			return __encap_and_redirect_with_nodeid(ctx, &fake_info,
 								SECLABEL_IPV4, WORLD_IPV4_ID,
@@ -1321,7 +1326,7 @@ ipv4_forward_to_destination(struct __ctx_buff *ctx, struct iphdr *ip4,
 		if (ct_status == CT_REPLY) {
 			if (identity_is_remote_node(dst_sec_identity) && ct_state->from_tunnel) {
 				/* Do not modify [info], as this will update IPcache */
-				fake_info.tunnel_endpoint.ip4 = ip4->daddr;
+				fake_info.tunnel_endpoint.ip4.be32 = ip4->daddr;
 				fake_info.flag_has_tunnel_ep = true;
 				info = &fake_info;
 			}
@@ -1348,6 +1353,13 @@ ipv4_forward_to_destination(struct __ctx_buff *ctx, struct iphdr *ip4,
 		__u32 tbid = CONFIG(fib_table_id);
 
 		ret = fib_redirect_v4(ctx, ETH_HLEN, ip4, false, false, ext_err, &oif, tbid);
+		/*
+		 * if the endpoint is configured with an explicit table id,
+		 * be strict and drop the traffic if we are not redirected.
+		 */
+		if (tbid && ret != CTX_ACT_REDIRECT)
+			return ret;
+
 		switch (ret) {
 		case CTX_ACT_REDIRECT:
 			send_trace_notify(ctx, TRACE_TO_NETWORK, SECLABEL_IPV4,
@@ -1514,7 +1526,7 @@ static __always_inline int handle_ipv4_from_lxc(struct __ctx_buff *ctx, __u32 *d
 
 			auth_type = (__u8)*ext_err;
 			if (info)
-				tunnel_endpoint = info->tunnel_endpoint.ip4;
+				tunnel_endpoint = info->tunnel_endpoint.ip4.be32;
 			verdict = auth_lookup(ctx, SECLABEL_IPV4, *dst_sec_identity,
 					      tunnel_endpoint, auth_type);
 		}
@@ -1792,6 +1804,8 @@ int cil_from_container(struct __ctx_buff *ctx)
 	 */
 	ctx->queue_mapping = 0;
 
+	edt_set_aggregate(ctx, LXC_ID);
+
 	send_trace_notify(ctx, TRACE_FROM_LXC, sec_label, UNKNOWN_ID,
 			  TRACE_EP_ID_UNKNOWN, TRACE_IFINDEX_UNKNOWN,
 			  TRACE_REASON_UNKNOWN, TRACE_PAYLOAD_LEN, proto);
@@ -1804,14 +1818,12 @@ int cil_from_container(struct __ctx_buff *ctx)
 	switch (proto) {
 #ifdef ENABLE_IPV6
 	case bpf_htons(ETH_P_IPV6):
-		edt_set_aggregate(ctx, LXC_ID);
 		ret = tail_call_internal(ctx, CILIUM_CALL_IPV6_FROM_LXC, &ext_err);
 		sec_label = SECLABEL_IPV6;
 		break;
 #endif /* ENABLE_IPV6 */
 #ifdef ENABLE_IPV4
 	case bpf_htons(ETH_P_IP):
-		edt_set_aggregate(ctx, LXC_ID);
 		ret = tail_call_internal(ctx, CILIUM_CALL_IPV4_FROM_LXC, &ext_err);
 		sec_label = SECLABEL_IPV4;
 		break;
@@ -1942,7 +1954,7 @@ ipv6_policy(struct __ctx_buff *ctx, struct ipv6hdr *ip6, __u32 src_label,
 			if (sep) {
 				auth_type = (__u8)*ext_err;
 				verdict = auth_lookup(ctx, SECLABEL_IPV6, src_label,
-						      sep->tunnel_endpoint.ip4, auth_type);
+						      sep->tunnel_endpoint.ip4.be32, auth_type);
 			}
 		}
 
@@ -2252,7 +2264,7 @@ ipv4_policy(struct __ctx_buff *ctx, struct iphdr *ip4, __u32 src_label,
 			if (sep) {
 				auth_type = (__u8)*ext_err;
 				verdict = auth_lookup(ctx, SECLABEL_IPV4, src_label,
-						      sep->tunnel_endpoint.ip4, auth_type);
+						      sep->tunnel_endpoint.ip4.be32, auth_type);
 			}
 		}
 		/* Emit verdict if drop or if allow for CT_NEW. */
@@ -2674,7 +2686,7 @@ int tail_policy_denied_ipv4(struct __ctx_buff *ctx)
 
 	ret = generate_icmp4_reply(ctx, ICMP_DEST_UNREACH, ICMP_PKT_FILTERED);
 	if (!ret) {
-		cilium_dbg_capture(ctx, DBG_CAPTURE_DELIVERY, ctx_get_ifindex(ctx));
+		cilium_dbg(ctx, DBG_LOCAL_DELIVERY, LXC_ID, SECLABEL_IPV4);
 		ret = redirect_self(ctx);
 
 		if (!IS_ERR(ret)) {
@@ -2683,7 +2695,7 @@ int tail_policy_denied_ipv4(struct __ctx_buff *ctx)
 		}
 	}
 
-	return send_drop_notify_error(ctx, SECLABEL_IPV4, ret, METRIC_EGRESS);
+	return send_drop_notify_error(ctx, SECLABEL_IPV4, verdict, METRIC_EGRESS);
 }
 #endif /* ENABLE_IPV4 */
 

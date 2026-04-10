@@ -138,6 +138,16 @@ ASSIGN_CONFIG(bool, enable_netkit, false)
 
 #ifdef ENABLE_IPV4
 
+/* packet defined in ./scapy/tc_redirect_pkt_defs.py */
+const __u8 tc_redirect_host_ipv4_pre[] = {
+	SCAPY_BUF_BYTES(tc_redirect_host_ipv4_pre)
+};
+
+/* packet defined in ./scapy/tc_redirect_pkt_defs.py */
+const __u8 tc_redirect_host_ipv4_post[] = {
+	SCAPY_BUF_BYTES(tc_redirect_host_ipv4_post)
+};
+
 /* Setup for this test:
  * +--------External--------+    +----------Pod 1---------+
  * | v4_ext_one:high-port   | -> | v4_pod_one:tcp_svc_one |
@@ -150,8 +160,8 @@ int tc_redirect_host_ipv4_pktgen(struct __ctx_buff *ctx)
 
 	pktgen__init(&builder, ctx);
 
-	BUF_DECL(REDIRECT_HOST_IPV4_PRE, tc_redirect_host_ipv4_pre);
-	BUILDER_PUSH_BUF(builder, REDIRECT_HOST_IPV4_PRE);
+	scapy_push_data(&builder, tc_redirect_host_ipv4_pre,
+			sizeof(tc_redirect_host_ipv4_pre));
 
 	pktgen__finish(&builder);
 
@@ -193,6 +203,8 @@ int tc_redirect_host_ipv4_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	test_init();
 
+	endpoint_v4_del_entry(v4_pod_one);
+
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
 
@@ -221,11 +233,10 @@ int tc_redirect_host_ipv4_check(__maybe_unused const struct __ctx_buff *ctx)
 		test_fatal(TEST_DRIVER_NAME ": Incorrect nunmber of bpf_redirect_peer() calls")
 
 	/* Check the packet. */
-	BUF_DECL(REDIRECT_HOST_IPV4_POST, tc_redirect_host_ipv4_post);
 	ASSERT_CTX_BUF_OFF("tc_redirect_host_ipv4_post",
 			   "Ether", ctx, sizeof(__u32),
-			   REDIRECT_HOST_IPV4_POST,
-			   sizeof(BUF(REDIRECT_HOST_IPV4_POST)));
+			   tc_redirect_host_ipv4_post,
+			   sizeof(tc_redirect_host_ipv4_post));
 
 	test_finish();
 }
@@ -233,6 +244,16 @@ int tc_redirect_host_ipv4_check(__maybe_unused const struct __ctx_buff *ctx)
 #endif /* ENABLE_IPV4 */
 
 #ifdef ENABLE_IPV6
+
+/* packet defined in ./scapy/tc_redirect_pkt_defs.py */
+const __u8 tc_redirect_host_ipv6_pre[] = {
+	SCAPY_BUF_BYTES(tc_redirect_host_ipv6_pre)
+};
+
+/* packet defined in ./scapy/tc_redirect_pkt_defs.py */
+const __u8 tc_redirect_host_ipv6_post[] = {
+	SCAPY_BUF_BYTES(tc_redirect_host_ipv6_post)
+};
 
 /* Setup for this test:
  * +--------External--------+    +----------Pod 1---------+
@@ -246,8 +267,8 @@ int tc_redirect_host_ipv6_pktgen(struct __ctx_buff *ctx)
 
 	pktgen__init(&builder, ctx);
 
-	BUF_DECL(REDIRECT_HOST_IPV6_PRE, tc_redirect_host_ipv6_pre);
-	BUILDER_PUSH_BUF(builder, REDIRECT_HOST_IPV6_PRE);
+	scapy_push_data(&builder, tc_redirect_host_ipv6_pre,
+			sizeof(tc_redirect_host_ipv6_pre));
 
 	pktgen__finish(&builder);
 
@@ -286,11 +307,14 @@ int tc_redirect_host_ipv6_check(__maybe_unused const struct __ctx_buff *ctx)
 #else
 	const unsigned int expected[RECORD__MAX] = {1, 1, 0};
 #endif
+	const union v6addr pod_ip = { .addr = v6_pod_one_addr };
 	void *data;
 	void *data_end;
 	__u32 *status_code;
 
 	test_init();
+
+	endpoint_v6_del_entry(&pod_ip);
 
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
@@ -320,11 +344,10 @@ int tc_redirect_host_ipv6_check(__maybe_unused const struct __ctx_buff *ctx)
 		test_fatal(TEST_DRIVER_NAME ": Incorrect nunmber of bpf_redirect_peer() calls")
 
 	/* Check the packet. */
-	BUF_DECL(REDIRECT_HOST_IPV6_POST, tc_redirect_host_ipv6_post);
 	ASSERT_CTX_BUF_OFF("tc_redirect_host_ipv6_post",
 			   "Ether", ctx, sizeof(__u32),
-			   REDIRECT_HOST_IPV6_POST,
-			   sizeof(BUF(REDIRECT_HOST_IPV6_POST)));
+			   tc_redirect_host_ipv6_post,
+			   sizeof(tc_redirect_host_ipv6_post));
 
 	test_finish();
 }

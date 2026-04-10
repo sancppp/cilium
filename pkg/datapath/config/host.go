@@ -10,21 +10,21 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/byteorder"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	endpoint "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/option"
 	wgtypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
 // CiliumHost returns a [BPFHost] for attaching bpf_host.c to cilium_host.
-func CiliumHost(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfiguration) any {
+func CiliumHost(ep endpoint.Config, lnc *Config) any {
 	cfg := NewBPFHost(NodeConfig(lnc))
 
 	em := ep.GetNodeMAC()
 	if len(em) != 6 {
 		panic(fmt.Sprintf("invalid MAC address for cilium_host: %q", em))
 	}
-	cfg.InterfaceMAC = em.As8()
+	cfg.InterfaceMAC.Addr = em.As6()
 
 	cfg.InterfaceIfIndex = uint32(ep.GetIfIndex())
 
@@ -64,7 +64,7 @@ func CiliumHost(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfig
 }
 
 // CiliumNet returns a [BPFHost] for attaching bpf_host.c to cilium_net.
-func CiliumNet(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfiguration, link netlink.Link) any {
+func CiliumNet(ep endpoint.Config, lnc *Config, link netlink.Link) any {
 	cfg := NewBPFHost(NodeConfig(lnc))
 
 	cfg.SecurityLabel = ep.GetIdentity().Uint32()
@@ -73,7 +73,7 @@ func CiliumNet(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfigu
 	if len(em) != 6 {
 		panic(fmt.Sprintf("invalid MAC address for %s: %q", link.Attrs().Name, em))
 	}
-	cfg.InterfaceMAC = em.As8()
+	cfg.InterfaceMAC.Addr = em.As6()
 
 	cfg.EnableExtendedIPProtocols = option.Config.EnableExtendedIPProtocols
 	cfg.EnableNoServiceEndpointsRoutable = lnc.SvcRouteConfig.EnableNoServiceEndpointsRoutable
@@ -111,14 +111,14 @@ func CiliumNet(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfigu
 
 // Netdev returns a [BPFHost] for attaching bpf_host.c to an externally-facing
 // network device.
-func Netdev(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfiguration, link netlink.Link, masq4, masq6 netip.Addr) any {
+func Netdev(ep endpoint.Config, lnc *Config, link netlink.Link, masq4, masq6 netip.Addr) any {
 	cfg := NewBPFHost(NodeConfig(lnc))
 
 	// External devices can be L2-less, in which case it won't have a MAC address
 	// and its ethernet header length is set to 0.
 	em := mac.MAC(link.Attrs().HardwareAddr)
 	if len(em) == 6 {
-		cfg.InterfaceMAC = em.As8()
+		cfg.InterfaceMAC.Addr = em.As6()
 	} else {
 		cfg.EthHeaderLength = 0
 	}
@@ -131,10 +131,10 @@ func Netdev(ep datapath.EndpointConfiguration, lnc *datapath.LocalNodeConfigurat
 	// Enable masquerading on external interfaces.
 	if option.Config.EnableBPFMasquerade {
 		if option.Config.EnableIPv4Masquerade && masq4.IsValid() {
-			cfg.NATIPv4Masquerade = masq4.As4()
+			cfg.NATIPv4Masquerade.Addr = masq4.As4()
 		}
 		if option.Config.EnableIPv6Masquerade && masq6.IsValid() {
-			cfg.NATIPv6Masquerade = masq6.As16()
+			cfg.NATIPv6Masquerade.Addr = masq6.As16()
 		}
 		// Masquerading IPv4 traffic from endpoints leaving the host.
 		cfg.EnableRemoteNodeMasquerade = option.Config.EnableRemoteNodeMasquerade

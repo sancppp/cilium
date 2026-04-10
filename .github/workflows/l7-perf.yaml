@@ -63,11 +63,11 @@ concurrency:
 
 env:
   # renovate: datasource=github-releases depName=eksctl-io/eksctl
-  eksctl_version: v0.224.0
+  eksctl_version: v0.225.0
   # renovate: datasource=github-releases depName=kubernetes/kubernetes
-  kubectl_version: v1.35.2
+  kubectl_version: v1.35.3
   # renovate: datasource=docker depName=google/cloud-sdk
-  gcloud_version: 560.0.0
+  gcloud_version: 563.0.0
 
   test_name: l7-perf
   cluster_name: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        uses: cilium/cilium/.github/actions/set-commit-status@main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -114,10 +114,9 @@ jobs:
           - benchmark
     steps:
       - name: Set commit status to pending
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        uses: cilium/cilium/.github/actions/set-commit-status@main
         with:
           sha: ${{ inputs.SHA || github.sha }}
-          status: pending
 
       - name: Checkout context ref (trusted)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -239,7 +238,7 @@ jobs:
           fi
 
       - name: Install Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # renovate: datasource=golang-version depName=go
           go-version: 1.26.1
@@ -360,77 +359,68 @@ jobs:
       # supported during cluster creation in a cluster without VPC CNI. Cilium is
       # also required to be already installed for the step to complete successfully.
       - name: Create EKS nodegroups
-        shell: bash
-        run: |
-          cat <<EOF > eks-nodegroup.yaml
-          apiVersion: eksctl.io/v1alpha5
-          kind: ClusterConfig
+        uses: ./.github/actions/setup-eks-nodegroup
+        with:
+          cluster_name: ${{ steps.vars.outputs.cluster_name }}
+          region: ${{ steps.vars.outputs.eks_region }}
+          owner: "${{ steps.vars.outputs.owner }}"
+          version: "${{ steps.vars.outputs.eks_version }}"
+          timeout: "15m"
+          node_groups_override: |
+            managedNodeGroups:
+            - name: ng-amd64-client
+              instanceTypes:
+              - ${{ steps.vars.outputs.node_instance_type }}
+              availabilityZones:
+              - ${{ steps.vars.outputs.eks_zone_1 }}
+              desiredCapacity: ${{ steps.vars.outputs.num_client_nodes }}
+              spot: false
+              privateNetworking: true
+              volumeType: "gp3"
+              volumeSize: 20
+              maxPodsPerNode: 110
+              taints:
+              - key: "node.cilium.io/agent-not-ready"
+                value: "true"
+                effect: "NoExecute"
+              labels:
+                role.scaffolding/http-perf-client: "true"
 
-          metadata:
-            name: ${{ steps.vars.outputs.cluster_name }}
-            region: ${{ steps.vars.outputs.eks_region }}
-            version: "${{ steps.vars.outputs.eks_version }}"
-            tags:
-              usage: "${{ github.repository_owner }}-${{ github.event.repository.name }}"
-              owner: "${{ steps.vars.outputs.owner }}"
+            - name: ng-amd64-server
+              instanceTypes:
+              - ${{ steps.vars.outputs.node_instance_type }}
+              availabilityZones:
+              - ${{ steps.vars.outputs.eks_zone_1 }}
+              desiredCapacity: ${{ steps.vars.outputs.num_test_nodes }}
+              spot: false
+              privateNetworking: true
+              volumeType: "gp3"
+              volumeSize: 20
+              maxPodsPerNode: 110
+              taints:
+              - key: "node.cilium.io/agent-not-ready"
+                value: "true"
+                effect: "NoExecute"
+              labels:
+                role.scaffolding/http-perf-server: "true"
 
-          managedNodeGroups:
-          - name: ng-amd64-client
-            instanceTypes:
-            - ${{ steps.vars.outputs.node_instance_type }}
-            availabilityZones:
-            - ${{ steps.vars.outputs.eks_zone_1 }}
-            desiredCapacity: ${{ steps.vars.outputs.num_client_nodes }}
-            spot: false
-            privateNetworking: true
-            volumeType: "gp3"
-            volumeSize: 20
-            maxPodsPerNode: 110
-            taints:
-            - key: "node.cilium.io/agent-not-ready"
-              value: "true"
-              effect: "NoExecute"
-            labels:
-              role.scaffolding/http-perf-client: "true"
-
-          - name: ng-amd64-server
-            instanceTypes:
-            - ${{ steps.vars.outputs.node_instance_type }}
-            availabilityZones:
-            - ${{ steps.vars.outputs.eks_zone_1 }}
-            desiredCapacity: ${{ steps.vars.outputs.num_test_nodes }}
-            spot: false
-            privateNetworking: true
-            volumeType: "gp3"
-            volumeSize: 20
-            maxPodsPerNode: 110
-            taints:
-            - key: "node.cilium.io/agent-not-ready"
-              value: "true"
-              effect: "NoExecute"
-            labels:
-              role.scaffolding/http-perf-server: "true"
-
-          - name: ng-amd64-heapster
-            instanceTypes:
-            - ${{ steps.vars.outputs.node_instance_type }}
-            availabilityZones:
-            - ${{ steps.vars.outputs.eks_zone_1 }}
-            desiredCapacity: 1
-            spot: false
-            privateNetworking: true
-            volumeType: "gp3"
-            volumeSize: 20
-            maxPodsPerNode: 110
-            taints:
-            - key: "node.cilium.io/agent-not-ready"
-              value: "true"
-              effect: "NoExecute"
-            labels:
-              role.scaffolding/monitoring: "true"
-          EOF
-
-          eksctl create nodegroup -f ./eks-nodegroup.yaml --timeout=10m
+            - name: ng-amd64-monitoring
+              instanceTypes:
+              - ${{ steps.vars.outputs.node_instance_type }}
+              availabilityZones:
+              - ${{ steps.vars.outputs.eks_zone_1 }}
+              desiredCapacity: 1
+              spot: false
+              privateNetworking: true
+              volumeType: "gp3"
+              volumeSize: 20
+              maxPodsPerNode: 110
+              taints:
+              - key: "node.cilium.io/agent-not-ready"
+                value: "true"
+                effect: "NoExecute"
+              labels:
+                role.scaffolding/monitoring: "true"
 
       - name: Wait for Cilium status to be ready
         run: |
@@ -515,7 +505,7 @@ jobs:
 
       - name: Export results and sysdump to GS bucket
         if: ${{ always() && steps.run-cl2.outcome != 'skipped' && steps.run-cl2.outcome != 'cancelled' }}
-        uses: cilium/scale-tests-action/export-results@8535f579142fa598c3b2a895cfb248cd492d7c5a # main
+        uses: cilium/scale-tests-action/export-results@995a08156171644e92e5688b0785b7baf86ce22a # main
         with:
           test_name: ${{ steps.vars.outputs.test_name }}
           tested_sha: ${{ steps.vars.outputs.SHA }}

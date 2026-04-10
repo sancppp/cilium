@@ -1714,6 +1714,21 @@
         "object"
       ]
     },
+    "configDriftDetection": {
+      "properties": {
+        "driftChecker": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "ignoredKeys": {
+          "items": {},
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "connectivityProbeFrequencyRatio": {
       "type": [
         "null",
@@ -2011,10 +2026,7 @@
             "image": {
               "properties": {
                 "digest": {
-                  "type": [
-                    "null",
-                    "string"
-                  ]
+                  "type": "string"
                 },
                 "override": {
                   "type": [
@@ -2173,6 +2185,9 @@
     },
     "endpointLockdownOnMapOverflow": {
       "type": "boolean"
+    },
+    "endpointPolicyUpdateTimeoutDuration": {
+      "type": "null"
     },
     "endpointRoutes": {
       "properties": {
@@ -2514,7 +2529,13 @@
             "failureThreshold": {
               "type": "integer"
             },
+            "initialDelaySeconds": {
+              "type": "integer"
+            },
             "periodSeconds": {
+              "type": "integer"
+            },
+            "timeoutSeconds": {
               "type": "integer"
             }
           },
@@ -2527,6 +2548,9 @@
                 "null",
                 "integer"
               ]
+            },
+            "accessLogEnabled": {
+              "type": "boolean"
             },
             "defaultLevel": {
               "oneOf": [
@@ -2575,6 +2599,14 @@
         },
         "maxRequestsPerConnection": {
           "type": "integer"
+        },
+        "nodeLocality": {
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
         },
         "nodeSelector": {
           "properties": {
@@ -2690,7 +2722,13 @@
             "failureThreshold": {
               "type": "integer"
             },
+            "initialDelaySeconds": {
+              "type": "integer"
+            },
             "periodSeconds": {
+              "type": "integer"
+            },
+            "timeoutSeconds": {
               "type": "integer"
             }
           },
@@ -2750,7 +2788,13 @@
             "failureThreshold": {
               "type": "integer"
             },
+            "initialDelaySeconds": {
+              "type": "integer"
+            },
             "periodSeconds": {
+              "type": "integer"
+            },
+            "timeoutSeconds": {
               "type": "integer"
             }
           },
@@ -4789,6 +4833,9 @@
           "type": "boolean"
         },
         "bindProtection": {
+          "type": "boolean"
+        },
+        "enableDynamicSourceLookup": {
           "type": "boolean"
         },
         "enableHealthCheck": {

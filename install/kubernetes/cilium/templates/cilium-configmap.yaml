@@ -467,6 +467,9 @@ data:
 {{- if has (kindOf .Values.bpf.policyMapPressureMetricsThreshold) (list "int64" "float64") }}
   bpf-policy-map-pressure-metrics-threshold: {{ .Values.bpf.policyMapPressureMetricsThreshold | quote }}
 {{- end }}
+{{- if .Values.endpointPolicyUpdateTimeoutDuration }}
+  endpoint-policy-update-timeout: {{ .Values.endpointPolicyUpdateTimeoutDuration | quote }}
+{{- end }}
 {{- if hasKey .Values.bpf "policyStatsMapMax" }}
   # bpf-policy-stats-map-max specifies the maximum number of entries in global
   # policy stats map
@@ -878,6 +881,9 @@ data:
 {{- end }}
 {{- if hasKey .Values.nodePort "enableHealthCheck" }}
   enable-health-check-nodeport: {{ .Values.nodePort.enableHealthCheck | quote}}
+{{- end }}
+{{- if hasKey .Values.nodePort "enableDynamicSourceLookup" }}
+  enable-dynamic-source-lookup-nodeport: {{ .Values.nodePort.enableDynamicSourceLookup | quote}}
 {{- end }}
 {{- if .Values.gke.enabled }}
   enable-health-check-loadbalancer-ip: "true"
@@ -1470,6 +1476,7 @@ data:
   proxy-cluster-max-requests: {{ .Values.envoy.clusterMaxRequests | quote }}
   http-retry-count: {{ .Values.envoy.httpRetryCount | quote }}
   http-stream-idle-timeout: {{ .Values.envoy.streamIdleTimeoutDurationSeconds | quote }}
+  envoy-node-locality-enabled: {{ .Values.envoy.nodeLocality.enabled | quote }}
 
   external-envoy-proxy: {{ include "envoyDaemonSetEnabled" . | quote }}
   envoy-base-id: {{ .Values.envoy.baseID | quote }}
@@ -1488,6 +1495,7 @@ data:
 {{- if .Values.envoy.log.defaultLevel }}
   envoy-default-log-level: {{ .Values.envoy.log.defaultLevel | quote }}
 {{- end }}
+  envoy-access-log-enabled: {{ .Values.envoy.log.accessLogEnabled | quote }}
 {{- if .Values.envoy.log.accessLogBufferSize }}
   envoy-access-log-buffer-size: {{ .Values.envoy.log.accessLogBufferSize | quote }}
 {{- end }}
@@ -1514,6 +1522,14 @@ data:
 
 {{- if has (kindOf .Values.connectivityProbeFrequencyRatio) (list "int64" "float64") }}
   connectivity-probe-frequency-ratio: {{ .Values.connectivityProbeFrequencyRatio | quote }}
+{{- end }}
+
+{{- if hasKey .Values "configDriftDetection" }}
+  enable-dynamic-config: {{ .Values.configDriftDetection.enabled | quote }}
+  enable-drift-checker: {{ .Values.configDriftDetection.driftChecker | quote }}
+  {{- if .Values.configDriftDetection.ignoredKeys }}
+  ignore-flags-drift-checker: {{ join "," .Values.configDriftDetection.ignoredKeys | quote }}
+  {{- end }}
 {{- end }}
 
 # Extra config allows adding arbitrary properties to the cilium config.

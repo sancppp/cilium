@@ -29,7 +29,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/cilium/cilium/api/v1/models"
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
 	"github.com/cilium/cilium/pkg/endpoint"
 	fqdndns "github.com/cilium/cilium/pkg/fqdn/dns"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
@@ -51,6 +51,7 @@ import (
 	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
 	"github.com/cilium/cilium/pkg/u8proto"
+	fakewireguard "github.com/cilium/cilium/pkg/wireguard/fake"
 )
 
 type DNSProxyTestSuite struct {
@@ -96,7 +97,7 @@ func setupDNSProxyTestSuite(tb testing.TB) *DNSProxyTestSuite {
 	}
 	proxy := NewDNSProxy(dnsProxyConfig,
 		s,
-		func(lookupTime time.Time, ep *endpoint.Endpoint, epIPPort string, serverID identity.NumericIdentity, dstAddr netip.AddrPort, msg *dns.Msg, protocol string, allowed bool, stat *ProxyRequestContext) error {
+		func(lookupTime time.Time, ep *endpoint.Endpoint, epIPPort string, serverID identity.NumericIdentity, dstAddr netip.AddrPort, details *MsgDetails, protocol string, allowed bool, stat *ProxyRequestContext) error {
 			return nil
 		},
 	)
@@ -175,8 +176,8 @@ func (s *DNSProxyTestSuite) LookupRegisteredEndpoint(ip netip.Addr) (*endpoint.E
 		NamedPortsGetter: testipcache.NewMockIPCache(),
 		Allocator:        testidentity.NewMockIdentityAllocator(nil),
 		CTMapGC:          ctmap.NewFakeGCRunner(),
-		WgConfig:         &fakeTypes.WireguardConfig{},
-		IPSecConfig:      fakeTypes.IPsecConfig{},
+		WgConfig:         &fakewireguard.Config{},
+		IPSecConfig:      fakeipsec.Config{},
 		Logger:           s.logger,
 		IdentityManager:  identitymanager.NewIDManager(s.logger),
 		PolicyRepo:       s.repo,
@@ -910,8 +911,8 @@ func TestPrivilegedFullPathDependence(t *testing.T) {
 		NamedPortsGetter: testipcache.NewMockIPCache(),
 		Allocator:        testidentity.NewMockIdentityAllocator(nil),
 		CTMapGC:          ctmap.NewFakeGCRunner(),
-		WgConfig:         &fakeTypes.WireguardConfig{},
-		IPSecConfig:      fakeTypes.IPsecConfig{},
+		WgConfig:         &fakewireguard.Config{},
+		IPSecConfig:      fakeipsec.Config{},
 		Logger:           hivetest.Logger(t),
 		IdentityManager:  identitymanager.NewIDManager(logger),
 		PolicyRepo:       s.repo,
@@ -972,8 +973,8 @@ func TestPrivilegedFullPathDependence(t *testing.T) {
 		NamedPortsGetter: testipcache.NewMockIPCache(),
 		Allocator:        testidentity.NewMockIdentityAllocator(nil),
 		CTMapGC:          ctmap.NewFakeGCRunner(),
-		WgConfig:         &fakeTypes.WireguardConfig{},
-		IPSecConfig:      fakeTypes.IPsecConfig{},
+		WgConfig:         &fakewireguard.Config{},
+		IPSecConfig:      fakeipsec.Config{},
 		Logger:           hivetest.Logger(t),
 		IdentityManager:  identitymanager.NewIDManager(logger),
 		PolicyRepo:       s.repo,
@@ -1194,8 +1195,8 @@ func TestPrivilegedRestoredEndpoint(t *testing.T) {
 		NamedPortsGetter: testipcache.NewMockIPCache(),
 		Allocator:        testidentity.NewMockIdentityAllocator(nil),
 		CTMapGC:          ctmap.NewFakeGCRunner(),
-		WgConfig:         &fakeTypes.WireguardConfig{},
-		IPSecConfig:      fakeTypes.IPsecConfig{},
+		WgConfig:         &fakewireguard.Config{},
+		IPSecConfig:      fakeipsec.Config{},
 		Logger:           hivetest.Logger(t),
 		IdentityManager:  identitymanager.NewIDManager(logger),
 		PolicyRepo:       s.repo,
@@ -1282,7 +1283,85 @@ func TestProxyRequestContext_IsTimeout(t *testing.T) {
 	require.True(t, p.IsTimeout())
 }
 
-func TestExtractMsgDetails(t *testing.T) {
+func TestExtractRequestMsgDetails(t *testing.T) {
+	testCases := []struct {
+		name    string
+		msg     *dns.Msg
+		qname   string
+		qtypes  []uint16
+		wantErr bool
+	}{
+		{
+			name:    "empty message",
+			msg:     &dns.Msg{},
+			wantErr: true,
+		},
+		{
+			name: "valid A request",
+			msg: &dns.Msg{
+				Question: []dns.Question{{
+					Name:  fqdndns.FQDN("cilium.io"),
+					Qtype: dns.TypeA,
+				}},
+			},
+			qname:   "cilium.io.",
+			qtypes:  []uint16{dns.TypeA},
+			wantErr: false,
+		},
+		{
+			name: "valid AAAA request",
+			msg: &dns.Msg{
+				Question: []dns.Question{{
+					Name:  fqdndns.FQDN("cilium.io"),
+					Qtype: dns.TypeAAAA,
+				}},
+			},
+			qname:   "cilium.io.",
+			qtypes:  []uint16{dns.TypeAAAA},
+			wantErr: false,
+		},
+		{
+			name: "request with spoofed answer section is ignored",
+			msg: &dns.Msg{
+				Question: []dns.Question{{
+					Name:  fqdndns.FQDN("cilium.io"),
+					Qtype: dns.TypeA,
+				}},
+				Answer: []dns.RR{&dns.A{
+					Hdr: dns.RR_Header{
+						Name: fqdndns.FQDN("cilium.io"),
+						Ttl:  3600,
+					},
+					A: net.ParseIP("192.0.2.3"),
+				}},
+			},
+			qname:   "cilium.io.",
+			qtypes:  []uint16{dns.TypeA},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			details, err := ExtractRequestMsgDetails(tc.msg)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.qname, details.QName)
+			require.Equal(t, tc.qtypes, details.QTypes)
+			require.False(t, details.Response)
+			// Request extraction must not populate response fields
+			require.Nil(t, details.ResponseIPs)
+			require.Nil(t, details.CNAMEs)
+			require.Nil(t, details.AnswerTypes)
+			require.Equal(t, uint32(0), details.TTL)
+		})
+	}
+}
+
+func TestExtractResponseMsgDetails(t *testing.T) {
 	testCases := []struct {
 		msg     *dns.Msg
 		ttl     uint32
@@ -1463,15 +1542,15 @@ func TestExtractMsgDetails(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		_, _, ttl, cnames, _, _, _, err := ExtractMsgDetails(tc.msg)
+		details, err := ExtractResponseMsgDetails(tc.msg)
 		if tc.wantErr {
 			require.Error(t, err)
 		} else {
 			require.NoError(t, err)
 		}
 
-		require.Equal(t, tc.ttl, ttl)
-		require.Equal(t, tc.cnames, cnames)
+		require.Equal(t, tc.ttl, details.TTL)
+		require.Equal(t, tc.cnames, details.CNAMEs)
 	}
 }
 

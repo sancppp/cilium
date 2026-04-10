@@ -22,7 +22,6 @@ import (
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint"
 	endpointcreator "github.com/cilium/cilium/pkg/endpoint/creator"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
@@ -57,7 +56,7 @@ type endpointAPIManager struct {
 	endpointCreations EndpointCreationManager
 	endpointMetadata  endpointmetadata.EndpointMetadataFetcher
 
-	bandwidthManager datapath.BandwidthManager
+	bandwidthManager bandwidth.Manager
 	clientset        k8sClient.Clientset
 	cniConfigManager cni.CNIConfigManager
 	ipam             *ipam.IPAM
@@ -337,17 +336,17 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 	// The endpoint has been successfully created, stop the expiration
 	// timers of all attached IPs
 	if addressing := epTemplate.Addressing; addressing != nil {
-		if uuid := addressing.IPV4ExpirationUUID; uuid != "" {
-			if ip := net.ParseIP(addressing.IPV4); ip != nil {
-				pool := ipam.PoolOrDefault(addressing.IPV4PoolName)
+		if uuid := addressing.IPv4ExpirationUUID; uuid != "" {
+			if ip := net.ParseIP(addressing.IPv4); ip != nil {
+				pool := ipam.PoolOrDefault(addressing.IPv4PoolName)
 				if err := m.ipam.StopExpirationTimer(ip, pool, uuid); err != nil {
 					return m.errorDuringCreation(ep, err)
 				}
 			}
 		}
-		if uuid := addressing.IPV6ExpirationUUID; uuid != "" {
-			if ip := net.ParseIP(addressing.IPV6); ip != nil {
-				pool := ipam.PoolOrDefault(addressing.IPV6PoolName)
+		if uuid := addressing.IPv6ExpirationUUID; uuid != "" {
+			if ip := net.ParseIP(addressing.IPv6); ip != nil {
+				pool := ipam.PoolOrDefault(addressing.IPv6PoolName)
 				if err := m.ipam.StopExpirationTimer(ip, pool, uuid); err != nil {
 					return m.errorDuringCreation(ep, err)
 				}

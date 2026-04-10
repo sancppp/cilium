@@ -16,9 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-//go:embed mapkv.btf
-var _mapKVTypes []byte
-
+// LoadMapSpecs returns the MapSpecs of all pinned BPF maps in the datapath.
 func LoadMapSpecs() (map[string]*ebpf.MapSpec, error) {
 	types, err := btf.LoadSpecFromReader(bytes.NewReader(_mapKVTypes))
 	if err != nil {
@@ -34,98 +32,101 @@ func LoadMapSpecs() (map[string]*ebpf.MapSpec, error) {
 	return out, nil
 }
 
-func anyTypeByName(spec *btf.Spec, name string) btf.Type {
-	typ, err := spec.AnyTypeByName(name)
-	if err != nil {
-		panic(fmt.Sprintf("get type %s by name: %v", name, err))
-	}
-	return typ
-}
-
-// newMapFn is a function that returns a new ebpf.MapSpec.
-type newMapFn func(btf *btf.Spec) *ebpf.MapSpec
-
-var _outer []newMapFn = []newMapFn{
-	newCiliumAuthMapSpec,
-	newCiliumCallPolicySpec,
-	newCiliumCallsSpec,
-	newCiliumCidrV4DynSpec,
-	newCiliumCidrV4FixSpec,
-	newCiliumCidrV6DynSpec,
-	newCiliumCidrV6FixSpec,
-	newCiliumCt4GlobalSpec,
-	newCiliumCt6GlobalSpec,
-	newCiliumCtAny4GlobalSpec,
-	newCiliumCtAny6GlobalSpec,
-	newCiliumDevicesSpec,
-	newCiliumEgressGwPolicyV4Spec,
-	newCiliumEgressGwPolicyV6Spec,
-	newCiliumEgresscallPolicySpec,
-	newCiliumEncryptStateSpec,
-	newCiliumEventsSpec,
-	newCiliumIPCacheV2Spec,
-	newCiliumIpmasqV4Spec,
-	newCiliumIpmasqV6Spec,
-	newCiliumIPv4FragDatagramsSpec,
-	newCiliumIPv6FragDatagramsSpec,
-	newCiliumL2ResponderV4Spec,
-	newCiliumL2ResponderV6Spec,
-	newCiliumLb4AffinitySpec,
-	newCiliumLb4BackendsV3Spec,
-	newCiliumLb4HealthSpec,
-	newCiliumLb4MaglevSpec,
-	newCiliumLb4ReverseNATSpec,
-	newCiliumLb4ReverseSkSpec,
-	newCiliumLb4ServicesV2Spec,
-	newCiliumLb4SourceRangeSpec,
-	newCiliumLb6AffinitySpec,
-	newCiliumLb6BackendsV3Spec,
-	newCiliumLb6HealthSpec,
-	newCiliumLb6MaglevSpec,
-	newCiliumLb6ReverseNATSpec,
-	newCiliumLb6ReverseSkSpec,
-	newCiliumLb6ServicesV2Spec,
-	newCiliumLb6SourceRangeSpec,
-	newCiliumLBActSpec,
-	newCiliumLBAffinityMatchSpec,
-	newCiliumLXCSpec,
-	newCiliumMcastGroupOuterV4MapSpec,
-	newCiliumMetricsSpec,
-	newCiliumNodeMapV2Spec,
-	newCiliumNodeportNeigh4Spec,
-	newCiliumNodeportNeigh6Spec,
-	newCiliumPerClusterCtAny4Spec,
-	newCiliumPerClusterCtAny6Spec,
-	newCiliumPerClusterCtTcp4Spec,
-	newCiliumPerClusterCtTcp6Spec,
-	newCiliumPerClusterSnatV4ExternalSpec,
-	newCiliumPerClusterSnatV6ExternalSpec,
-	newCiliumPercpuTraceIDSpec,
-	newCiliumPolicyV2Spec,
-	newCiliumPolicystatsSpec,
-	newCiliumRatelimitSpec,
-	newCiliumRatelimitMetricsSpec,
-	newCiliumRuntimeConfigSpec,
-	newCiliumSignalsSpec,
-	newCiliumSkipLb4Spec,
-	newCiliumSkipLb6Spec,
-	newCiliumSnatV4AllocRetriesSpec,
-	newCiliumSnatV4ExternalSpec,
-	newCiliumSnatV6ExternalSpec,
-	newCiliumSrv6PolicyV4Spec,
-	newCiliumSrv6PolicyV6Spec,
-	newCiliumSrv6SidSpec,
-	newCiliumSrv6VrfV4Spec,
-	newCiliumSrv6VrfV6Spec,
-	newCiliumSubnetMapSpec,
-	newCiliumThrottleSpec,
-	newCiliumVTEPMapSpec,
-	newCiliumXDPScratchSpec,
-}
+// Below is a list of BPF map names as they will appear in /sys/fs/bpf as well
+// as their key in the map returned by [LoadMapSpecs]. Use this as the source of
+// truth for map name constants throughout the agent.
+//
+// Extend dpgen/acronyms.txt if any identifiers are incorrectly capitalized.
+const (
+	CiliumAuthMap                       = "cilium_auth_map"
+	CiliumCallPolicy                    = "cilium_call_policy"
+	CiliumCalls                         = "cilium_calls"
+	CiliumCIDRV4Dyn                     = "cilium_cidr_v4_dyn"
+	CiliumCIDRV4Fix                     = "cilium_cidr_v4_fix"
+	CiliumCIDRV6Dyn                     = "cilium_cidr_v6_dyn"
+	CiliumCIDRV6Fix                     = "cilium_cidr_v6_fix"
+	CiliumCT4Global                     = "cilium_ct4_global"
+	CiliumCT6Global                     = "cilium_ct6_global"
+	CiliumCTAny4Global                  = "cilium_ct_any4_global"
+	CiliumCTAny6Global                  = "cilium_ct_any6_global"
+	CiliumDevices                       = "cilium_devices"
+	CiliumEgressGWPolicyV4              = "cilium_egress_gw_policy_v4"
+	CiliumEgressGWPolicyV6              = "cilium_egress_gw_policy_v6"
+	CiliumEgresscallPolicy              = "cilium_egresscall_policy"
+	CiliumEncryptState                  = "cilium_encrypt_state"
+	CiliumEvents                        = "cilium_events"
+	CiliumIPCacheV2                     = "cilium_ipcache_v2"
+	CiliumIPMasqV4                      = "cilium_ipmasq_v4"
+	CiliumIPMasqV6                      = "cilium_ipmasq_v6"
+	CiliumIPv4FragDatagrams             = "cilium_ipv4_frag_datagrams"
+	CiliumIPv6FragDatagrams             = "cilium_ipv6_frag_datagrams"
+	CiliumL2ResponderV4                 = "cilium_l2_responder_v4"
+	CiliumL2ResponderV6                 = "cilium_l2_responder_v6"
+	CiliumLB4Affinity                   = "cilium_lb4_affinity"
+	CiliumLB4BackendsV3                 = "cilium_lb4_backends_v3"
+	CiliumLB4Health                     = "cilium_lb4_health"
+	CiliumLB4Maglev                     = "cilium_lb4_maglev"
+	CiliumLB4MaglevInner                = "cilium_lb4_maglev_inner"
+	CiliumLB4ReverseNAT                 = "cilium_lb4_reverse_nat"
+	CiliumLB4ReverseSk                  = "cilium_lb4_reverse_sk"
+	CiliumLB4ServicesV2                 = "cilium_lb4_services_v2"
+	CiliumLB4SourceRange                = "cilium_lb4_source_range"
+	CiliumLB6Affinity                   = "cilium_lb6_affinity"
+	CiliumLB6BackendsV3                 = "cilium_lb6_backends_v3"
+	CiliumLB6Health                     = "cilium_lb6_health"
+	CiliumLB6Maglev                     = "cilium_lb6_maglev"
+	CiliumLB6MaglevInner                = "cilium_lb6_maglev_inner"
+	CiliumLB6ReverseNAT                 = "cilium_lb6_reverse_nat"
+	CiliumLB6ReverseSk                  = "cilium_lb6_reverse_sk"
+	CiliumLB6ServicesV2                 = "cilium_lb6_services_v2"
+	CiliumLB6SourceRange                = "cilium_lb6_source_range"
+	CiliumLBACT                         = "cilium_lb_act"
+	CiliumLBAffinityMatch               = "cilium_lb_affinity_match"
+	CiliumLXC                           = "cilium_lxc"
+	CiliumMcastGroupOuterV4Map          = "cilium_mcast_group_outer_v4_map"
+	CiliumMcastGroupOuterV4MapInner     = "cilium_mcast_group_outer_v4_map_inner"
+	CiliumMetrics                       = "cilium_metrics"
+	CiliumNodeMapV2                     = "cilium_node_map_v2"
+	CiliumNodeportNeigh4                = "cilium_nodeport_neigh4"
+	CiliumNodeportNeigh6                = "cilium_nodeport_neigh6"
+	CiliumPerClusterCTAny4              = "cilium_per_cluster_ct_any4"
+	CiliumPerClusterCTAny4Inner         = "cilium_per_cluster_ct_any4_inner"
+	CiliumPerClusterCTAny6              = "cilium_per_cluster_ct_any6"
+	CiliumPerClusterCTAny6Inner         = "cilium_per_cluster_ct_any6_inner"
+	CiliumPerClusterCTTCP4              = "cilium_per_cluster_ct_tcp4"
+	CiliumPerClusterCTTCP4Inner         = "cilium_per_cluster_ct_tcp4_inner"
+	CiliumPerClusterCTTCP6              = "cilium_per_cluster_ct_tcp6"
+	CiliumPerClusterCTTCP6Inner         = "cilium_per_cluster_ct_tcp6_inner"
+	CiliumPerClusterSNATV4External      = "cilium_per_cluster_snat_v4_external"
+	CiliumPerClusterSNATV4ExternalInner = "cilium_per_cluster_snat_v4_external_inner"
+	CiliumPerClusterSNATV6External      = "cilium_per_cluster_snat_v6_external"
+	CiliumPerClusterSNATV6ExternalInner = "cilium_per_cluster_snat_v6_external_inner"
+	CiliumPerCPUTraceID                 = "cilium_percpu_trace_id"
+	CiliumPolicyV2                      = "cilium_policy_v2"
+	CiliumPolicystats                   = "cilium_policystats"
+	CiliumRatelimit                     = "cilium_ratelimit"
+	CiliumRatelimitMetrics              = "cilium_ratelimit_metrics"
+	CiliumRuntimeConfig                 = "cilium_runtime_config"
+	CiliumSignals                       = "cilium_signals"
+	CiliumSkipLB4                       = "cilium_skip_lb4"
+	CiliumSkipLB6                       = "cilium_skip_lb6"
+	CiliumSNATV4AllocRetries            = "cilium_snat_v4_alloc_retries"
+	CiliumSNATV4External                = "cilium_snat_v4_external"
+	CiliumSNATV6External                = "cilium_snat_v6_external"
+	CiliumSRv6PolicyV4                  = "cilium_srv6_policy_v4"
+	CiliumSRv6PolicyV6                  = "cilium_srv6_policy_v6"
+	CiliumSRv6Sid                       = "cilium_srv6_sid"
+	CiliumSRv6VRFV4                     = "cilium_srv6_vrf_v4"
+	CiliumSRv6VRFV6                     = "cilium_srv6_vrf_v6"
+	CiliumSubnetMap                     = "cilium_subnet_map"
+	CiliumThrottle                      = "cilium_throttle"
+	CiliumVTEPMap                       = "cilium_vtep_map"
+	CiliumXDPScratch                    = "cilium_xdp_scratch"
+)
 
 func newCiliumAuthMapSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_auth_map",
+		Name:       CiliumAuthMap,
 		Type:       ebpf.Hash,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "auth_key"),
@@ -139,7 +140,7 @@ func newCiliumAuthMapSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumCallPolicySpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_call_policy",
+		Name:       CiliumCallPolicy,
 		Type:       ebpf.ProgramArray,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -153,7 +154,7 @@ func newCiliumCallPolicySpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumCallsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_calls",
+		Name:       CiliumCalls,
 		Type:       ebpf.ProgramArray,
 		KeySize:    4,
 		ValueSize:  4,
@@ -163,9 +164,9 @@ func newCiliumCallsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCidrV4DynSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCIDRV4DynSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_cidr_v4_dyn",
+		Name:       CiliumCIDRV4Dyn,
 		Type:       ebpf.LPMTrie,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "lpm_v4_key"),
@@ -177,9 +178,9 @@ func newCiliumCidrV4DynSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCidrV4FixSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCIDRV4FixSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_cidr_v4_fix",
+		Name:       CiliumCIDRV4Fix,
 		Type:       ebpf.Hash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "lpm_v4_key"),
@@ -191,9 +192,9 @@ func newCiliumCidrV4FixSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCidrV6DynSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCIDRV6DynSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_cidr_v6_dyn",
+		Name:       CiliumCIDRV6Dyn,
 		Type:       ebpf.LPMTrie,
 		KeySize:    20,
 		Key:        anyTypeByName(btf, "lpm_v6_key"),
@@ -205,9 +206,9 @@ func newCiliumCidrV6DynSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCidrV6FixSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCIDRV6FixSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_cidr_v6_fix",
+		Name:       CiliumCIDRV6Fix,
 		Type:       ebpf.Hash,
 		KeySize:    20,
 		Key:        anyTypeByName(btf, "lpm_v6_key"),
@@ -219,9 +220,9 @@ func newCiliumCidrV6FixSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCt4GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCT4GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ct4_global",
+		Name:       CiliumCT4Global,
 		Type:       ebpf.LRUHash,
 		KeySize:    14,
 		Key:        anyTypeByName(btf, "ipv4_ct_tuple"),
@@ -233,9 +234,9 @@ func newCiliumCt4GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCt6GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCT6GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ct6_global",
+		Name:       CiliumCT6Global,
 		Type:       ebpf.LRUHash,
 		KeySize:    38,
 		Key:        anyTypeByName(btf, "ipv6_ct_tuple"),
@@ -247,9 +248,9 @@ func newCiliumCt6GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCtAny4GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCTAny4GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ct_any4_global",
+		Name:       CiliumCTAny4Global,
 		Type:       ebpf.LRUHash,
 		KeySize:    14,
 		Key:        anyTypeByName(btf, "ipv4_ct_tuple"),
@@ -261,9 +262,9 @@ func newCiliumCtAny4GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumCtAny6GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumCTAny6GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ct_any6_global",
+		Name:       CiliumCTAny6Global,
 		Type:       ebpf.LRUHash,
 		KeySize:    38,
 		Key:        anyTypeByName(btf, "ipv6_ct_tuple"),
@@ -277,7 +278,7 @@ func newCiliumCtAny6GlobalSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumDevicesSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_devices",
+		Name:       CiliumDevices,
 		Type:       ebpf.Array,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -289,9 +290,9 @@ func newCiliumDevicesSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumEgressGwPolicyV4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumEgressGWPolicyV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_egress_gw_policy_v4",
+		Name:       CiliumEgressGWPolicyV4,
 		Type:       ebpf.LPMTrie,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "egress_gw_policy_key"),
@@ -303,9 +304,9 @@ func newCiliumEgressGwPolicyV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumEgressGwPolicyV6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumEgressGWPolicyV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_egress_gw_policy_v6",
+		Name:       CiliumEgressGWPolicyV6,
 		Type:       ebpf.LPMTrie,
 		KeySize:    36,
 		Key:        anyTypeByName(btf, "egress_gw_policy_key6"),
@@ -319,7 +320,7 @@ func newCiliumEgressGwPolicyV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumEgresscallPolicySpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_egresscall_policy",
+		Name:       CiliumEgresscallPolicy,
 		Type:       ebpf.ProgramArray,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -333,7 +334,7 @@ func newCiliumEgresscallPolicySpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumEncryptStateSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_encrypt_state",
+		Name:       CiliumEncryptState,
 		Type:       ebpf.Array,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -347,7 +348,7 @@ func newCiliumEncryptStateSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumEventsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_events",
+		Name:       CiliumEvents,
 		Type:       ebpf.PerfEventArray,
 		KeySize:    4,
 		ValueSize:  4,
@@ -359,7 +360,7 @@ func newCiliumEventsSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumIPCacheV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ipcache_v2",
+		Name:       CiliumIPCacheV2,
 		Type:       ebpf.LPMTrie,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "ipcache_key"),
@@ -371,9 +372,9 @@ func newCiliumIPCacheV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumIpmasqV4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumIPMasqV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ipmasq_v4",
+		Name:       CiliumIPMasqV4,
 		Type:       ebpf.LPMTrie,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "lpm_v4_key"),
@@ -385,9 +386,9 @@ func newCiliumIpmasqV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumIpmasqV6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumIPMasqV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ipmasq_v6",
+		Name:       CiliumIPMasqV6,
 		Type:       ebpf.LPMTrie,
 		KeySize:    20,
 		Key:        anyTypeByName(btf, "lpm_v6_key"),
@@ -401,7 +402,7 @@ func newCiliumIpmasqV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumIPv4FragDatagramsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ipv4_frag_datagrams",
+		Name:       CiliumIPv4FragDatagrams,
 		Type:       ebpf.LRUHash,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "ipv4_frag_id"),
@@ -415,7 +416,7 @@ func newCiliumIPv4FragDatagramsSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumIPv6FragDatagramsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ipv6_frag_datagrams",
+		Name:       CiliumIPv6FragDatagrams,
 		Type:       ebpf.LRUHash,
 		KeySize:    40,
 		Key:        anyTypeByName(btf, "ipv6_frag_id"),
@@ -429,7 +430,7 @@ func newCiliumIPv6FragDatagramsSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumL2ResponderV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_l2_responder_v4",
+		Name:       CiliumL2ResponderV4,
 		Type:       ebpf.Hash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "l2_responder_v4_key"),
@@ -443,7 +444,7 @@ func newCiliumL2ResponderV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumL2ResponderV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_l2_responder_v6",
+		Name:       CiliumL2ResponderV6,
 		Type:       ebpf.Hash,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "l2_responder_v6_key"),
@@ -455,9 +456,9 @@ func newCiliumL2ResponderV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4AffinitySpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4AffinitySpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_affinity",
+		Name:       CiliumLB4Affinity,
 		Type:       ebpf.LRUHash,
 		KeySize:    16,
 		Key:        anyTypeByName(btf, "lb4_affinity_key"),
@@ -469,9 +470,9 @@ func newCiliumLb4AffinitySpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4BackendsV3Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4BackendsV3Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_backends_v3",
+		Name:       CiliumLB4BackendsV3,
 		Type:       ebpf.Hash,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -483,9 +484,9 @@ func newCiliumLb4BackendsV3Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4HealthSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4HealthSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_health",
+		Name:       CiliumLB4Health,
 		Type:       ebpf.LRUHash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "__sock_cookie"),
@@ -497,24 +498,24 @@ func newCiliumLb4HealthSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4MaglevSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4MaglevSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_maglev",
+		Name:       CiliumLB4Maglev,
 		Type:       ebpf.HashOfMaps,
 		KeySize:    2,
 		Key:        anyTypeByName(btf, "__u16"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumLb4MaglevInnerSpec(btf),
+		InnerMap:   newCiliumLB4MaglevInnerSpec(btf),
 		MaxEntries: 65536,
 		Flags:      unix.BPF_F_NO_PREALLOC | unix.BPF_F_RDONLY_PROG,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumLb4MaglevInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4MaglevInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_maglev_inner",
+		Name:       CiliumLB4MaglevInner,
 		Type:       ebpf.Array,
 		KeySize:    4,
 		ValueSize:  130996,
@@ -524,9 +525,9 @@ func newCiliumLb4MaglevInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4ReverseNATSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4ReverseNATSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_reverse_nat",
+		Name:       CiliumLB4ReverseNAT,
 		Type:       ebpf.Hash,
 		KeySize:    2,
 		Key:        anyTypeByName(btf, "__u16"),
@@ -538,9 +539,9 @@ func newCiliumLb4ReverseNATSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4ReverseSkSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4ReverseSkSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_reverse_sk",
+		Name:       CiliumLB4ReverseSk,
 		Type:       ebpf.LRUHash,
 		KeySize:    16,
 		Key:        anyTypeByName(btf, "ipv4_revnat_tuple"),
@@ -552,9 +553,9 @@ func newCiliumLb4ReverseSkSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4ServicesV2Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4ServicesV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_services_v2",
+		Name:       CiliumLB4ServicesV2,
 		Type:       ebpf.Hash,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "lb4_key"),
@@ -566,9 +567,9 @@ func newCiliumLb4ServicesV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb4SourceRangeSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB4SourceRangeSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb4_source_range",
+		Name:       CiliumLB4SourceRange,
 		Type:       ebpf.LPMTrie,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "lb4_src_range_key"),
@@ -580,9 +581,9 @@ func newCiliumLb4SourceRangeSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6AffinitySpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6AffinitySpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_affinity",
+		Name:       CiliumLB6Affinity,
 		Type:       ebpf.LRUHash,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "lb6_affinity_key"),
@@ -594,9 +595,9 @@ func newCiliumLb6AffinitySpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6BackendsV3Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6BackendsV3Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_backends_v3",
+		Name:       CiliumLB6BackendsV3,
 		Type:       ebpf.Hash,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -608,9 +609,9 @@ func newCiliumLb6BackendsV3Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6HealthSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6HealthSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_health",
+		Name:       CiliumLB6Health,
 		Type:       ebpf.LRUHash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "__sock_cookie"),
@@ -622,24 +623,24 @@ func newCiliumLb6HealthSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6MaglevSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6MaglevSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_maglev",
+		Name:       CiliumLB6Maglev,
 		Type:       ebpf.HashOfMaps,
 		KeySize:    2,
 		Key:        anyTypeByName(btf, "__u16"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumLb6MaglevInnerSpec(btf),
+		InnerMap:   newCiliumLB6MaglevInnerSpec(btf),
 		MaxEntries: 65536,
 		Flags:      unix.BPF_F_NO_PREALLOC | unix.BPF_F_RDONLY_PROG,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumLb6MaglevInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6MaglevInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_maglev_inner",
+		Name:       CiliumLB6MaglevInner,
 		Type:       ebpf.Array,
 		KeySize:    4,
 		ValueSize:  130996,
@@ -649,9 +650,9 @@ func newCiliumLb6MaglevInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6ReverseNATSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6ReverseNATSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_reverse_nat",
+		Name:       CiliumLB6ReverseNAT,
 		Type:       ebpf.Hash,
 		KeySize:    2,
 		Key:        anyTypeByName(btf, "__u16"),
@@ -663,9 +664,9 @@ func newCiliumLb6ReverseNATSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6ReverseSkSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6ReverseSkSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_reverse_sk",
+		Name:       CiliumLB6ReverseSk,
 		Type:       ebpf.LRUHash,
 		KeySize:    32,
 		Key:        anyTypeByName(btf, "ipv6_revnat_tuple"),
@@ -677,9 +678,9 @@ func newCiliumLb6ReverseSkSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6ServicesV2Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6ServicesV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_services_v2",
+		Name:       CiliumLB6ServicesV2,
 		Type:       ebpf.Hash,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "lb6_key"),
@@ -691,9 +692,9 @@ func newCiliumLb6ServicesV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLb6SourceRangeSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLB6SourceRangeSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb6_source_range",
+		Name:       CiliumLB6SourceRange,
 		Type:       ebpf.LPMTrie,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "lb6_src_range_key"),
@@ -705,9 +706,9 @@ func newCiliumLb6SourceRangeSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumLBActSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumLBACTSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb_act",
+		Name:       CiliumLBACT,
 		Type:       ebpf.LRUHash,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "lb_act_key"),
@@ -721,7 +722,7 @@ func newCiliumLBActSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumLBAffinityMatchSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lb_affinity_match",
+		Name:       CiliumLBAffinityMatch,
 		Type:       ebpf.Hash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "lb_affinity_match"),
@@ -735,7 +736,7 @@ func newCiliumLBAffinityMatchSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumLXCSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_lxc",
+		Name:       CiliumLXC,
 		Type:       ebpf.Hash,
 		KeySize:    20,
 		Key:        anyTypeByName(btf, "endpoint_key"),
@@ -749,7 +750,7 @@ func newCiliumLXCSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumMcastGroupOuterV4MapSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_mcast_group_outer_v4_map",
+		Name:       CiliumMcastGroupOuterV4Map,
 		Type:       ebpf.HashOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "mcast_group_v4"),
@@ -764,7 +765,7 @@ func newCiliumMcastGroupOuterV4MapSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumMcastGroupOuterV4MapInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_mcast_group_outer_v4_map_inner",
+		Name:       CiliumMcastGroupOuterV4MapInner,
 		Type:       ebpf.Hash,
 		KeySize:    4,
 		ValueSize:  12,
@@ -776,7 +777,7 @@ func newCiliumMcastGroupOuterV4MapInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumMetricsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_metrics",
+		Name:       CiliumMetrics,
 		Type:       ebpf.PerCPUHash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "metrics_key"),
@@ -790,7 +791,7 @@ func newCiliumMetricsSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumNodeMapV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_node_map_v2",
+		Name:       CiliumNodeMapV2,
 		Type:       ebpf.Hash,
 		KeySize:    20,
 		Key:        anyTypeByName(btf, "node_key"),
@@ -804,7 +805,7 @@ func newCiliumNodeMapV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumNodeportNeigh4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_nodeport_neigh4",
+		Name:       CiliumNodeportNeigh4,
 		Type:       ebpf.LRUHash,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__be32"),
@@ -818,7 +819,7 @@ func newCiliumNodeportNeigh4Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumNodeportNeigh6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_nodeport_neigh6",
+		Name:       CiliumNodeportNeigh6,
 		Type:       ebpf.LRUHash,
 		KeySize:    16,
 		Key:        anyTypeByName(btf, "v6addr"),
@@ -830,24 +831,24 @@ func newCiliumNodeportNeigh6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPerClusterCtAny4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTAny4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_any4",
+		Name:       CiliumPerClusterCTAny4,
 		Type:       ebpf.ArrayOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumPerClusterCtAny4InnerSpec(btf),
+		InnerMap:   newCiliumPerClusterCTAny4InnerSpec(btf),
 		MaxEntries: 256,
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumPerClusterCtAny4InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTAny4InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_any4_inner",
+		Name:       CiliumPerClusterCTAny4Inner,
 		Type:       ebpf.LRUHash,
 		KeySize:    14,
 		Key:        anyTypeByName(btf, "ipv4_ct_tuple"),
@@ -859,24 +860,24 @@ func newCiliumPerClusterCtAny4InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPerClusterCtAny6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTAny6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_any6",
+		Name:       CiliumPerClusterCTAny6,
 		Type:       ebpf.ArrayOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumPerClusterCtAny6InnerSpec(btf),
+		InnerMap:   newCiliumPerClusterCTAny6InnerSpec(btf),
 		MaxEntries: 256,
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumPerClusterCtAny6InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTAny6InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_any6_inner",
+		Name:       CiliumPerClusterCTAny6Inner,
 		Type:       ebpf.LRUHash,
 		KeySize:    38,
 		Key:        anyTypeByName(btf, "ipv6_ct_tuple"),
@@ -888,24 +889,24 @@ func newCiliumPerClusterCtAny6InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPerClusterCtTcp4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTTCP4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_tcp4",
+		Name:       CiliumPerClusterCTTCP4,
 		Type:       ebpf.ArrayOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumPerClusterCtTcp4InnerSpec(btf),
+		InnerMap:   newCiliumPerClusterCTTCP4InnerSpec(btf),
 		MaxEntries: 256,
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumPerClusterCtTcp4InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTTCP4InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_tcp4_inner",
+		Name:       CiliumPerClusterCTTCP4Inner,
 		Type:       ebpf.LRUHash,
 		KeySize:    14,
 		Key:        anyTypeByName(btf, "ipv4_ct_tuple"),
@@ -917,24 +918,24 @@ func newCiliumPerClusterCtTcp4InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPerClusterCtTcp6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTTCP6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_tcp6",
+		Name:       CiliumPerClusterCTTCP6,
 		Type:       ebpf.ArrayOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumPerClusterCtTcp6InnerSpec(btf),
+		InnerMap:   newCiliumPerClusterCTTCP6InnerSpec(btf),
 		MaxEntries: 256,
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumPerClusterCtTcp6InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterCTTCP6InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_ct_tcp6_inner",
+		Name:       CiliumPerClusterCTTCP6Inner,
 		Type:       ebpf.LRUHash,
 		KeySize:    38,
 		Key:        anyTypeByName(btf, "ipv6_ct_tuple"),
@@ -946,24 +947,24 @@ func newCiliumPerClusterCtTcp6InnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPerClusterSnatV4ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterSNATV4ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_snat_v4_external",
+		Name:       CiliumPerClusterSNATV4External,
 		Type:       ebpf.ArrayOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumPerClusterSnatV4ExternalInnerSpec(btf),
+		InnerMap:   newCiliumPerClusterSNATV4ExternalInnerSpec(btf),
 		MaxEntries: 256,
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumPerClusterSnatV4ExternalInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterSNATV4ExternalInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_snat_v4_external_inner",
+		Name:       CiliumPerClusterSNATV4ExternalInner,
 		Type:       ebpf.LRUHash,
 		KeySize:    14,
 		Key:        anyTypeByName(btf, "ipv4_ct_tuple"),
@@ -975,24 +976,24 @@ func newCiliumPerClusterSnatV4ExternalInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPerClusterSnatV6ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterSNATV6ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_snat_v6_external",
+		Name:       CiliumPerClusterSNATV6External,
 		Type:       ebpf.ArrayOfMaps,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
 		ValueSize:  4,
 		Value:      anyTypeByName(btf, "__u32"),
-		InnerMap:   newCiliumPerClusterSnatV6ExternalInnerSpec(btf),
+		InnerMap:   newCiliumPerClusterSNATV6ExternalInnerSpec(btf),
 		MaxEntries: 256,
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
 }
 
-func newCiliumPerClusterSnatV6ExternalInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerClusterSNATV6ExternalInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_per_cluster_snat_v6_external_inner",
+		Name:       CiliumPerClusterSNATV6ExternalInner,
 		Type:       ebpf.LRUHash,
 		KeySize:    38,
 		Key:        anyTypeByName(btf, "ipv6_ct_tuple"),
@@ -1004,9 +1005,9 @@ func newCiliumPerClusterSnatV6ExternalInnerSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumPercpuTraceIDSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumPerCPUTraceIDSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_percpu_trace_id",
+		Name:       CiliumPerCPUTraceID,
 		Type:       ebpf.PerCPUArray,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -1020,7 +1021,7 @@ func newCiliumPercpuTraceIDSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumPolicyV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_policy_v2",
+		Name:       CiliumPolicyV2,
 		Type:       ebpf.LPMTrie,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "policy_key"),
@@ -1034,7 +1035,7 @@ func newCiliumPolicyV2Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumPolicystatsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_policystats",
+		Name:       CiliumPolicystats,
 		Type:       ebpf.LRUCPUHash,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "policy_stats_key"),
@@ -1048,7 +1049,7 @@ func newCiliumPolicystatsSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumRatelimitSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ratelimit",
+		Name:       CiliumRatelimit,
 		Type:       ebpf.LRUHash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "ratelimit_key"),
@@ -1062,7 +1063,7 @@ func newCiliumRatelimitSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumRatelimitMetricsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_ratelimit_metrics",
+		Name:       CiliumRatelimitMetrics,
 		Type:       ebpf.Hash,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "ratelimit_metrics_key"),
@@ -1076,7 +1077,7 @@ func newCiliumRatelimitMetricsSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumRuntimeConfigSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_runtime_config",
+		Name:       CiliumRuntimeConfig,
 		Type:       ebpf.Array,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -1090,7 +1091,7 @@ func newCiliumRuntimeConfigSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumSignalsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_signals",
+		Name:       CiliumSignals,
 		Type:       ebpf.PerfEventArray,
 		KeySize:    4,
 		ValueSize:  4,
@@ -1100,9 +1101,9 @@ func newCiliumSignalsSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSkipLb4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSkipLB4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_skip_lb4",
+		Name:       CiliumSkipLB4,
 		Type:       ebpf.Hash,
 		KeySize:    16,
 		Key:        anyTypeByName(btf, "skip_lb4_key"),
@@ -1114,9 +1115,9 @@ func newCiliumSkipLb4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSkipLb6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSkipLB6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_skip_lb6",
+		Name:       CiliumSkipLB6,
 		Type:       ebpf.Hash,
 		KeySize:    32,
 		Key:        anyTypeByName(btf, "skip_lb6_key"),
@@ -1128,9 +1129,9 @@ func newCiliumSkipLb6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSnatV4AllocRetriesSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSNATV4AllocRetriesSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_snat_v4_alloc_retries",
+		Name:       CiliumSNATV4AllocRetries,
 		Type:       ebpf.PerCPUArray,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "__u32"),
@@ -1142,9 +1143,9 @@ func newCiliumSnatV4AllocRetriesSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSnatV4ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSNATV4ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_snat_v4_external",
+		Name:       CiliumSNATV4External,
 		Type:       ebpf.LRUHash,
 		KeySize:    14,
 		Key:        anyTypeByName(btf, "ipv4_ct_tuple"),
@@ -1156,9 +1157,9 @@ func newCiliumSnatV4ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSnatV6ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSNATV6ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_snat_v6_external",
+		Name:       CiliumSNATV6External,
 		Type:       ebpf.LRUHash,
 		KeySize:    38,
 		Key:        anyTypeByName(btf, "ipv6_ct_tuple"),
@@ -1170,9 +1171,9 @@ func newCiliumSnatV6ExternalSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSrv6PolicyV4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSRv6PolicyV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_srv6_policy_v4",
+		Name:       CiliumSRv6PolicyV4,
 		Type:       ebpf.LPMTrie,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "srv6_policy_key4"),
@@ -1184,9 +1185,9 @@ func newCiliumSrv6PolicyV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSrv6PolicyV6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSRv6PolicyV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_srv6_policy_v6",
+		Name:       CiliumSRv6PolicyV6,
 		Type:       ebpf.LPMTrie,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "srv6_policy_key6"),
@@ -1198,9 +1199,9 @@ func newCiliumSrv6PolicyV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSrv6SidSpec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSRv6SidSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_srv6_sid",
+		Name:       CiliumSRv6Sid,
 		Type:       ebpf.Hash,
 		KeySize:    16,
 		Key:        anyTypeByName(btf, "v6addr"),
@@ -1212,9 +1213,9 @@ func newCiliumSrv6SidSpec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSrv6VrfV4Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSRv6VRFV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_srv6_vrf_v4",
+		Name:       CiliumSRv6VRFV4,
 		Type:       ebpf.LPMTrie,
 		KeySize:    12,
 		Key:        anyTypeByName(btf, "srv6_vrf_key4"),
@@ -1226,9 +1227,9 @@ func newCiliumSrv6VrfV4Spec(btf *btf.Spec) *ebpf.MapSpec {
 	}
 }
 
-func newCiliumSrv6VrfV6Spec(btf *btf.Spec) *ebpf.MapSpec {
+func newCiliumSRv6VRFV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_srv6_vrf_v6",
+		Name:       CiliumSRv6VRFV6,
 		Type:       ebpf.LPMTrie,
 		KeySize:    36,
 		Key:        anyTypeByName(btf, "srv6_vrf_key6"),
@@ -1242,7 +1243,7 @@ func newCiliumSrv6VrfV6Spec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumSubnetMapSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_subnet_map",
+		Name:       CiliumSubnetMap,
 		Type:       ebpf.LPMTrie,
 		KeySize:    24,
 		Key:        anyTypeByName(btf, "subnet_key"),
@@ -1256,7 +1257,7 @@ func newCiliumSubnetMapSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumThrottleSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_throttle",
+		Name:       CiliumThrottle,
 		Type:       ebpf.Hash,
 		KeySize:    8,
 		Key:        anyTypeByName(btf, "edt_id"),
@@ -1270,7 +1271,7 @@ func newCiliumThrottleSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumVTEPMapSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_vtep_map",
+		Name:       CiliumVTEPMap,
 		Type:       ebpf.Hash,
 		KeySize:    4,
 		Key:        anyTypeByName(btf, "vtep_key"),
@@ -1284,7 +1285,7 @@ func newCiliumVTEPMapSpec(btf *btf.Spec) *ebpf.MapSpec {
 
 func newCiliumXDPScratchSpec(btf *btf.Spec) *ebpf.MapSpec {
 	return &ebpf.MapSpec{
-		Name:       "cilium_xdp_scratch",
+		Name:       CiliumXDPScratch,
 		Type:       ebpf.PerCPUArray,
 		KeySize:    4,
 		ValueSize:  28,
@@ -1292,4 +1293,95 @@ func newCiliumXDPScratchSpec(btf *btf.Spec) *ebpf.MapSpec {
 		Flags:      0,
 		Pinning:    ebpf.PinByName,
 	}
+}
+
+var _outer []newMapFn = []newMapFn{
+	newCiliumAuthMapSpec,
+	newCiliumCallPolicySpec,
+	newCiliumCallsSpec,
+	newCiliumCIDRV4DynSpec,
+	newCiliumCIDRV4FixSpec,
+	newCiliumCIDRV6DynSpec,
+	newCiliumCIDRV6FixSpec,
+	newCiliumCT4GlobalSpec,
+	newCiliumCT6GlobalSpec,
+	newCiliumCTAny4GlobalSpec,
+	newCiliumCTAny6GlobalSpec,
+	newCiliumDevicesSpec,
+	newCiliumEgressGWPolicyV4Spec,
+	newCiliumEgressGWPolicyV6Spec,
+	newCiliumEgresscallPolicySpec,
+	newCiliumEncryptStateSpec,
+	newCiliumEventsSpec,
+	newCiliumIPCacheV2Spec,
+	newCiliumIPMasqV4Spec,
+	newCiliumIPMasqV6Spec,
+	newCiliumIPv4FragDatagramsSpec,
+	newCiliumIPv6FragDatagramsSpec,
+	newCiliumL2ResponderV4Spec,
+	newCiliumL2ResponderV6Spec,
+	newCiliumLB4AffinitySpec,
+	newCiliumLB4BackendsV3Spec,
+	newCiliumLB4HealthSpec,
+	newCiliumLB4MaglevSpec,
+	newCiliumLB4ReverseNATSpec,
+	newCiliumLB4ReverseSkSpec,
+	newCiliumLB4ServicesV2Spec,
+	newCiliumLB4SourceRangeSpec,
+	newCiliumLB6AffinitySpec,
+	newCiliumLB6BackendsV3Spec,
+	newCiliumLB6HealthSpec,
+	newCiliumLB6MaglevSpec,
+	newCiliumLB6ReverseNATSpec,
+	newCiliumLB6ReverseSkSpec,
+	newCiliumLB6ServicesV2Spec,
+	newCiliumLB6SourceRangeSpec,
+	newCiliumLBACTSpec,
+	newCiliumLBAffinityMatchSpec,
+	newCiliumLXCSpec,
+	newCiliumMcastGroupOuterV4MapSpec,
+	newCiliumMetricsSpec,
+	newCiliumNodeMapV2Spec,
+	newCiliumNodeportNeigh4Spec,
+	newCiliumNodeportNeigh6Spec,
+	newCiliumPerClusterCTAny4Spec,
+	newCiliumPerClusterCTAny6Spec,
+	newCiliumPerClusterCTTCP4Spec,
+	newCiliumPerClusterCTTCP6Spec,
+	newCiliumPerClusterSNATV4ExternalSpec,
+	newCiliumPerClusterSNATV6ExternalSpec,
+	newCiliumPerCPUTraceIDSpec,
+	newCiliumPolicyV2Spec,
+	newCiliumPolicystatsSpec,
+	newCiliumRatelimitSpec,
+	newCiliumRatelimitMetricsSpec,
+	newCiliumRuntimeConfigSpec,
+	newCiliumSignalsSpec,
+	newCiliumSkipLB4Spec,
+	newCiliumSkipLB6Spec,
+	newCiliumSNATV4AllocRetriesSpec,
+	newCiliumSNATV4ExternalSpec,
+	newCiliumSNATV6ExternalSpec,
+	newCiliumSRv6PolicyV4Spec,
+	newCiliumSRv6PolicyV6Spec,
+	newCiliumSRv6SidSpec,
+	newCiliumSRv6VRFV4Spec,
+	newCiliumSRv6VRFV6Spec,
+	newCiliumSubnetMapSpec,
+	newCiliumThrottleSpec,
+	newCiliumVTEPMapSpec,
+	newCiliumXDPScratchSpec,
+}
+
+//go:embed mapkv.btf
+var _mapKVTypes []byte
+
+type newMapFn func(btf *btf.Spec) *ebpf.MapSpec
+
+func anyTypeByName(spec *btf.Spec, name string) btf.Type {
+	typ, err := spec.AnyTypeByName(name)
+	if err != nil {
+		panic(fmt.Sprintf("get type %s by name: %v", name, err))
+	}
+	return typ
 }

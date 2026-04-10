@@ -111,7 +111,7 @@
    * - :spelling:ignore:`authentication.mutual.spire.install.agent.image`
      - SPIRE agent image
      - object
-     - ``{"digest":"sha256:f8c40f435d42bd8b5420768b95f6b41acc695fb13cd9f9728d27c8e21e07d803","override":null,"pullPolicy":"Always","repository":"ghcr.io/spiffe/spire-agent","tag":"1.14.2","useDigest":true}``
+     - ``{"digest":"sha256:f93996a9396ec4042a48042085c2abf1a0f8f0f3b339571e06ebfebbf94bb830","override":null,"pullPolicy":"Always","repository":"ghcr.io/spiffe/spire-agent","tag":"1.14.4","useDigest":true}``
    * - :spelling:ignore:`authentication.mutual.spire.install.agent.labels`
      - SPIRE agent labels
      - object
@@ -199,7 +199,7 @@
    * - :spelling:ignore:`authentication.mutual.spire.install.server.image`
      - SPIRE server image
      - object
-     - ``{"digest":"sha256:12f30ce1b6e298cf0dc7bedd5a67b174f03a4c5130ab825fba0ec3dcf407d0b2","override":null,"pullPolicy":"Always","repository":"ghcr.io/spiffe/spire-server","tag":"1.14.2","useDigest":true}``
+     - ``{"digest":"sha256:27c7d356768b8641c569745e1121328affeb4aaabe0c974d33ff92dddecf30ef","override":null,"pullPolicy":"Always","repository":"ghcr.io/spiffe/spire-server","tag":"1.14.4","useDigest":true}``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.initContainers`
      - SPIRE server init containers
      - list
@@ -1160,6 +1160,22 @@
      - commonLabels allows users to add common labels for all Cilium resources.
      - object
      - ``{}``
+   * - :spelling:ignore:`configDriftDetection`
+     - Configuration for the ConfigMap drift detection feature. When enabled, the agent continuously watches the cilium-config ConfigMap and exposes a cilium_drift_checker_config_delta Prometheus metric reporting the number of keys that differ between the ConfigMap and the agent's active settings. A non-zero value indicates that the agent has not yet applied all current ConfigMap changes and needs to be restarted.
+     - object
+     - ``{"driftChecker":true,"enabled":true,"ignoredKeys":[]}``
+   * - :spelling:ignore:`configDriftDetection.driftChecker`
+     - Enable the drift checker which compares the DynamicConfig table against the agent's active settings and publishes the cilium_drift_checker_config_delta metric.
+     - bool
+     - ``true``
+   * - :spelling:ignore:`configDriftDetection.enabled`
+     - Enable watching of the cilium-config ConfigMap and reflecting its contents into the agent's internal DynamicConfig table.
+     - bool
+     - ``true``
+   * - :spelling:ignore:`configDriftDetection.ignoredKeys`
+     - List of config-map keys to ignore when computing the drift delta.
+     - list
+     - ``[]``
    * - :spelling:ignore:`connectivityProbeFrequencyRatio`
      - Ratio of the connectivity probe frequency vs resource usage, a float in [0, 1]. 0 will give more frequent probing, 1 will give less frequent probing. Probing frequency is dynamically adjusted based on the cluster size.
      - float64
@@ -1403,7 +1419,7 @@
    * - :spelling:ignore:`encryption.ztunnel`
      - ztunnel encryption configuration. ztunnel is Istio's purpose-built, per-node proxy for handling L4 traffic in ambient mesh mode. These settings only apply when encryption.type is set to "ztunnel".
      - object
-     - ``{"affinity":{},"annotations":{},"caAddress":"https://localhost:15012","extraEnv":[],"extraVolumeMounts":[],"extraVolumes":[],"healthPort":15021,"image":{"digest":null,"override":null,"pullPolicy":"IfNotPresent","repository":"docker.io/istio/ztunnel","tag":"1.28.0-distroless","useDigest":false},"nodeSelector":{"kubernetes.io/os":"linux"},"podAnnotations":{},"podLabels":{},"priorityClassName":null,"readinessProbe":{"failureThreshold":3,"initialDelaySeconds":0,"periodSeconds":10},"resources":{"requests":{"cpu":"200m","memory":"512Mi"}},"secrets":{"bootstrapRootCert":null},"terminationGracePeriodSeconds":30,"tolerations":[{"effect":"NoSchedule","operator":"Exists"},{"key":"CriticalAddonsOnly","operator":"Exists"},{"effect":"NoExecute","operator":"Exists"}],"updateStrategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0},"type":"RollingUpdate"}}``
+     - ``{"affinity":{},"annotations":{},"caAddress":"https://localhost:15012","extraEnv":[],"extraVolumeMounts":[],"extraVolumes":[],"healthPort":15021,"image":{"digest":"sha256:884de5adde400e39f58e36c7a729f7690466ca4a8eb4c2a8daa9c1c025115b24","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/ztunnel","tag":"v1.0.0","useDigest":true},"nodeSelector":{"kubernetes.io/os":"linux"},"podAnnotations":{},"podLabels":{},"priorityClassName":null,"readinessProbe":{"failureThreshold":3,"initialDelaySeconds":0,"periodSeconds":10},"resources":{"requests":{"cpu":"200m","memory":"512Mi"}},"secrets":{"bootstrapRootCert":null},"terminationGracePeriodSeconds":30,"tolerations":[{"effect":"NoSchedule","operator":"Exists"},{"key":"CriticalAddonsOnly","operator":"Exists"},{"effect":"NoExecute","operator":"Exists"}],"updateStrategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0},"type":"RollingUpdate"}}``
    * - :spelling:ignore:`encryption.ztunnel.affinity`
      - Affinity for ztunnel pods.
      - object
@@ -1435,7 +1451,7 @@
    * - :spelling:ignore:`encryption.ztunnel.image`
      - ztunnel container image.
      - object
-     - ``{"digest":null,"override":null,"pullPolicy":"IfNotPresent","repository":"docker.io/istio/ztunnel","tag":"1.28.0-distroless","useDigest":false}``
+     - ``{"digest":"sha256:884de5adde400e39f58e36c7a729f7690466ca4a8eb4c2a8daa9c1c025115b24","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/ztunnel","tag":"v1.0.0","useDigest":true}``
    * - :spelling:ignore:`encryption.ztunnel.nodeSelector`
      - Node selector for ztunnel pods.
      - object
@@ -1488,6 +1504,10 @@
      - Enable endpoint lockdown on policy map overflow.
      - bool
      - ``false``
+   * - :spelling:ignore:`endpointPolicyUpdateTimeoutDuration`
+     - Max duration to wait for envoy to respond to configuration changes. Default "10s".
+     - string
+     - ``nil``
    * - :spelling:ignore:`endpointRoutes.enabled`
      - Enable use of per endpoint routes instead of routing via the cilium_host interface.
      - bool
@@ -1663,7 +1683,7 @@
    * - :spelling:ignore:`envoy.image`
      - Envoy container image.
      - object
-     - ``{"digest":"sha256:f3b4865104d4bc687e49ba401e9c6add7d36d316a90999afde74a6eaf7732960","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/cilium-envoy","tag":"v1.36.5-1773220197-f7a54727954edc6855e6f8bc674aff8ca57a80da","useDigest":true}``
+     - ``{"digest":"sha256:df144744740f91dc55ca39367f61c9a214a989d543c6f91319ccd686ddd7477f","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/cilium-envoy","tag":"v1.36.5-1775137579-2b3493aca96923190423ccec7e4dbc5f074ccad4","useDigest":true}``
    * - :spelling:ignore:`envoy.initContainers`
      - Init containers added to the cilium Envoy DaemonSet.
      - list
@@ -1680,14 +1700,26 @@
      - failure threshold of liveness probe
      - int
      - ``10``
+   * - :spelling:ignore:`envoy.livenessProbe.initialDelaySeconds`
+     - Initial delay before the liveness probe begins
+     - int
+     - ``0``
    * - :spelling:ignore:`envoy.livenessProbe.periodSeconds`
      - interval between checks of the liveness probe
      - int
      - ``30``
+   * - :spelling:ignore:`envoy.livenessProbe.timeoutSeconds`
+     - Timeout for the liveness probe
+     - int
+     - ``5``
    * - :spelling:ignore:`envoy.log.accessLogBufferSize`
      - Size of the Envoy access log buffer created within the agent in bytes. Tune this value up if you encounter "Envoy: Discarded truncated access log message" errors. Large request/response header sizes (e.g. 16KiB) will require a larger buffer size.
      - int
      - ``4096``
+   * - :spelling:ignore:`envoy.log.accessLogEnabled`
+     - Enable access log forwarding for integration with Hubble.
+     - bool
+     - ``true``
    * - :spelling:ignore:`envoy.log.defaultLevel`
      - Default log level of Envoy application log that is configured if Cilium debug / verbose logging isn't enabled. This option allows to have a different log level than the Cilium Agent - e.g. lower it to ``critical``. Possible values: trace, debug, info, warning, error, critical, off
      - string
@@ -1720,6 +1752,10 @@
      - ProxyMaxRequestsPerConnection specifies the max_requests_per_connection setting for Envoy
      - int
      - ``0``
+   * - :spelling:ignore:`envoy.nodeLocality.enabled`
+     - Enable node-locality support for cilium-envoy. When enabled, Cilium looks up the node zone from the topology label and passes it to the Envoy process via ``--service-zone``. Startup fails if the zone cannot be resolved or the label is empty.
+     - bool
+     - ``false``
    * - :spelling:ignore:`envoy.nodeSelector`
      - Node selector for cilium-envoy.
      - object
@@ -1792,10 +1828,18 @@
      - failure threshold of readiness probe
      - int
      - ``3``
+   * - :spelling:ignore:`envoy.readinessProbe.initialDelaySeconds`
+     - Initial delay before the readiness probe begins
+     - int
+     - ``0``
    * - :spelling:ignore:`envoy.readinessProbe.periodSeconds`
      - interval between checks of the readiness probe
      - int
      - ``30``
+   * - :spelling:ignore:`envoy.readinessProbe.timeoutSeconds`
+     - Timeout for the readiness probe
+     - int
+     - ``5``
    * - :spelling:ignore:`envoy.resources`
      - Envoy resource limits & requests ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
      - object
@@ -1828,10 +1872,18 @@
      - failure threshold of startup probe. 105 x 2s translates to the old behaviour of the readiness probe (120s delay + 30 x 3s)
      - int
      - ``105``
+   * - :spelling:ignore:`envoy.startupProbe.initialDelaySeconds`
+     - Initial delay before the startup probe begins
+     - int
+     - ``5``
    * - :spelling:ignore:`envoy.startupProbe.periodSeconds`
      - interval between checks of the startup probe
      - int
      - ``2``
+   * - :spelling:ignore:`envoy.startupProbe.timeoutSeconds`
+     - Timeout for the startup probe
+     - int
+     - ``5``
    * - :spelling:ignore:`envoy.streamIdleTimeoutDurationSeconds`
      - Set Envoy the amount of time that the connection manager will allow a stream to exist with no upstream or downstream activity. default 5 minutes
      - int
@@ -3159,7 +3211,7 @@
    * - :spelling:ignore:`nodePort`
      - Configure N-S k8s service loadbalancing
      - object
-     - ``{"addresses":null,"autoProtectPortRange":true,"bindProtection":true,"enableHealthCheck":true,"enableHealthCheckLoadBalancerIP":false}``
+     - ``{"addresses":null,"autoProtectPortRange":true,"bindProtection":true,"enableDynamicSourceLookup":false,"enableHealthCheck":true,"enableHealthCheckLoadBalancerIP":false}``
    * - :spelling:ignore:`nodePort.addresses`
      - List of CIDRs for choosing which IP addresses assigned to native devices are used for NodePort load-balancing. By default this is empty and the first suitable, preferably private, IPv4 and IPv6 address assigned to each device is used.  Example:    addresses: ["192.168.1.0/24", "2001::/64"]
      - string
@@ -3172,6 +3224,10 @@
      - Set to true to prevent applications binding to service ports.
      - bool
      - ``true``
+   * - :spelling:ignore:`nodePort.enableDynamicSourceLookup`
+     - Enable dynamic source IP resolution for SNAT via linux's routing table. The kernel must support this feature.
+     - bool
+     - ``false``
    * - :spelling:ignore:`nodePort.enableHealthCheck`
      - Enable healthcheck nodePort server for NodePort services
      - bool
@@ -3567,7 +3623,7 @@
    * - :spelling:ignore:`preflight.envoy.image`
      - Envoy pre-flight image.
      - object
-     - ``{"digest":"sha256:f3b4865104d4bc687e49ba401e9c6add7d36d316a90999afde74a6eaf7732960","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/cilium-envoy","tag":"v1.36.5-1773220197-f7a54727954edc6855e6f8bc674aff8ca57a80da","useDigest":true}``
+     - ``{"digest":"sha256:df144744740f91dc55ca39367f61c9a214a989d543c6f91319ccd686ddd7477f","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/cilium-envoy","tag":"v1.36.5-1775137579-2b3493aca96923190423ccec7e4dbc5f074ccad4","useDigest":true}``
    * - :spelling:ignore:`preflight.extraEnv`
      - Additional preflight environment variables.
      - list

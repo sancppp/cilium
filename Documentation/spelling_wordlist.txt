@@ -691,6 +691,7 @@ qdisc
 qdiscs
 qede
 qemu
+quantile
 queryable
 queueing
 rST
@@ -842,6 +843,7 @@ udp
 ui
 uid
 uint
+unapplied
 unaudited
 uncommented
 uncordon

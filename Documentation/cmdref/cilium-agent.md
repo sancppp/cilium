@@ -129,6 +129,7 @@ cilium-agent [flags]
       --enable-drift-checker                                      Enables support for config drift checker (default true)
       --enable-dynamic-config                                     Enables support for dynamic agent config (default true)
       --enable-dynamic-lifecycle-manager                          Enables support for dynamic lifecycle management
+      --enable-dynamic-source-lookup-nodeport                     Enable dynamic source IP resolution for SNAT via linux's routing table. The kernel must support this feature.
       --enable-egress-gateway                                     Enable egress gateway
       --enable-encryption-strict-mode-egress                      Enable strict mode encryption enforcement for egress traffic
       --enable-encryption-strict-mode-ingress                     Enable strict mode encryption enforcement for ingress traffic
@@ -197,6 +198,7 @@ cilium-agent [flags]
       --encryption-strict-egress-allow-remote-node-identities     Allows unencrypted traffic from pods to remote node identities within the strict mode CIDR. This is required when tunneling is used or direct routing is used and the node CIDR and pod CIDR overlap.
       --encryption-strict-egress-cidr string                      In strict-mode-egress encryption, all unencrypted traffic coming from this CIDR and going to this same CIDR will be dropped.
       --endpoint-bpf-prog-watchdog-interval duration              Interval to trigger endpoint BPF programs load check watchdog (default 30s)
+      --endpoint-policy-update-timeout duration                   Timeout duration for Endpoint policy updates (default 10s)
       --endpoint-queue-size int                                   Size of EventQueue per-endpoint (default 25)
       --endpoint-regen-interval duration                          Periodically recalculate and re-apply endpoint configuration. Set to 0 to disable (default 2m0s)
       --eni-delete-on-termination                                 Whether the ENI should be deleted when the associated instance is terminated at the node level (default true)
@@ -209,6 +211,7 @@ cilium-agent [flags]
       --eni-subnet-tags stringToString                            List of tags to use when evaluating what AWS subnets to use for ENI and IP allocation at the node level (default [])
       --eni-use-primary-address                                   Whether an ENI's primary address should be available for allocations on the node at the node level
       --envoy-access-log-buffer-size uint                         Envoy access log buffer size in bytes (default 4096)
+      --envoy-access-log-enabled                                  Enable access log forwarding for integration with Hubble. (default true)
       --envoy-base-id uint                                        Envoy base ID
       --envoy-config-retry-interval duration                      Interval in which an attempt is made to reconcile failed EnvoyConfigs. If the duration is zero, the retry is deactivated. (default 15s)
       --envoy-config-timeout duration                             Timeout that determines how long to wait for Envoy to N/ACK CiliumEnvoyConfig resources (default 2m0s)
@@ -216,6 +219,7 @@ cilium-agent [flags]
       --envoy-http-upstream-linger-timeout int                    Time in seconds to block Envoy worker thread while an upstream HTTP connection is closing. If set to 0, the connection is closed immediately (with TCP RST). If set to -1, the connection is closed asynchronously in the background. (default -1)
       --envoy-keep-cap-netbindservice                             Keep capability NET_BIND_SERVICE for Envoy process
       --envoy-log string                                          Path to a separate Envoy log file, if any
+      --envoy-node-locality-enabled                               Enable Envoy node-locality support for zone-aware routing
       --envoy-policy-restore-timeout duration                     Maximum time to wait for endpoint policy restoration before starting serving resources to Envoy (default 3m0s)
       --envoy-secrets-namespace string                            EnvoySecretsNamespace is the namespace having secrets used by CEC
       --exclude-local-address strings                             Exclude CIDR from being recognized as local address

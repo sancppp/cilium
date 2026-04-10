@@ -10,6 +10,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -21,6 +22,7 @@ type onDemandXdsStarter struct {
 	runDir                         string
 	envoyLogPath                   string
 	envoyDefaultLogLevel           string
+	envoyNodeLocalityEnabled       bool
 	envoyBaseID                    uint64
 	keepCapNetBindService          bool
 	metricsListenerPort            int
@@ -33,6 +35,7 @@ type onDemandXdsStarter struct {
 	maxConcurrentRetries           uint32
 	maxConnections                 uint32
 	maxRequests                    uint32
+	localNodeStore                 *node.LocalNodeStore
 
 	envoyOnce sync.Once
 }
@@ -40,8 +43,8 @@ type onDemandXdsStarter struct {
 var _ XDSServer = &onDemandXdsStarter{}
 
 func (o *onDemandXdsStarter) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
-	if err := o.startEmbeddedEnvoy(nil); err != nil {
-		o.logger.Error("Envoy: Failed to start embedded Envoy proxy on demand",
+	if err := o.startStandaloneEnvoy(nil); err != nil {
+		o.logger.Error("Envoy: Failed to start standalone Envoy proxy on demand",
 			logfields.Error, err,
 		)
 	}
@@ -50,8 +53,8 @@ func (o *onDemandXdsStarter) AddListener(name string, kind policy.L7ParserType, 
 }
 
 func (o *onDemandXdsStarter) UpsertEnvoyResources(ctx context.Context, resources Resources) error {
-	if err := o.startEmbeddedEnvoy(nil); err != nil {
-		o.logger.Error("Envoy: Failed to start embedded Envoy proxy on demand",
+	if err := o.startStandaloneEnvoy(nil); err != nil {
+		o.logger.Error("Envoy: Failed to start standalone Envoy proxy on demand",
 			logfields.Error, err,
 		)
 	}
@@ -60,8 +63,8 @@ func (o *onDemandXdsStarter) UpsertEnvoyResources(ctx context.Context, resources
 }
 
 func (o *onDemandXdsStarter) UpdateEnvoyResources(ctx context.Context, old, new Resources) error {
-	if err := o.startEmbeddedEnvoy(nil); err != nil {
-		o.logger.Error("Envoy: Failed to start embedded Envoy proxy on demand",
+	if err := o.startStandaloneEnvoy(nil); err != nil {
+		o.logger.Error("Envoy: Failed to start standalone Envoy proxy on demand",
 			logfields.Error, err,
 		)
 	}
@@ -69,15 +72,16 @@ func (o *onDemandXdsStarter) UpdateEnvoyResources(ctx context.Context, old, new 
 	return o.XDSServer.UpdateEnvoyResources(ctx, old, new)
 }
 
-func (o *onDemandXdsStarter) startEmbeddedEnvoy(wg *completion.WaitGroup) error {
+func (o *onDemandXdsStarter) startStandaloneEnvoy(wg *completion.WaitGroup) error {
 	var startErr error
 
 	o.envoyOnce.Do(func() {
-		// Start embedded Envoy on first invocation
-		_, startErr = o.startEmbeddedEnvoyInternal(embeddedEnvoyConfig{
+		// Start standalone Envoy on first invocation
+		_, startErr = o.startStandaloneEnvoyInternal(standaloneEnvoyConfig{
 			runDir:                         o.runDir,
 			logPath:                        o.envoyLogPath,
 			defaultLogLevel:                o.envoyDefaultLogLevel,
+			nodeLocalityEnabled:            o.envoyNodeLocalityEnabled,
 			baseID:                         o.envoyBaseID,
 			keepCapNetBindService:          o.keepCapNetBindService,
 			connectTimeout:                 o.connectTimeout,

@@ -811,7 +811,22 @@ func (ct *ConnectivityTest) detectNodesWithoutCiliumIPs() error {
 	return nil
 }
 
+func (ct *ConnectivityTest) requiresStaticRoutes() bool {
+	if f, ok := ct.Feature(features.Flavor); ok && f.Enabled {
+		switch f.Mode {
+		case "gke", "aks", "eks":
+			return false
+		}
+	}
+	return true
+}
+
 func (ct *ConnectivityTest) modifyStaticRoutesForNodesWithoutCilium(ctx context.Context, verb string) error {
+	if !ct.requiresStaticRoutes() {
+		ct.Debugf("Skipping modifying static route on nodes without Cilium, cloud platform has pod connectivity")
+		return nil
+	}
+
 	for _, e := range ct.params.PodCIDRs {
 		for withoutCilium := range ct.nodesWithoutCilium {
 			pod := ct.hostNetNSPodsByNode[withoutCilium]
@@ -829,6 +844,34 @@ func (ct *ConnectivityTest) modifyStaticRoutesForNodesWithoutCilium(ctx context.
 	}
 
 	return nil
+}
+
+// NeedsStaticRoutes checks whether any test requires static ip routes
+// installed.
+func (ct *ConnectivityTest) NeedsStaticRoutes() bool {
+	for _, t := range ct.tests {
+		if t.installIPRoutesFromOutsideToPodCIDRs {
+			return true
+		}
+	}
+	return false
+}
+
+// SetupStaticRoutes idempotently sets up static routes for nodes without Cilium.
+func (ct *ConnectivityTest) SetupStaticRoutes(ctx context.Context) error {
+	if !ct.NeedsStaticRoutes() {
+		return nil
+	}
+	ct.modifyStaticRoutesForNodesWithoutCilium(ctx, "del")
+	return ct.modifyStaticRoutesForNodesWithoutCilium(ctx, "add")
+}
+
+// TeardownStaticRoutes tears down static routes for nodes without Cilium.
+func (ct *ConnectivityTest) TeardownStaticRoutes(ctx context.Context) error {
+	if !ct.NeedsStaticRoutes() {
+		return nil
+	}
+	return ct.modifyStaticRoutesForNodesWithoutCilium(ctx, "del")
 }
 
 // multiClusterClientLock protects K8S client instantiation (Scheme registration)

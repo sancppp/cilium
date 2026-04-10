@@ -20,10 +20,6 @@ cilium-operator-alibabacloud [flags]
       --cilium-pod-namespace string                                Name of the Kubernetes namespace in which Cilium is deployed in. Defaults to the same namespace defined in k8s-namespace
       --cluster-id uint32                                          Unique identifier of the cluster
       --cluster-name string                                        Name of the cluster. It must consist of at most 32 lower case alphanumeric characters and '-', start and end with an alphanumeric character. (default "default")
-      --cluster-pool-ipv4-cidr strings                             IPv4 CIDR Range for Pods in cluster. Requires 'ipam=cluster-pool' and 'enable-ipv4=true'
-      --cluster-pool-ipv4-mask-size int                            Mask size for each IPv4 podCIDR per node. Requires 'ipam=cluster-pool' and 'enable-ipv4=true' (default 24)
-      --cluster-pool-ipv6-cidr strings                             IPv6 CIDR Range for Pods in cluster. Requires 'ipam=cluster-pool' and 'enable-ipv6=true'
-      --cluster-pool-ipv6-mask-size int                            Mask size for each IPv6 podCIDR per node. Requires 'ipam=cluster-pool' and 'enable-ipv6=true' (default 112)
       --clustermesh-cache-ttl duration                             The time to live for the cache of a remote cluster after connectivity is lost. If the connection is not re-established within this duration, the cached data is revoked to prevent stale state. If not specified or set to 0s, the cache is never revoked.
       --clustermesh-concurrent-service-endpoint-syncs int          The number of remote cluster service syncing operations that will be done concurrently. Larger number = faster endpoint slice updating, but more CPU (and network) load. (default 5)
       --clustermesh-config string                                  Path to the ClusterMesh configuration directory
@@ -144,14 +140,14 @@ cilium-operator-alibabacloud [flags]
       --policy-secrets-namespace string                            Namespace where secrets used in TLS Interception will be synced to. (default "cilium-secrets")
       --remove-cilium-node-taints                                  Remove node taint "node.cilium.io/agent-not-ready" from Kubernetes nodes once Cilium is up and running (default true)
       --set-cilium-is-up-condition                                 Set CiliumIsUp Node condition to mark a Kubernetes Node that a Cilium pod is up and running in that node (default true)
-      --set-cilium-node-taints                                     Set node taint "node.cilium.io/agent-not-ready" from Kubernetes nodes if Cilium is scheduled but not up and running
+      --set-cilium-node-taints                                     Set node taint "node.cilium.io/agent-not-ready" on Kubernetes nodes if Cilium is scheduled but not up and running
       --shell-sock-path string                                     Path to the shell UNIX socket (default "/var/run/cilium/shell.sock")
       --skip-crd-creation                                          When true, Kubernetes Custom Resource Definitions will not be created
       --subnet-ids-filter strings                                  Subnets IDs (separated by commas)
       --subnet-tags-filter map                                     Subnets tags in the form of k1=v1,k2=v2 (multiple k/v pairs can also be passed by repeating the CLI flag
       --synchronize-k8s-nodes                                      Perform GC of stale node entries from the KVStore (default true)
       --synchronize-k8s-services                                   Synchronize Kubernetes services to kvstore (default true)
-      --taint-sync-workers int                                     Number of workers used to synchronize node tains and conditions (default 10)
+      --taint-sync-workers int                                     Number of workers used to synchronize node taints and conditions (default 10)
       --unmanaged-pod-watcher-interval duration                    Interval to check for unmanaged kube-dns pods (0 to disable) (default 15s)
       --validate-network-policy                                    Whether to enable or disable the informational network policy validator (default true)
       --version                                                    Print version information

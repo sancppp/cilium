@@ -27,7 +27,7 @@ on:
 # By specifying the access of one of the scopes, all of those that are not
 # specified are set to 'none'.
 permissions:
-  # To read actions state with catchpoint/workflow-telemetry-action
+  # To read actions state with cilium/workflow-telemetry-action
   actions: read
   # To be able to access the repository with actions/checkout
   contents: read
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        uses: cilium/cilium/.github/actions/set-commit-status@main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -135,13 +135,12 @@ jobs:
     timeout-minutes: 75
     steps:
       - name: Set commit status to pending
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        uses: cilium/cilium/.github/actions/set-commit-status@main
         with:
           sha: ${{ inputs.SHA || github.sha }}
-          status: pending
 
       - name: Collect Workflow Telemetry
-        uses: catchpoint/workflow-telemetry-action@94c3c3d9567a0205de6da68a76c428ce4e769af1 # v2.0.0
+        uses: cilium/workflow-telemetry-action@b1a318f80a08acede58027afe1455d037379966f # v2.2.0
         with:
           comment_on_pr: false
 
@@ -332,38 +331,22 @@ jobs:
           script: ./.github/actions/bpftrace/scripts/check-encryption-leaks.bt
           args: ${{ steps.bpftrace-params.outputs.params }} "${{ matrix.ipv4 != 'false' }}" "ipsec"
 
-      - name: Run sequential tests (${{ join(matrix.*, ', ') }})
+      - name: Run concurrent tests (${{ join(matrix.*, ', ') }})
         id: run-tests
         shell: bash
         run: |
           mkdir -p cilium-junits
 
-          TEST='"seq-.*"'
+          TEST=''
           if [ "${{ matrix.ipv4 }}" == "false" ]; then
-            TEST='"seq-.*,!pod-to-world.*"'
-          fi
-
-          cilium connectivity test ${{ steps.vars-conn.outputs.connectivity_test_defaults }} \
-            --sysdump-output-filename "cilium-sysdump-${{ matrix.name }}-<ts>" \
-            --junit-file "cilium-junits/${{ env.job_name }}-sequential-pre-rotate (${{ join(matrix.*, ', ') }}).xml" \
-            --junit-property github_job_step="Run tests (${{ join(matrix.*, ', ') }})" \
-            --test $TEST
-
-      - name: Run concurrent tests (${{ join(matrix.*, ', ') }})
-        shell: bash
-        run: |
-          mkdir -p cilium-junits
-
-          TEST='"!seq-.*"'
-          if [ "${{ matrix.ipv4 }}" == "false" ]; then
-            TEST='"!(seq-.*|pod-to-world.*|pod-to-cidr)"'
+            TEST='--test "!(pod-to-world.*|pod-to-cidr)"'
           fi
 
           cilium connectivity test ${{ steps.vars-conn.outputs.connectivity_test_defaults }} \
             --sysdump-output-filename "cilium-sysdump-${{ matrix.name }}-<ts>" \
             --junit-file "cilium-junits/${{ env.job_name }}-concurrent-pre-rotate (${{ join(matrix.*, ', ') }}).xml" \
             --junit-property github_job_step="Run tests (${{ join(matrix.*, ', ') }})" \
-            --test $TEST \
+            $TEST \
             --test-concurrency=${{ env.test_concurrency }}
 
       - name: Features tested
@@ -406,37 +389,21 @@ jobs:
           script: ./.github/actions/bpftrace/scripts/check-encryption-leaks.bt
           args: ${{ steps.bpftrace-params.outputs.params }} "${{ matrix.ipv4 != 'false' }}" "ipsec"
 
-      - name: Run sequential tests (${{ join(matrix.*, ', ') }})
-        shell: bash
-        run: |
-          mkdir -p cilium-junits
-
-          TEST='"seq-.*"'
-          if [ "${{ matrix.ipv4 }}" == "false" ]; then
-            TEST='"seq-.*,!pod-to-world.*"'
-          fi
-
-          cilium connectivity test ${{ steps.vars-conn.outputs.connectivity_test_defaults }} \
-            --sysdump-output-filename "cilium-sysdump-${{ matrix.name }}-<ts>" \
-            --junit-file "cilium-junits/${{ env.job_name }}-sequential-post-rotate (${{ join(matrix.*, ', ') }}).xml" \
-            --junit-property github_job_step="Run tests (${{ join(matrix.*, ', ') }})" \
-            --test $TEST
-
       - name: Run concurrent tests (${{ join(matrix.*, ', ') }})
         shell: bash
         run: |
           mkdir -p cilium-junits
 
-          TEST='"!seq-.*"'
+          TEST=''
           if [ "${{ matrix.ipv4 }}" == "false" ]; then
-            TEST='"!(seq-.*|pod-to-world.*|pod-to-cidr)"'
+            TEST='--test "!(pod-to-world.*|pod-to-cidr)"'
           fi
 
           cilium connectivity test ${{ steps.vars-conn.outputs.connectivity_test_defaults }} \
             --sysdump-output-filename "cilium-sysdump-${{ matrix.name }}-<ts>" \
             --junit-file "cilium-junits/${{ env.job_name }}-concurrent-post-rotate (${{ join(matrix.*, ', ') }}).xml" \
             --junit-property github_job_step="Run tests (${{ join(matrix.*, ', ') }})" \
-            --test $TEST \
+            $TEST \
             --test-concurrency=${{ env.test_concurrency }}
 
       - name: Features tested

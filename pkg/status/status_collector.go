@@ -20,7 +20,6 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/identity"
 	k8smetrics "github.com/cilium/cilium/pkg/k8s/metrics"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -124,8 +123,8 @@ func (d *statusCollector) getMasqueradingStatus(ctx context.Context) (*models.Ma
 	s := &models.Masquerading{
 		Enabled: d.statusParams.DaemonConfig.MasqueradingEnabled(),
 		EnabledProtocols: &models.MasqueradingEnabledProtocols{
-			IPV4: d.statusParams.DaemonConfig.EnableIPv4Masquerade,
-			IPV6: d.statusParams.DaemonConfig.EnableIPv6Masquerade,
+			IPv4: d.statusParams.DaemonConfig.EnableIPv4Masquerade,
+			IPv6: d.statusParams.DaemonConfig.EnableIPv6Masquerade,
 		},
 	}
 
@@ -141,7 +140,7 @@ func (d *statusCollector) getMasqueradingStatus(ctx context.Context) (*models.Ma
 	if d.statusParams.DaemonConfig.EnableIPv4 {
 		// SnatExclusionCidr is the legacy field, continue to provide
 		// it for the time being
-		addr := datapath.RemoteSNATDstAddrExclusionCIDRv4(localNode)
+		addr := localNode.RemoteSNATDstAddrExclusionCIDRv4()
 		if addr == nil {
 			return s, errors.New("no local node v4 CIDR")
 		}
@@ -151,7 +150,7 @@ func (d *statusCollector) getMasqueradingStatus(ctx context.Context) (*models.Ma
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv6 {
-		addr := datapath.RemoteSNATDstAddrExclusionCIDRv6(localNode)
+		addr := localNode.RemoteSNATDstAddrExclusionCIDRv6()
 		if addr == nil {
 			return s, errors.New("no local node v6 CIDR")
 		}
@@ -177,7 +176,7 @@ func (d *statusCollector) getSRv6Status() *models.Srv6 {
 
 func (d *statusCollector) getIPV6BigTCPStatus() *models.IPV6BigTCP {
 	s := &models.IPV6BigTCP{
-		Enabled: d.statusParams.BigTCPConfig.EnableIPv6BIGTCP,
+		Enabled: d.statusParams.BigTCPConfig.IsIPv6Enabled(),
 		MaxGRO:  int64(d.statusParams.BigTCPConfig.GetGROIPv6MaxSize()),
 		MaxGSO:  int64(d.statusParams.BigTCPConfig.GetGSOIPv6MaxSize()),
 	}
@@ -187,7 +186,7 @@ func (d *statusCollector) getIPV6BigTCPStatus() *models.IPV6BigTCP {
 
 func (d *statusCollector) getIPV4BigTCPStatus() *models.IPV4BigTCP {
 	s := &models.IPV4BigTCP{
-		Enabled: d.statusParams.BigTCPConfig.EnableIPv4BIGTCP,
+		Enabled: d.statusParams.BigTCPConfig.IsIPv4Enabled(),
 		MaxGRO:  int64(d.statusParams.BigTCPConfig.GetGROIPv4MaxSize()),
 		MaxGSO:  int64(d.statusParams.BigTCPConfig.GetGSOIPv4MaxSize()),
 	}
@@ -538,11 +537,11 @@ func (d *statusCollector) dumpIPAM() *models.IPAMStatus {
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv4 {
-		status.IPV4 = v4
+		status.IPv4 = v4
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv6 {
-		status.IPV6 = v6
+		status.IPv6 = v6
 	}
 
 	status.Allocations = allocv4
@@ -697,7 +696,7 @@ func (d *statusCollector) getProbes() []Probe {
 					return backoff.ClusterSizeDependantInterval(2*time.Minute, 0)
 				}
 
-				// The base interval is dependant on the
+				// The base interval is dependent on the
 				// cluster size. One status interval does not
 				// automatically translate to an apiserver
 				// interaction as any regular apiserver
@@ -1030,7 +1029,7 @@ func (d *statusCollector) getProbes() []Probe {
 
 				if status.Err == nil {
 					if s, ok := status.Data.(*models.IPV6BigTCP); ok {
-						d.statusResponse.IPV6BigTCP = s
+						d.statusResponse.IPv6BigTCP = s
 					}
 				}
 			},
@@ -1046,7 +1045,7 @@ func (d *statusCollector) getProbes() []Probe {
 
 				if status.Err == nil {
 					if s, ok := status.Data.(*models.IPV4BigTCP); ok {
-						d.statusResponse.IPV4BigTCP = s
+						d.statusResponse.IPv4BigTCP = s
 					}
 				}
 			},
