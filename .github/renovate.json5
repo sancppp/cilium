@@ -121,6 +121,26 @@
   "assignAutomerge": true,
   "packageRules": [
     {
+      // Dependency cooldown: skip versions published less than 5 days ago
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "minimumReleaseAge": "5 days"
+    },
+    {
+      // Do not pin digests for self-referenced cilium/cilium GitHub Actions
+      // and reusable workflows (e.g.,
+      // cilium/cilium/.github/actions/set-commit-status@main or
+      // cilium/cilium/.github/workflows/foo.yaml@v1.17). These are internal
+      // references within the same repository and should not be pinned to a
+      // commit SHA by Renovate.
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "cilium/cilium"
+      ],
+      "pinDigests": false
+    },
+    {
       "matchPackageNames": [
         "bufbuild/buf", // Protocol buffer toolkit
         "docker.io/alpine/socat", // Alpine socat package
@@ -353,7 +373,9 @@
         "/github.com/onsi/ginkgo/",
         "/github.com/onsi/gomega/*/",
         // We can't update it, see https://github.com/cilium/cilium/issues/44063 for more info
-        "github.com/cilium/ebpf"
+        "github.com/cilium/ebpf",
+        // The version upgrade from 9.0.4 to 9.1.0 breaks our CI
+        "sphinx"
       ]
     },
     {
@@ -535,17 +557,6 @@
       "matchDepNames": [
         "golangci/golangci-lint",
         "golangci/golangci-lint-action"
-      ]
-    },
-    {
-      // Do not allow any updates into stable branches.
-      "enabled": false,
-      "matchDepNames": [
-        "golangci/golangci-lint",
-        "golangci/golangci-lint-action"
-      ],
-      "matchBaseBranches": [
-        "!main",
       ]
     },
     {
@@ -825,9 +836,25 @@
         "quay.io/cilium/cilium-envoy"
       ],
       "versioning": "regex:v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<build>\\d+).*$",
-      "allowedVersions": "/^v1\\.36\\.([0-9]+)-([0-9]+)-.*$/",
+      "allowedVersions": "/^v1\\.37\\.([0-9]+)-([0-9]+)-.*$/",
       "matchBaseBranches": [
         "main",
+      ]
+    },
+    {
+      // cilium-envoy is referenced in both images/cilium/Dockerfile and
+      // install/kubernetes/Makefile.values. Without explicit grouping,
+      // Renovate creates separate PRs for each manager. The groupSlug ensures
+      // both updates use the same branch name and get combined into a single
+      // PR.
+      "groupName": "cilium-envoy",
+      "groupSlug": "cilium-envoy",
+      "matchDepNames": [
+        "quay.io/cilium/cilium-envoy"
+      ],
+      "versioning": "regex:v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<build>\\d+).*$",
+      "allowedVersions": "/^v1\\.36\\.([0-9]+)-([0-9]+)-.*$/",
+      "matchBaseBranches": [
         "v1.19",
         "v1.18",
         "v1.17"
@@ -1058,7 +1085,7 @@
       // similar to the examples shown here:
       //   https://docs.renovatebot.com/modules/manager/regex/#advanced-capture
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>.*?)\\s+.+_REPO:=(?<depName>.*?)\\s+.+_VERSION:=(?<currentValue>.*)\\s+.+_DIGEST:=(?<currentDigest>sha256:[a-f0-9]+)"
+        "# renovate: datasource=(?<datasource>.*?)\\s+.+_REPO[:?]=(?<depName>.*?)\\s+.+_VERSION[:?]=(?<currentValue>.*)\\s+.+_DIGEST[:?]=(?<currentDigest>sha256:[a-f0-9]+)"
       ]
     },
     {

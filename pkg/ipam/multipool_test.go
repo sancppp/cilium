@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cilium/hive/cell"
@@ -18,15 +20,21 @@ import (
 	"github.com/cilium/statedb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	k8sTesting "k8s.io/client-go/testing"
 
 	"github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/hive"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipam/podippool"
 	"github.com/cilium/cilium/pkg/ipam/service/ipallocator"
 	"github.com/cilium/cilium/pkg/ipam/types"
@@ -40,37 +48,17 @@ import (
 )
 
 func Test_MultiPoolManager(t *testing.T) {
-	fakeConfig := testConfiguration
-	// disable debounce interval to trigger CiliumNode update at each test step
-	fakeConfig.IPAMCiliumNodeUpdateRate = 1 * time.Nanosecond
-	// set custom preAllocMap for unit tests
-	fakeConfig.IPAMMultiPoolPreAllocation = map[string]string{
-		"default": "16",
-		"mars":    "8",
-	}
-	events := make(chan string, 1)
-	cnEvents := make(chan resource.Event[*ciliumv2.CiliumNode])
-	fakeK8sCiliumNodeAPI := &fakeK8sCiliumNodeAPIResource{
-		c:    cnEvents,
-		node: &ciliumv2.CiliumNode{},
-		onDeleteEvent: func(err error) {
-			if err != nil {
-				t.Errorf("deleting failed: %v", err)
-			}
-			events <- "delete"
-		},
-		onUpsertEvent: func(err error) {
-			if err != nil {
-				t.Errorf("upserting failed: %v", err)
-			}
-			events <- "upsert"
-		},
-	}
+	var (
+		tick    = 10 * time.Millisecond
+		timeout = 2 * refreshPoolInterval
+	)
 
-	defaultIPv4CIDR1 := cidr.MustParseCIDR("10.0.22.0/24")
-	defaultIPv6CIDR1 := cidr.MustParseCIDR("fd00:22::/96")
-	marsIPv4CIDR1 := cidr.MustParseCIDR("10.0.11.0/27")
-	marsIPv6CIDR1 := cidr.MustParseCIDR("fd00:11::/123")
+	nodeTypes.SetName("test-node")
+
+	defaultIPv4CIDR1 := netip.MustParsePrefix("10.0.22.0/24")
+	defaultIPv6CIDR1 := netip.MustParsePrefix("fd00:22::/96")
+	marsIPv4CIDR1 := netip.MustParsePrefix("10.0.11.0/27")
+	marsIPv6CIDR1 := netip.MustParsePrefix("fd00:11::/123")
 
 	currentNode := &ciliumv2.CiliumNode{
 		ObjectMeta: metav1.ObjectMeta{Name: nodeTypes.GetName()},
@@ -80,16 +68,17 @@ func Test_MultiPoolManager(t *testing.T) {
 					Allocated: []types.IPAMPoolAllocation{
 						{
 							Pool: "default",
-							CIDRs: []types.IPAMCIDR{
-								types.IPAMCIDR(defaultIPv4CIDR1.String()),
-								types.IPAMCIDR(defaultIPv6CIDR1.String()),
+							CIDRs: []iputil.Prefix{
+								iputil.PrefixFrom(defaultIPv4CIDR1),
+								iputil.PrefixFrom(defaultIPv6CIDR1),
 							},
 						},
 						{
-							Pool: "mars",
-							CIDRs: []types.IPAMCIDR{
-								types.IPAMCIDR(marsIPv4CIDR1.String()),
-								types.IPAMCIDR(marsIPv6CIDR1.String()),
+							Pool:        "mars",
+							AllowLastIP: true,
+							CIDRs: []iputil.Prefix{
+								iputil.PrefixFrom(marsIPv4CIDR1),
+								iputil.PrefixFrom(marsIPv6CIDR1),
 							},
 						},
 					},
@@ -98,371 +87,434 @@ func Test_MultiPoolManager(t *testing.T) {
 		},
 	}
 
-	// provide initial CiliumNode CRD - we expect newMultiPoolManager to stop
-	// waiting for initial local node sync and return
-	go fakeK8sCiliumNodeAPI.updateNode(currentNode)
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			jg        job.Group
+			localNode k8s.LocalCiliumNodeResource
+			clientset *k8sClient.FakeClientset
+		)
+		h := hive.New(
+			k8s.ResourcesCell,
+			k8sClient.FakeClientCell(),
+			cell.Provide(func() *node.LocalNodeStore { return node.NewTestLocalNodeStore(node.LocalNode{}) }),
+			cell.Invoke(
+				func(
+					jg_ job.Group,
+					localNode_ k8s.LocalCiliumNodeResource,
+					localNodeStore_ *node.LocalNodeStore,
+					clientset_ *k8sClient.FakeClientset,
+				) {
+					jg = jg_
+					localNode = localNode_
+					clientset = clientset_
+				},
+			),
+		)
 
-	var jg job.Group
-	h := hive.New(
-		cell.Invoke(func(jg_ job.Group) { jg = jg_ }),
-	)
+		tlog := hivetest.Logger(t, hivetest.LogLevel(slog.LevelError))
+		assert.NoError(t, h.Start(tlog, t.Context()))
+		t.Cleanup(func() { h.Stop(tlog, context.Background()) })
 
-	tlog := hivetest.Logger(t, hivetest.LogLevel(slog.LevelError))
-	assert.NoError(t, h.Start(tlog, t.Context()))
-	t.Cleanup(func() { h.Stop(tlog, context.Background()) })
+		// create local node
+		_, err := clientset.CiliumV2().CiliumNodes().Create(t.Context(), currentNode, metav1.CreateOptions{})
+		assert.NoError(t, err)
 
-	preallocMap, err := ParseMultiPoolPreAllocMap(fakeConfig.IPAMMultiPoolPreAllocation)
-	assert.NoError(t, err)
+		preallocMap, err := ParseMultiPoolPreAllocMap(map[string]string{
+			"default": "16",
+			"mars":    "8",
+		})
+		assert.NoError(t, err)
 
-	c := newMultiPoolManager(MultiPoolManagerParams{
-		Logger:               hivetest.Logger(t),
-		IPv4Enabled:          fakeConfig.EnableIPv4,
-		IPv6Enabled:          fakeConfig.EnableIPv6,
-		CiliumNodeUpdateRate: fakeConfig.IPAMCiliumNodeUpdateRate,
-		PreallocMap:          preallocMap,
-		Node:                 fakeK8sCiliumNodeAPI,
-		CNClient:             fakeK8sCiliumNodeAPI,
-		JobGroup:             jg,
-		PoolsFromResource: func(cn *ciliumv2.CiliumNode) *types.IPAMPoolSpec {
-			return &cn.Spec.IPAM.Pools
-		},
+		mgr := newMultiPoolManager(MultiPoolManagerParams{
+			Logger:               hivetest.Logger(t),
+			IPv4Enabled:          true,
+			IPv6Enabled:          true,
+			CiliumNodeUpdateRate: time.Nanosecond,
+			PreallocMap:          preallocMap,
+			Node:                 localNode,
+			CNClient:             clientset.CiliumV2().CiliumNodes(),
+			JobGroup:             jg,
+			PoolsFromResource: func(cn *ciliumv2.CiliumNode) *types.IPAMPoolSpec {
+				return &cn.Spec.IPAM.Pools
+			},
+		})
+
+		// Wait for agent pre-allocation request, then validate it
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			currentNode, err := clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+			assert.NoError(c, err)
+
+			assert.ElementsMatch(c,
+				[]types.IPAMPoolRequest{
+					{Pool: "default", Needed: types.IPAMPoolDemand{IPv4Addrs: 16, IPv6Addrs: 16}},
+					{Pool: "mars", Needed: types.IPAMPoolDemand{IPv4Addrs: 8, IPv6Addrs: 8}},
+				},
+				currentNode.Spec.IPAM.Pools.Requested,
+			)
+			assert.ElementsMatch(c,
+				[]types.IPAMPoolAllocation{
+					{
+						Pool: "default",
+						CIDRs: []iputil.Prefix{
+							iputil.PrefixFrom(defaultIPv4CIDR1),
+							iputil.PrefixFrom(defaultIPv6CIDR1),
+						},
+					},
+					{
+						Pool:        "mars",
+						AllowLastIP: true,
+						CIDRs: []iputil.Prefix{
+							iputil.PrefixFrom(marsIPv4CIDR1),
+							iputil.PrefixFrom(marsIPv6CIDR1),
+						},
+					},
+				},
+				currentNode.Spec.IPAM.Pools.Allocated,
+			)
+		}, timeout, tick)
+
+		unusedIPv4CIDR1 := netip.MustParsePrefix("10.0.33.0/24")
+		unusedIPv6CIDR1 := netip.MustParsePrefix("fd00:33::/96")
+
+		// Assign further CIDRs to pools (i.e. this simulates the operator logic)
+		currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+		assert.NoError(t, err)
+
+		updNode := currentNode.DeepCopy()
+		allocatedPools := []types.IPAMPoolAllocation{
+			{
+				Pool: "default",
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(defaultIPv4CIDR1),
+					iputil.PrefixFrom(defaultIPv6CIDR1),
+				},
+			},
+			{
+				Pool:        "mars",
+				AllowLastIP: true,
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(marsIPv4CIDR1),
+					iputil.PrefixFrom(marsIPv6CIDR1),
+				},
+			},
+			{
+				Pool: "unused",
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(unusedIPv4CIDR1),
+					iputil.PrefixFrom(unusedIPv6CIDR1),
+				},
+			},
+		}
+		updNode.Spec.IPAM.Pools.Allocated = allocatedPools
+
+		_, err = clientset.CiliumV2().CiliumNodes().Update(t.Context(), updNode, metav1.UpdateOptions{})
+		assert.NoError(t, err)
+
+		mgr.waitForAllPools()
+
+		// test allocation in default pool
+		defaultAllocation, err := mgr.allocateIP(netip.MustParseAddr("10.0.22.1"), "default-pod-1", "default", IPv4, false)
+		assert.NoError(t, err)
+		assert.Equal(t, netip.MustParseAddr("10.0.22.1"), defaultAllocation.IP)
+
+		// cannot allocate the same IP twice
+		faultyAllocation, err := mgr.allocateIP(netip.MustParseAddr("10.0.22.1"), "default-pod-1", "default", IPv4, false)
+		assert.ErrorIs(t, err, ipallocator.ErrAllocated)
+		assert.Nil(t, faultyAllocation)
+
+		// Allocation from an unknown pool should create a new pending allocation
+		jupiterIPv4CIDR := netip.MustParsePrefix("192.168.1.0/16")
+		juptierIPv6CIDR := netip.MustParsePrefix("fc00:33::/96")
+
+		faultyAllocation, err = mgr.allocateIP(netip.MustParseAddr("192.168.1.1"), "jupiter-pod-0", "jupiter", IPv4, false)
+		assert.ErrorIs(t, err, &ErrPoolNotReadyYet{})
+		assert.Nil(t, faultyAllocation)
+		faultyAllocation, err = mgr.allocateNext("jupiter-pod-1", "jupiter", IPv6, false)
+		assert.ErrorIs(t, err, &ErrPoolNotReadyYet{})
+		assert.Nil(t, faultyAllocation)
+
+		// Try again. This should still fail, but not request an additional third IP
+		// (since the owner has already attempted to allocate). This however sets
+		// upstreamSync to 'true', which should populate .Spec.IPAM.Pools.Requested
+		// with pending requests for the "jupiter" pool
+		faultyAllocation, err = mgr.allocateNext("jupiter-pod-1", "jupiter", IPv6, true)
+		assert.ErrorIs(t, err, &ErrPoolNotReadyYet{})
+		assert.Nil(t, faultyAllocation)
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+			assert.NoError(c, err)
+
+			// Check that the agent has not (yet) removed the unused pool.
+			assert.Equal(c, allocatedPools, currentNode.Spec.IPAM.Pools.Allocated)
+			// Check if the agent now requests one IPv4 and one IPv6 IP for the jupiter pool
+			assert.Equal(c, []types.IPAMPoolRequest{
+				{
+					Pool: "default",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
+						IPv6Addrs: 16, // 0 allocated + 16 pre-allocate
+					},
+				},
+				{
+					Pool: "jupiter",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 1, // 1 pending, no pre-allocate
+						IPv6Addrs: 1, // 1 pending, no pre-allocate
+					},
+				},
+				{
+					Pool: "mars",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 8, // 0 allocated + 8 pre-allocate
+						IPv6Addrs: 8, // 0 allocated + 8 pre-allocate
+					},
+				},
+			}, currentNode.Spec.IPAM.Pools.Requested)
+		}, timeout, tick)
+
+		mgr.restoreFinished(IPv4)
+		mgr.restoreFinished(IPv6)
+
+		// Assign the jupiter pool
+		currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+		assert.NoError(t, err)
+
+		updNode = currentNode.DeepCopy()
+		updNode.Spec.IPAM.Pools.Allocated = []types.IPAMPoolAllocation{
+			{
+				Pool: "default",
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(defaultIPv6CIDR1),
+					iputil.PrefixFrom(defaultIPv4CIDR1),
+				},
+			},
+			{
+				Pool: "jupiter",
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(jupiterIPv4CIDR),
+					iputil.PrefixFrom(juptierIPv6CIDR),
+				},
+			},
+			{
+				Pool:        "mars",
+				AllowLastIP: true,
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(marsIPv6CIDR1),
+					iputil.PrefixFrom(marsIPv4CIDR1),
+				},
+			},
+			{
+				Pool: "unused",
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(unusedIPv4CIDR1),
+					iputil.PrefixFrom(unusedIPv6CIDR1),
+				},
+			},
+		}
+		_, err = clientset.CiliumV2().CiliumNodes().Update(t.Context(), updNode, metav1.UpdateOptions{})
+		assert.NoError(t, err)
+
+		assert.True(t, mgr.waitForPool(t.Context(), IPv4, "jupiter"))
+		assert.True(t, mgr.waitForPool(t.Context(), IPv6, "jupiter"))
+
+		// Allocations should now succeed
+		jupiterIP0 := netip.MustParseAddr("192.168.1.1")
+		allocatedJupiterIP0, err := mgr.allocateIP(jupiterIP0, "jupiter-pod-0", "jupiter", IPv4, false)
+		require.NoError(t, err)
+		require.NotNil(t, allocatedJupiterIP0)
+		assert.Equal(t, jupiterIP0, allocatedJupiterIP0.IP)
+
+		allocatedJupiterIP1, err := mgr.allocateNext("jupiter-pod-1", "jupiter", IPv6, false)
+		require.NoError(t, err)
+		require.NotNil(t, allocatedJupiterIP1)
+		assert.True(t, juptierIPv6CIDR.Contains(allocatedJupiterIP1.IP))
+
+		// Release IPs from jupiter pool. This should fully remove it from both
+		// "requested" and "allocated"
+		err = mgr.releaseIP(allocatedJupiterIP0.IP, "jupiter", IPv4, false)
+		assert.NoError(t, err)
+		err = mgr.releaseIP(allocatedJupiterIP1.IP, "jupiter", IPv6, true) // triggers sync
+		assert.NoError(t, err)
+
+		// Wait for agent to release jupiter and unused CIDRs
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+			assert.NoError(c, err)
+			assert.Equal(c, types.IPAMPoolSpec{
+				Requested: []types.IPAMPoolRequest{
+					{
+						Pool: "default",
+						Needed: types.IPAMPoolDemand{
+							IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
+							IPv6Addrs: 16, // 0 allocated + 16 pre-allocate
+						},
+					},
+					{
+						Pool: "mars",
+						Needed: types.IPAMPoolDemand{
+							IPv4Addrs: 8, // 0 allocated + 8 pre-allocate
+							IPv6Addrs: 8, // 0 allocated + 8 pre-allocate
+						},
+					},
+				},
+				Allocated: []types.IPAMPoolAllocation{
+					{
+						Pool: "default",
+						CIDRs: []iputil.Prefix{
+							iputil.PrefixFrom(defaultIPv4CIDR1),
+							iputil.PrefixFrom(defaultIPv6CIDR1),
+						},
+					},
+					{
+						Pool:        "mars",
+						AllowLastIP: true,
+						CIDRs: []iputil.Prefix{
+							iputil.PrefixFrom(marsIPv4CIDR1),
+							iputil.PrefixFrom(marsIPv6CIDR1),
+						},
+					},
+				},
+			}, currentNode.Spec.IPAM.Pools)
+		}, timeout, tick)
+
+		// exhaust mars ipv4 pool (/27 contains 31 IPs with allowLastIP enabled)
+		allocatedMarsIPs := []netip.Addr{}
+		numMarsIPs := 31
+		for i := range numMarsIPs {
+			// set upstreamSync to true for last allocation, to ensure we only get one upsert event
+			ar, err := mgr.allocateNext(fmt.Sprintf("mars-pod-%d", i), "mars", IPv4, i == numMarsIPs-1)
+			assert.NoError(t, err)
+			require.NotNil(t, ar)
+			assert.True(t, marsIPv4CIDR1.Contains(ar.IP))
+			allocatedMarsIPs = append(allocatedMarsIPs, ar.IP)
+		}
+		_, err = mgr.allocateNext("mars-pod-overflow", "mars", IPv4, false)
+		assert.ErrorContains(t, err, "all CIDR ranges are exhausted")
+
+		ipv4Dump, _ := mgr.dump(IPv4)
+		assert.Len(t, ipv4Dump, 2) // 2 pools: default + mars
+		assert.Len(t, ipv4Dump[PoolDefault()], 1)
+		assert.Len(t, ipv4Dump[Pool("mars")], numMarsIPs)
+
+		// Ensure Requested numbers are bumped
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+			assert.NoError(c, err)
+			assert.Equal(c, []types.IPAMPoolRequest{
+				{
+					Pool: "default",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
+						IPv6Addrs: 16,
+					},
+				},
+				{
+					Pool: "mars",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 40, // 31 allocated + 8 pre-allocate, rounded up to multiple of 8
+						IPv6Addrs: 8,
+					},
+				},
+			}, currentNode.Spec.IPAM.Pools.Requested)
+		}, timeout, tick)
+
+		marsIPv4CIDR2 := netip.MustParsePrefix("10.0.12.0/27")
+
+		// Assign additional mars IPv4 CIDR
+		currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+		assert.NoError(t, err)
+
+		updNode = currentNode.DeepCopy()
+		updNode.Spec.IPAM.Pools.Allocated = []types.IPAMPoolAllocation{
+			{
+				Pool: "default",
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(defaultIPv4CIDR1),
+					iputil.PrefixFrom(defaultIPv6CIDR1),
+				},
+			},
+			{
+				Pool:        "mars",
+				AllowLastIP: true,
+				CIDRs: []iputil.Prefix{
+					iputil.PrefixFrom(marsIPv4CIDR1),
+					iputil.PrefixFrom(marsIPv4CIDR2),
+					iputil.PrefixFrom(marsIPv6CIDR1),
+				},
+			},
+		}
+		_, err = clientset.CiliumV2().CiliumNodes().Update(t.Context(), updNode, metav1.UpdateOptions{})
+		assert.NoError(t, err)
+
+		var marsAllocation *AllocationResult
+
+		// Should eventually be able to allocate from mars pool again
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			marsAllocation, err = mgr.allocateNext("mars-pod-overflow", "mars", IPv4, false)
+			require.NoError(c, err)
+			require.NotNil(c, marsAllocation)
+			assert.True(c, marsIPv4CIDR2.Contains(marsAllocation.IP))
+		}, timeout, tick)
+
+		// Deallocate all other IPs from mars pool. This should release the old CIDR
+		for i, addr := range allocatedMarsIPs {
+			err = mgr.releaseIP(addr, "mars", IPv4, i == numMarsIPs-1)
+			assert.NoError(t, err)
+		}
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			currentNode, err = clientset.CiliumV2().CiliumNodes().Get(t.Context(), nodeTypes.GetName(), metav1.GetOptions{})
+			assert.NoError(c, err)
+
+			assert.Equal(c, []types.IPAMPoolRequest{
+				{
+					Pool: "default",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
+						IPv6Addrs: 16,
+					},
+				},
+				{
+					Pool: "mars",
+					Needed: types.IPAMPoolDemand{
+						IPv4Addrs: 16, // 1 allocated + 8 pre-allocate, rounded up to multiple of 8
+						IPv6Addrs: 8,
+					},
+				},
+			}, currentNode.Spec.IPAM.Pools.Requested)
+
+			// Initial mars CIDR should have been marked as released now
+			assert.Equal(c, []types.IPAMPoolAllocation{
+				{
+					Pool: "default",
+					CIDRs: []iputil.Prefix{
+						iputil.PrefixFrom(defaultIPv4CIDR1),
+						iputil.PrefixFrom(defaultIPv6CIDR1),
+					},
+				},
+				{
+					Pool:        "mars",
+					AllowLastIP: true,
+					CIDRs: []iputil.Prefix{
+						iputil.PrefixFrom(marsIPv4CIDR2),
+						iputil.PrefixFrom(marsIPv6CIDR1),
+					},
+				},
+			}, currentNode.Spec.IPAM.Pools.Allocated)
+		}, timeout, tick)
+
+		ipv4Dump, ipv4Summary := mgr.dump(IPv4)
+		assert.Equal(t, map[Pool]map[string]string{
+			PoolDefault(): {
+				defaultAllocation.IP.String(): "",
+			},
+			Pool("mars"): {
+				marsAllocation.IP.String(): "",
+			},
+		}, ipv4Dump)
+		assert.Equal(t, "2 IPAM pool(s) available", ipv4Summary)
 	})
-
-	// assert initial CiliumNode upsert has been sent to the events chan
-	assert.Equal(t, "upsert", <-events)
-
-	// Wait for agent pre-allocation request, then validate it
-	assert.Equal(t, "upsert", <-events)
-	currentNode = fakeK8sCiliumNodeAPI.currentNode()
-	assert.ElementsMatch(t,
-		[]types.IPAMPoolRequest{
-			{Pool: "default", Needed: types.IPAMPoolDemand{IPv4Addrs: 16, IPv6Addrs: 16}},
-			{Pool: "mars", Needed: types.IPAMPoolDemand{IPv4Addrs: 8, IPv6Addrs: 8}},
-		},
-		currentNode.Spec.IPAM.Pools.Requested,
-	)
-	assert.ElementsMatch(t,
-		[]types.IPAMPoolAllocation{
-			{
-				Pool: "default",
-				CIDRs: []types.IPAMCIDR{
-					types.IPAMCIDR(defaultIPv4CIDR1.String()),
-					types.IPAMCIDR(defaultIPv6CIDR1.String()),
-				},
-			},
-			{
-				Pool: "mars",
-				CIDRs: []types.IPAMCIDR{
-					types.IPAMCIDR(marsIPv4CIDR1.String()),
-					types.IPAMCIDR(marsIPv6CIDR1.String()),
-				},
-			},
-		},
-		currentNode.Spec.IPAM.Pools.Allocated,
-	)
-
-	unusedIPv4CIDR1 := cidr.MustParseCIDR("10.0.33.0/24")
-	unusedIPv6CIDR1 := cidr.MustParseCIDR("fd00:33::/96")
-
-	// Assign further CIDRs to pools (i.e. this simulates the operator logic)
-	allocatedPools := []types.IPAMPoolAllocation{
-		{
-			Pool: "default",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(defaultIPv4CIDR1.String()),
-				types.IPAMCIDR(defaultIPv6CIDR1.String()),
-			},
-		},
-		{
-			Pool: "mars",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(marsIPv4CIDR1.String()),
-				types.IPAMCIDR(marsIPv6CIDR1.String()),
-			},
-		},
-		{
-			Pool: "unused",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(unusedIPv4CIDR1.String()),
-				types.IPAMCIDR(unusedIPv6CIDR1.String()),
-			},
-		},
-	}
-	currentNode.Spec.IPAM.Pools.Allocated = allocatedPools
-
-	fakeK8sCiliumNodeAPI.updateNode(currentNode)
-	assert.Equal(t, "upsert", <-events)
-	c.waitForAllPools()
-
-	// test allocation in default pool
-	defaultAllocation, err := c.allocateIP(net.ParseIP("10.0.22.1"), "default-pod-1", "default", IPv4, false)
-	assert.NoError(t, err)
-	assert.Equal(t, defaultAllocation.IP, net.ParseIP("10.0.22.1"))
-
-	// cannot allocate the same IP twice
-	faultyAllocation, err := c.allocateIP(net.ParseIP("10.0.22.1"), "default-pod-1", "default", IPv4, false)
-	assert.ErrorIs(t, err, ipallocator.ErrAllocated)
-	assert.Nil(t, faultyAllocation)
-
-	// Allocation from an unknown pool should create a new pending allocation
-	jupiterIPv4CIDR := cidr.MustParseCIDR("192.168.1.0/16")
-	juptierIPv6CIDR := cidr.MustParseCIDR("fc00:33::/96")
-
-	faultyAllocation, err = c.allocateIP(net.ParseIP("192.168.1.1"), "jupiter-pod-0", "jupiter", IPv4, false)
-	assert.ErrorIs(t, err, &ErrPoolNotReadyYet{})
-	assert.Nil(t, faultyAllocation)
-	faultyAllocation, err = c.allocateNext("jupiter-pod-1", "jupiter", IPv6, false)
-	assert.ErrorIs(t, err, &ErrPoolNotReadyYet{})
-	assert.Nil(t, faultyAllocation)
-	// Try again. This should still fail, but not request an additional third IP
-	// (since the owner has already attempted to allocate). This however sets
-	// upstreamSync to 'true', which should populate .Spec.IPAM.Pools.Requested
-	// with pending requests for the "jupiter" pool
-	faultyAllocation, err = c.allocateNext("jupiter-pod-1", "jupiter", IPv6, true)
-	assert.ErrorIs(t, err, &ErrPoolNotReadyYet{})
-	assert.Nil(t, faultyAllocation)
-
-	assert.Equal(t, "upsert", <-events)
-	currentNode = fakeK8sCiliumNodeAPI.currentNode()
-	// Check that the agent has not (yet) removed the unused pool.
-	assert.Equal(t, allocatedPools, currentNode.Spec.IPAM.Pools.Allocated)
-	// Check if the agent now requests one IPv4 and one IPv6 IP for the jupiter pool
-	assert.Equal(t, []types.IPAMPoolRequest{
-		{
-			Pool: "default",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
-				IPv6Addrs: 16, // 0 allocated + 16 pre-allocate
-			},
-		},
-		{
-			Pool: "jupiter",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 1, // 1 pending, no pre-allocate
-				IPv6Addrs: 1, // 1 pending, no pre-allocate
-			},
-		},
-		{
-			Pool: "mars",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 8, // 0 allocated + 8 pre-allocate
-				IPv6Addrs: 8, // 0 allocated + 8 pre-allocate
-			},
-		},
-	}, currentNode.Spec.IPAM.Pools.Requested)
-
-	c.restoreFinished(IPv4)
-	c.restoreFinished(IPv6)
-
-	// Assign the jupiter pool
-	currentNode.Spec.IPAM.Pools.Allocated = []types.IPAMPoolAllocation{
-		{
-			Pool: "default",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(defaultIPv6CIDR1.String()),
-				types.IPAMCIDR(defaultIPv4CIDR1.String()),
-			},
-		},
-		{
-			Pool: "jupiter",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(jupiterIPv4CIDR.String()),
-				types.IPAMCIDR(juptierIPv6CIDR.String()),
-			},
-		},
-		{
-			Pool: "mars",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(marsIPv6CIDR1.String()),
-				types.IPAMCIDR(marsIPv4CIDR1.String()),
-			},
-		},
-		{
-			Pool: "unused",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(unusedIPv4CIDR1.String()),
-				types.IPAMCIDR(unusedIPv6CIDR1.String()),
-			},
-		},
-	}
-	fakeK8sCiliumNodeAPI.updateNode(currentNode)
-	assert.Equal(t, "upsert", <-events)
-
-	c.waitForPool(t.Context(), IPv4, "jupiter")
-	c.waitForPool(t.Context(), IPv6, "jupiter")
-
-	// Allocations should now succeed
-	jupiterIP0 := net.ParseIP("192.168.1.1")
-	allocatedJupiterIP0, err := c.allocateIP(jupiterIP0, "jupiter-pod-0", "jupiter", IPv4, false)
-	assert.NoError(t, err)
-	assert.True(t, jupiterIP0.Equal(allocatedJupiterIP0.IP))
-	allocatedJupiterIP1, err := c.allocateNext("jupiter-pod-1", "jupiter", IPv6, false)
-	assert.NoError(t, err)
-	assert.True(t, juptierIPv6CIDR.Contains(allocatedJupiterIP1.IP))
-
-	// Release IPs from jupiter pool. This should fully remove it from both
-	// "requested" and "allocated"
-	err = c.releaseIP(allocatedJupiterIP0.IP, "jupiter", IPv4, false)
-	assert.NoError(t, err)
-	err = c.releaseIP(allocatedJupiterIP1.IP, "jupiter", IPv6, true) // triggers sync
-	assert.NoError(t, err)
-
-	// Wait for agent to release jupiter and unused CIDRs
-	assert.Equal(t, "upsert", <-events)
-	currentNode = fakeK8sCiliumNodeAPI.currentNode()
-	assert.Equal(t, types.IPAMPoolSpec{
-		Requested: []types.IPAMPoolRequest{
-			{
-				Pool: "default",
-				Needed: types.IPAMPoolDemand{
-					IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
-					IPv6Addrs: 16, // 0 allocated + 16 pre-allocate
-				},
-			},
-			{
-				Pool: "mars",
-				Needed: types.IPAMPoolDemand{
-					IPv4Addrs: 8, // 0 allocated + 8 pre-allocate
-					IPv6Addrs: 8, // 0 allocated + 8 pre-allocate
-				},
-			},
-		},
-		Allocated: []types.IPAMPoolAllocation{
-			{
-				Pool: "default",
-				CIDRs: []types.IPAMCIDR{
-					types.IPAMCIDR(defaultIPv4CIDR1.String()),
-					types.IPAMCIDR(defaultIPv6CIDR1.String()),
-				},
-			},
-			{
-				Pool: "mars",
-				CIDRs: []types.IPAMCIDR{
-					types.IPAMCIDR(marsIPv4CIDR1.String()),
-					types.IPAMCIDR(marsIPv6CIDR1.String()),
-				},
-			},
-		},
-	}, currentNode.Spec.IPAM.Pools)
-
-	// exhaust mars ipv4 pool (/27 contains 30 IPs)
-	allocatedMarsIPs := []net.IP{}
-	numMarsIPs := 30
-	for i := range numMarsIPs {
-		// set upstreamSync to true for last allocation, to ensure we only get one upsert event
-		ar, err := c.allocateNext(fmt.Sprintf("mars-pod-%d", i), "mars", IPv4, i == numMarsIPs-1)
-		assert.NoError(t, err)
-		assert.True(t, marsIPv4CIDR1.Contains(ar.IP))
-		allocatedMarsIPs = append(allocatedMarsIPs, ar.IP)
-	}
-	_, err = c.allocateNext("mars-pod-overflow", "mars", IPv4, false)
-	assert.ErrorContains(t, err, "all CIDR ranges are exhausted")
-
-	ipv4Dump, _ := c.dump(IPv4)
-	assert.Len(t, ipv4Dump, 2) // 2 pools: default + mars
-	assert.Len(t, ipv4Dump[PoolDefault()], 1)
-	assert.Len(t, ipv4Dump[Pool("mars")], numMarsIPs)
-
-	// Ensure Requested numbers are bumped
-	assert.Equal(t, "upsert", <-events)
-	currentNode = fakeK8sCiliumNodeAPI.currentNode()
-	assert.Equal(t, []types.IPAMPoolRequest{
-		{
-			Pool: "default",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
-				IPv6Addrs: 16,
-			},
-		},
-		{
-			Pool: "mars",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 40, // 30 allocated + 8 pre-allocate, rounded up to multiple of 8
-				IPv6Addrs: 8,
-			},
-		},
-	}, currentNode.Spec.IPAM.Pools.Requested)
-
-	marsIPv4CIDR2 := cidr.MustParseCIDR("10.0.12.0/27")
-
-	// Assign additional mars IPv4 CIDR
-	currentNode.Spec.IPAM.Pools.Allocated = []types.IPAMPoolAllocation{
-		{
-			Pool: "default",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(defaultIPv4CIDR1.String()),
-				types.IPAMCIDR(defaultIPv6CIDR1.String()),
-			},
-		},
-		{
-			Pool: "mars",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(marsIPv4CIDR1.String()),
-				types.IPAMCIDR(marsIPv4CIDR2.String()),
-				types.IPAMCIDR(marsIPv6CIDR1.String()),
-			},
-		},
-	}
-	fakeK8sCiliumNodeAPI.updateNode(currentNode)
-	assert.Equal(t, "upsert", <-events)
-
-	// Should now be able to allocate from mars pool again
-	marsAllocation, err := c.allocateNext("mars-pod-overflow", "mars", IPv4, false)
-	assert.NoError(t, err)
-	assert.True(t, marsIPv4CIDR2.Contains(marsAllocation.IP))
-
-	// Deallocate all other IPs from mars pool. This should release the old CIDR
-	for i, ip := range allocatedMarsIPs {
-		err = c.releaseIP(ip, "mars", IPv4, i == numMarsIPs-1)
-		assert.NoError(t, err)
-	}
-	assert.Equal(t, "upsert", <-events)
-	currentNode = fakeK8sCiliumNodeAPI.currentNode()
-	assert.Equal(t, []types.IPAMPoolRequest{
-		{
-			Pool: "default",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 32, // 1 allocated + 16 pre-allocate, rounded up to multiple of 16
-				IPv6Addrs: 16,
-			},
-		},
-		{
-			Pool: "mars",
-			Needed: types.IPAMPoolDemand{
-				IPv4Addrs: 16, // 1 allocated + 8 pre-allocate, rounded up to multiple of 8
-				IPv6Addrs: 8,
-			},
-		},
-	}, currentNode.Spec.IPAM.Pools.Requested)
-
-	// Initial mars CIDR should have been marked as released now
-	assert.Equal(t, []types.IPAMPoolAllocation{
-		{
-			Pool: "default",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(defaultIPv4CIDR1.String()),
-				types.IPAMCIDR(defaultIPv6CIDR1.String()),
-			},
-		},
-		{
-			Pool: "mars",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(marsIPv4CIDR2.String()),
-				types.IPAMCIDR(marsIPv6CIDR1.String()),
-			},
-		},
-	}, currentNode.Spec.IPAM.Pools.Allocated)
-
-	ipv4Dump, ipv4Summary := c.dump(IPv4)
-	assert.Equal(t, map[Pool]map[string]string{
-		PoolDefault(): {
-			defaultAllocation.IP.String(): "",
-		},
-		Pool("mars"): {
-			marsAllocation.IP.String(): "",
-		},
-	}, ipv4Dump)
-	assert.Equal(t, "2 IPAM pool(s) available", ipv4Summary)
 }
 
 // Test_MultiPoolManager_ReleaseUnusedCIDR verifies that we release all unused CIDRs.
@@ -487,10 +539,10 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR(t *testing.T) {
 	}
 
 	// Initial node owns two /32 IPv4 and two /128 IPv6 CIDRs
-	cidr1 := cidr.MustParseCIDR("10.0.10.0/32")
-	cidr2 := cidr.MustParseCIDR("10.0.11.0/32")
-	cidrv61 := cidr.MustParseCIDR("fd00:10::/128")
-	cidrv62 := cidr.MustParseCIDR("fd00:11::/128")
+	cidr1 := netip.MustParsePrefix("10.0.10.0/32")
+	cidr2 := netip.MustParsePrefix("10.0.11.0/32")
+	cidrv61 := netip.MustParsePrefix("fd00:10::/128")
+	cidrv62 := netip.MustParsePrefix("fd00:11::/128")
 	initialNode := &ciliumv2.CiliumNode{
 		ObjectMeta: metav1.ObjectMeta{Name: nodeTypes.GetName()},
 		Spec: ciliumv2.NodeSpec{
@@ -498,11 +550,11 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR(t *testing.T) {
 				Pools: types.IPAMPoolSpec{
 					Allocated: []types.IPAMPoolAllocation{{
 						Pool: "default",
-						CIDRs: []types.IPAMCIDR{
-							types.IPAMCIDR(cidr1.String()),
-							types.IPAMCIDR(cidr2.String()),
-							types.IPAMCIDR(cidrv61.String()),
-							types.IPAMCIDR(cidrv62.String()),
+						CIDRs: []iputil.Prefix{
+							iputil.PrefixFrom(cidr1),
+							iputil.PrefixFrom(cidr2),
+							iputil.PrefixFrom(cidrv61),
+							iputil.PrefixFrom(cidrv62),
 						},
 					}},
 				},
@@ -542,11 +594,11 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR(t *testing.T) {
 	<-events // first upsert (initial node)
 
 	// Allocate one IPv4 and one IPv6 IP
-	ipInCIDR1 := net.ParseIP("10.0.10.0")
+	ipInCIDR1 := netip.MustParseAddr("10.0.10.0")
 	_, err = mgr.allocateIP(ipInCIDR1, "pod-a", "default", IPv4, false)
 	assert.NoError(t, err)
 
-	ipInCIDRv61 := net.ParseIP("fd00:10::")
+	ipInCIDRv61 := netip.MustParseAddr("fd00:10::")
 	_, err = mgr.allocateIP(ipInCIDRv61, "pod-a", "default", IPv6, false)
 	assert.NoError(t, err)
 
@@ -565,9 +617,9 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR(t *testing.T) {
 	assert.Equal(t, "default", alloc[0].Pool)
 	assert.ElementsMatch(t,
 
-		[]types.IPAMCIDR{
-			types.IPAMCIDR(cidr1.String()),
-			types.IPAMCIDR(cidrv61.String()),
+		[]iputil.Prefix{
+			iputil.PrefixFrom(cidr1),
+			iputil.PrefixFrom(cidrv61),
 		},
 		alloc[0].CIDRs,
 		"unused CIDRs should have been released",
@@ -604,17 +656,17 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR_PreAlloc(t *testing.T) {
 	}
 
 	// Create 10 distinct IPv4 /32 and IPv6 /128 CIDRs
-	v4Cidrs := make([]*cidr.CIDR, 10)
-	v6Cidrs := make([]*cidr.CIDR, 10)
-	cidrPodCIDRs := make([]types.IPAMCIDR, 0, 20)
+	v4Cidrs := make([]netip.Prefix, 10)
+	v6Cidrs := make([]netip.Prefix, 10)
+	cidrPodCIDRs := make([]iputil.Prefix, 0, 20)
 	for i := range 10 {
-		c4 := cidr.MustParseCIDR(fmt.Sprintf("10.0.100.%d/32", i))
+		c4 := netip.MustParsePrefix(fmt.Sprintf("10.0.100.%d/32", i))
 		v4Cidrs[i] = c4
-		cidrPodCIDRs = append(cidrPodCIDRs, types.IPAMCIDR(c4.String()))
+		cidrPodCIDRs = append(cidrPodCIDRs, iputil.PrefixFrom(c4))
 
-		c6 := cidr.MustParseCIDR(fmt.Sprintf("fd00:100::%d/128", i))
+		c6 := netip.MustParsePrefix(fmt.Sprintf("fd00:100::%d/128", i))
 		v6Cidrs[i] = c6
-		cidrPodCIDRs = append(cidrPodCIDRs, types.IPAMCIDR(c6.String()))
+		cidrPodCIDRs = append(cidrPodCIDRs, iputil.PrefixFrom(c6))
 	}
 
 	initialNode := &ciliumv2.CiliumNode{
@@ -664,11 +716,11 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR_PreAlloc(t *testing.T) {
 
 	// Allocate 5 IPv4 and 5 IPv6 IPs
 	for i := range 5 {
-		ip4 := net.ParseIP(fmt.Sprintf("10.0.100.%d", i))
+		ip4 := netip.MustParseAddr(fmt.Sprintf("10.0.100.%d", i))
 		_, err := mgr.allocateIP(ip4, fmt.Sprintf("pod4-%d", i), "default", IPv4, false)
 		assert.NoError(t, err)
 
-		ip6 := net.ParseIP(fmt.Sprintf("fd00:100::%d", i))
+		ip6 := netip.MustParseAddr(fmt.Sprintf("fd00:100::%d", i))
 		_, err = mgr.allocateIP(ip6, fmt.Sprintf("pod6-%d", i), "default", IPv6, false)
 		assert.NoError(t, err)
 	}
@@ -689,12 +741,20 @@ func Test_MultiPoolManager_ReleaseUnusedCIDR_PreAlloc(t *testing.T) {
 	// Verify that all in-use CIDRs are still present
 	remaining := map[string]struct{}{}
 	for _, c := range alloc[0].CIDRs {
-		remaining[string(c)] = struct{}{}
+		remaining[c.String()] = struct{}{}
 	}
 	for i := range 5 {
 		assert.Contains(t, remaining, v4Cidrs[i].String(), "in-use CIDR %s should not be released", v4Cidrs[i].String())
 		assert.Contains(t, remaining, v6Cidrs[i].String(), "in-use CIDR %s should not be released", v6Cidrs[i].String())
 	}
+}
+
+// toCIDR converts a netip.Prefix into a *cidr.CIDR for assertions that compare
+// against LocalNode.{IPv4,IPv6}AllocCIDR / {IPv4,IPv6}SecondaryAllocCIDRs.
+// The prefix is masked to match net.ParseCIDR semantics used to populate
+// those fields.
+func toCIDR(p netip.Prefix) *cidr.CIDR {
+	return cidr.NewCIDR(netipx.PrefixIPNet(p.Masked()))
 }
 
 func Test_LocalNodeCIDRsSyncer(t *testing.T) {
@@ -703,12 +763,12 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 		timeout = 5 * time.Second
 	)
 
-	defaultIPv4CIDR1 := cidr.MustParseCIDR("10.0.22.0/24")
-	defaultIPv6CIDR1 := cidr.MustParseCIDR("fd00:22::/96")
-	marsIPv4CIDR1 := cidr.MustParseCIDR("10.0.11.0/27")
-	marsIPv6CIDR1 := cidr.MustParseCIDR("fd00:11::/123")
-	jupiterIPv4CIDR := cidr.MustParseCIDR("192.168.1.0/16")
-	jupiterIPv6CIDR := cidr.MustParseCIDR("fc00:33::/96")
+	defaultIPv4CIDR1 := netip.MustParsePrefix("10.0.22.0/24")
+	defaultIPv6CIDR1 := netip.MustParsePrefix("fd00:22::/96")
+	marsIPv4CIDR1 := netip.MustParsePrefix("10.0.11.0/27")
+	marsIPv6CIDR1 := netip.MustParsePrefix("fd00:11::/123")
+	jupiterIPv4CIDR := netip.MustParsePrefix("192.168.1.0/16")
+	jupiterIPv6CIDR := netip.MustParsePrefix("fc00:33::/96")
 
 	currentNode := &ciliumv2.CiliumNode{
 		ObjectMeta: metav1.ObjectMeta{Name: nodeTypes.GetName()},
@@ -718,16 +778,16 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 					Allocated: []types.IPAMPoolAllocation{
 						{
 							Pool: "default",
-							CIDRs: []types.IPAMCIDR{
-								types.IPAMCIDR(defaultIPv4CIDR1.String()),
-								types.IPAMCIDR(defaultIPv6CIDR1.String()),
+							CIDRs: []iputil.Prefix{
+								iputil.PrefixFrom(defaultIPv4CIDR1),
+								iputil.PrefixFrom(defaultIPv6CIDR1),
 							},
 						},
 						{
 							Pool: "mars",
-							CIDRs: []types.IPAMCIDR{
-								types.IPAMCIDR(marsIPv4CIDR1.String()),
-								types.IPAMCIDR(marsIPv6CIDR1.String()),
+							CIDRs: []iputil.Prefix{
+								iputil.PrefixFrom(marsIPv4CIDR1),
+								iputil.PrefixFrom(marsIPv6CIDR1),
 							},
 						},
 					},
@@ -777,19 +837,19 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 		localNode, err := localNodeStore.Get(t.Context())
 		assert.NoError(c, err)
 		assert.Equalf(c,
-			defaultIPv4CIDR1, localNode.IPv4AllocCIDR,
+			toCIDR(defaultIPv4CIDR1), localNode.IPv4AllocCIDR,
 			"IPv4 primary allocation CIDR do not match",
 		)
 		assert.ElementsMatch(c,
-			localNode.IPv4SecondaryAllocCIDRs, []*cidr.CIDR{marsIPv4CIDR1},
+			localNode.IPv4SecondaryAllocCIDRs, []*cidr.CIDR{toCIDR(marsIPv4CIDR1)},
 			"IPv4 secondary allocation CIDRs do not match",
 		)
 		assert.Equalf(c,
-			defaultIPv6CIDR1, localNode.IPv6AllocCIDR,
+			toCIDR(defaultIPv6CIDR1), localNode.IPv6AllocCIDR,
 			"IPv6 primary allocation CIDR do not match",
 		)
 		assert.ElementsMatch(c,
-			localNode.IPv6SecondaryAllocCIDRs, []*cidr.CIDR{marsIPv6CIDR1},
+			localNode.IPv6SecondaryAllocCIDRs, []*cidr.CIDR{toCIDR(marsIPv6CIDR1)},
 			"IPv6 secondary allocation CIDRs do not match",
 		)
 	}, timeout, tick)
@@ -798,9 +858,9 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 	currentNode.Spec.IPAM.Pools.Allocated = append(currentNode.Spec.IPAM.Pools.Allocated,
 		types.IPAMPoolAllocation{
 			Pool: "jupiter",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(jupiterIPv4CIDR.String()),
-				types.IPAMCIDR(jupiterIPv6CIDR.String()),
+			CIDRs: []iputil.Prefix{
+				iputil.PrefixFrom(jupiterIPv4CIDR),
+				iputil.PrefixFrom(jupiterIPv6CIDR),
 			},
 		},
 	)
@@ -814,19 +874,19 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 		localNode, err := localNodeStore.Get(t.Context())
 		assert.NoError(c, err)
 		assert.Equalf(c,
-			defaultIPv4CIDR1, localNode.IPv4AllocCIDR,
+			toCIDR(defaultIPv4CIDR1), localNode.IPv4AllocCIDR,
 			"IPv4 primary allocation CIDR do not match",
 		)
 		assert.ElementsMatch(c,
-			localNode.IPv4SecondaryAllocCIDRs, []*cidr.CIDR{marsIPv4CIDR1, jupiterIPv4CIDR},
+			localNode.IPv4SecondaryAllocCIDRs, []*cidr.CIDR{toCIDR(marsIPv4CIDR1), toCIDR(jupiterIPv4CIDR)},
 			"IPv4 secondary allocation CIDRs do not match",
 		)
 		assert.Equalf(c,
-			defaultIPv6CIDR1, localNode.IPv6AllocCIDR,
+			toCIDR(defaultIPv6CIDR1), localNode.IPv6AllocCIDR,
 			"IPv6 primary allocation CIDR do not match",
 		)
 		assert.ElementsMatch(c,
-			localNode.IPv6SecondaryAllocCIDRs, []*cidr.CIDR{marsIPv6CIDR1, jupiterIPv6CIDR},
+			localNode.IPv6SecondaryAllocCIDRs, []*cidr.CIDR{toCIDR(marsIPv6CIDR1), toCIDR(jupiterIPv6CIDR)},
 			"IPv6 secondary allocation CIDRs do not match",
 		)
 	}, timeout, tick)
@@ -835,9 +895,9 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 	currentNode.Spec.IPAM.Pools.Allocated = []types.IPAMPoolAllocation{
 		{
 			Pool: "default",
-			CIDRs: []types.IPAMCIDR{
-				types.IPAMCIDR(defaultIPv4CIDR1.String()),
-				types.IPAMCIDR(defaultIPv6CIDR1.String()),
+			CIDRs: []iputil.Prefix{
+				iputil.PrefixFrom(defaultIPv4CIDR1),
+				iputil.PrefixFrom(defaultIPv6CIDR1),
 			},
 		},
 	}
@@ -851,7 +911,7 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 		localNode, err := localNodeStore.Get(t.Context())
 		assert.NoError(c, err)
 		assert.Equalf(c,
-			defaultIPv4CIDR1, localNode.IPv4AllocCIDR,
+			toCIDR(defaultIPv4CIDR1), localNode.IPv4AllocCIDR,
 			"IPv4 primary allocation CIDR do not match",
 		)
 		assert.Empty(c,
@@ -859,7 +919,7 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 			"IPv4 secondary allocation CIDRs do not match",
 		)
 		assert.Equalf(c,
-			defaultIPv6CIDR1, localNode.IPv6AllocCIDR,
+			toCIDR(defaultIPv6CIDR1), localNode.IPv6AllocCIDR,
 			"IPv6 primary allocation CIDR do not match",
 		)
 		assert.Empty(c,
@@ -869,6 +929,168 @@ func Test_LocalNodeCIDRsSyncer(t *testing.T) {
 	}, timeout, tick)
 
 	assert.NoError(t, h.Stop(tlog, t.Context()))
+}
+
+func Test_MultiPoolManager_UpdateNodeRetries(t *testing.T) {
+	fixture := func(t *testing.T, node *ciliumv2.CiliumNode, setReactor func(cs *k8sClient.FakeClientset)) *k8sClient.FakeClientset {
+		nodeTypes.SetName(node.Name)
+
+		var (
+			jg        job.Group
+			localNode k8s.LocalCiliumNodeResource
+			clientset *k8sClient.FakeClientset
+		)
+		h := hive.New(
+			k8sClient.FakeClientCell(),
+			k8s.ResourcesCell,
+			cell.Invoke(
+				func(cs *k8sClient.FakeClientset) {
+					setReactor(cs)
+				},
+				func(
+					jg_ job.Group,
+					localNode_ k8s.LocalCiliumNodeResource,
+					clientset_ *k8sClient.FakeClientset,
+				) {
+					jg = jg_
+					localNode = localNode_
+					clientset = clientset_
+				},
+			),
+		)
+
+		tlog := hivetest.Logger(t, hivetest.LogLevel(slog.LevelError))
+		require.NoError(t, h.Start(tlog, t.Context()))
+		t.Cleanup(func() { h.Stop(tlog, context.Background()) })
+
+		_, err := clientset.CiliumV2().CiliumNodes().Create(t.Context(), node.DeepCopy(), metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		mgr := newMultiPoolManager(MultiPoolManagerParams{
+			Logger:               hivetest.Logger(t),
+			IPv4Enabled:          true,
+			CiliumNodeUpdateRate: time.Millisecond,
+			PreallocMap:          preAllocatePerPool{},
+			Node:                 localNode,
+			CNClient:             clientset.CiliumV2().CiliumNodes(),
+			JobGroup:             jg,
+			PoolsFromResource: func(cn *ciliumv2.CiliumNode) *types.IPAMPoolSpec {
+				return &cn.Spec.IPAM.Pools
+			},
+		})
+		require.NotNil(t, mgr)
+
+		return clientset
+	}
+
+	t.Run("update", func(t *testing.T) {
+		node := &ciliumv2.CiliumNode{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-node",
+			},
+			Spec: ciliumv2.NodeSpec{
+				IPAM: types.IPAMSpec{
+					Pools: types.IPAMPoolSpec{
+						Requested: []types.IPAMPoolRequest{
+							{
+								Pool:   "default",
+								Needed: types.IPAMPoolDemand{IPv4Addrs: 99},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		var updates atomic.Int32
+		updateReactor := func(cs *k8sClient.FakeClientset) {
+			cs.CiliumFakeClientset.PrependReactor("update", "ciliumnodes", func(action k8sTesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "" {
+					return false, nil, nil
+				}
+
+				if updates.Add(1) == 1 {
+					return true, nil, k8sErrors.NewConflict(
+						schema.GroupResource{
+							Group:    ciliumv2.CustomResourceDefinitionGroup,
+							Resource: ciliumv2.CNPluralName,
+						},
+						node.Name,
+						errors.New("update refused by unit test"),
+					)
+				}
+				return false, nil, nil
+			})
+		}
+
+		synctest.Test(t, func(t *testing.T) {
+			clientset := fixture(t, node, updateReactor)
+
+			// wait for the manager to retry the update after the conflict error
+			//
+			// the timeout is set to 2xrefreshPoolInterval so that updateLocalNode
+			// has a chance to be run again from the job.Timer.
+			assert.EventuallyWithT(t, func(c *assert.CollectT) {
+				assert.GreaterOrEqual(c, updates.Load(), int32(2))
+			}, 2*time.Minute, 10*time.Millisecond)
+
+			updatedNode, err := clientset.CiliumV2().CiliumNodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+			assert.NoError(t, err)
+			assert.Empty(t, updatedNode.Spec.IPAM.Pools.Requested)
+		})
+	})
+
+	t.Run("updateStatus", func(t *testing.T) {
+		node := &ciliumv2.CiliumNode{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node-status",
+			},
+			Status: ciliumv2.NodeStatus{
+				IPAM: types.IPAMStatus{
+					Used: types.AllocationMap{
+						"10.0.0.1": types.AllocationIP{Resource: "pod-a"},
+					},
+				},
+			},
+		}
+
+		var updateStatuses atomic.Int32
+		updateStatusReactor := func(cs *k8sClient.FakeClientset) {
+			cs.CiliumFakeClientset.PrependReactor("update", "ciliumnodes", func(action k8sTesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "status" {
+					return false, nil, nil
+				}
+
+				if updateStatuses.Add(1) == 1 {
+					return true, nil, k8sErrors.NewConflict(
+						schema.GroupResource{
+							Group:    ciliumv2.CustomResourceDefinitionGroup,
+							Resource: ciliumv2.CNPluralName,
+						},
+						node.Name,
+						errors.New("update refused by unit test"),
+					)
+				}
+				return false, nil, nil
+			})
+		}
+
+		synctest.Test(t, func(t *testing.T) {
+			clientset := fixture(t, node, updateStatusReactor)
+
+			// wait for the manager to retry the update after the conflict error
+			//
+			// the timeout is set to 2xrefreshPoolInterval so that updateLocalNode
+			// has a chance to be run again from the job.Timer.
+			assert.EventuallyWithT(t, func(c *assert.CollectT) {
+				assert.GreaterOrEqual(c, updateStatuses.Load(), int32(2))
+			}, 2*time.Minute, 10*time.Millisecond)
+
+			updatedNode, err := clientset.CiliumV2().CiliumNodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+			assert.NoError(t, err)
+			assert.Empty(t, updatedNode.Status.IPAM.Used)
+		})
+	})
 }
 
 func Test_neededIPCeil(t *testing.T) {
@@ -1092,11 +1314,46 @@ func TestAllocateNext_SkipMasquerade(t *testing.T) {
 	require.False(t, res.SkipMasquerade, "SkipMasquerade should default to false")
 }
 
-func insertPool(t *testing.T, db *statedb.DB, tbl statedb.RWTable[podippool.LocalPodIPPool], name string, skipMasq bool) {
+func TestMultiPoolManagerUpdatesFirstLastIPSettingsBeforeAllocation(t *testing.T) {
+	logger := hivetest.Logger(t)
+	mgr := &multiPoolManager{
+		logger:       logger,
+		ipv4Enabled:  true,
+		pools:        map[Pool]*poolPair{},
+		poolsUpdated: make(chan struct{}, 1),
+		pendingIPsPerPool: newPendingAllocationsPerPool(
+			logger,
+		),
+		skipMasqueradeForPool: func(Pool) (bool, error) {
+			return false, nil
+		},
+	}
+
+	prefix := iputil.PrefixFrom(netip.MustParsePrefix("10.20.0.0/30"))
+	lastIP := netip.MustParseAddr("10.20.0.3")
+
+	mgr.upsertPoolLocked("default", []iputil.Prefix{prefix}, false, false)
+	_, err := mgr.allocateIP(lastIP, "pod-a", "default", IPv4, false)
+	require.Error(t, err)
+
+	mgr.upsertPoolLocked("default", []iputil.Prefix{prefix}, false, true)
+	result, err := mgr.allocateIP(lastIP, "pod-a", "default", IPv4, false)
+	require.NoError(t, err)
+	require.Equal(t, lastIP, result.IP)
+}
+
+func insertPool(t *testing.T, db *statedb.DB, tbl statedb.RWTable[podippool.LocalPodIPPool], name string, skipMasq bool, allowFirstAndLastIPs ...bool) {
 	t.Helper()
 	ann := map[string]string{}
 	if skipMasq {
 		ann[annotation.IPAMSkipMasquerade] = "true"
+	}
+	var allowFirstIP, allowLastIP bool
+	if len(allowFirstAndLastIPs) > 0 {
+		allowFirstIP = allowFirstAndLastIPs[0]
+	}
+	if len(allowFirstAndLastIPs) > 1 {
+		allowLastIP = allowFirstAndLastIPs[1]
 	}
 
 	poolObj := podippool.LocalPodIPPool{
@@ -1104,6 +1361,10 @@ func insertPool(t *testing.T, db *statedb.DB, tbl statedb.RWTable[podippool.Loca
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        name,
 				Annotations: ann,
+			},
+			Spec: k8sv2alpha1.IPPoolSpec{
+				AllowFirstIP: allowFirstIP,
+				AllowLastIP:  allowLastIP,
 			},
 		},
 		UpdatedAt: time.Now(),
@@ -1126,10 +1387,10 @@ func createSkipMasqTestManager(t *testing.T, db *statedb.DB, pools statedb.Table
 			IPAM: types.IPAMSpec{
 				Pools: types.IPAMPoolSpec{
 					Allocated: []types.IPAMPoolAllocation{
-						{Pool: "default", CIDRs: []types.IPAMCIDR{"10.0.0.0/24"}},
-						{Pool: "blue", CIDRs: []types.IPAMCIDR{"10.0.1.0/24"}},
-						{Pool: "red", CIDRs: []types.IPAMCIDR{"10.0.2.0/24"}},
-						{Pool: "green", CIDRs: []types.IPAMCIDR{"10.0.3.0/24"}},
+						{Pool: "default", CIDRs: []iputil.Prefix{iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24"))}},
+						{Pool: "blue", CIDRs: []iputil.Prefix{iputil.PrefixFrom(netip.MustParsePrefix("10.0.1.0/24"))}},
+						{Pool: "red", CIDRs: []iputil.Prefix{iputil.PrefixFrom(netip.MustParsePrefix("10.0.2.0/24"))}},
+						{Pool: "green", CIDRs: []iputil.Prefix{iputil.PrefixFrom(netip.MustParsePrefix("10.0.3.0/24"))}},
 					},
 				},
 			},

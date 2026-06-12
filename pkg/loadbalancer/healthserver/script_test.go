@@ -32,6 +32,7 @@ import (
 	envoyCfg "github.com/cilium/cilium/pkg/envoy/config"
 	"github.com/cilium/cilium/pkg/hive"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/testutils"
 	"github.com/cilium/cilium/pkg/k8s/version"
 	"github.com/cilium/cilium/pkg/kpr"
@@ -67,7 +68,7 @@ func TestScript(t *testing.T) {
 	var opts []hivetest.LogOption
 	if *debug {
 		opts = append(opts, hivetest.LogLevel(slog.LevelDebug))
-		logging.SetLogLevelToDebug()
+		logging.SetLogLevel(slog.LevelDebug)
 	}
 	log := hivetest.Logger(t, opts...)
 
@@ -83,7 +84,7 @@ func TestScript(t *testing.T) {
 				k8sClient.FakeClientCell(),
 				daemonk8s.ResourcesCell,
 				cell.Config(envoyCfg.SecretSyncConfig{}),
-				daemonk8s.TablesCell,
+				k8sTables.TablesCell,
 				metrics.Cell,
 
 				lbcell.Cell,
@@ -227,10 +228,10 @@ func svcSetProxyRedirectCmd(writer *writer.Writer) script.Cmd {
 				}
 
 				svc = svc.Clone()
-				svc.ProxyRedirect = &loadbalancer.ProxyRedirect{
+				svc.ProxyRedirects = loadbalancer.ProxyRedirects{{
 					ProxyPort: proxyPort,
 					Ports:     []uint16{80, 443},
-				}
+				}}
 
 				if _, err := writer.UpsertService(wtxn, svc); err != nil {
 					return "", "", fmt.Errorf("failed to upsert service: %w", err)

@@ -32,6 +32,8 @@ import (
 
 var secretsNamespace = "cilium-secrets-test"
 
+const testSecretSyncControllerName = "example.com/test-gateway-controller"
+
 var secretFixture = []client.Object{
 	&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -80,7 +82,7 @@ var secretFixture = []client.Object{
 			Name: "cilium",
 		},
 		Spec: gatewayv1.GatewayClassSpec{
-			ControllerName: "io.cilium/gateway-controller",
+			ControllerName: testSecretSyncControllerName,
 		},
 	},
 	&gatewayv1.Gateway{
@@ -203,11 +205,13 @@ func Test_SecretSync_Reconcile(t *testing.T) {
 		WithObjects(secretFixture...).
 		Build()
 
+	gatewayHandler := gateway_api.NewSecretSyncHandler(c, logger, testSecretSyncControllerName)
+
 	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
 		{
 			RefObject:            &gatewayv1.Gateway{},
-			RefObjectEnqueueFunc: gateway_api.EnqueueTLSSecrets(c, logger),
-			RefObjectCheckFunc:   gateway_api.IsReferencedByCiliumGateway,
+			RefObjectEnqueueFunc: gatewayHandler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   gatewayHandler.IsReferencedByGateway,
 			SecretsNamespace:     secretsNamespace,
 		},
 		{
@@ -352,6 +356,109 @@ func Test_SecretSync_Reconcile(t *testing.T) {
 	})
 }
 
+var secretFixtureTypeChange = []client.Object{
+	&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      "cert-tls",
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			"tls.crt": []byte("cert"),
+			"tls.key": []byte("key"),
+		},
+	},
+	&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: secretsNamespace,
+			Name:      "test-cert-tls",
+			UID:       "stale-opaque-uid",
+			Labels: map[string]string{
+				secretsync.OwningSecretNamespace: "test",
+				secretsync.OwningSecretName:      "cert-tls",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+	},
+	&gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cilium",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: testSecretSyncControllerName,
+		},
+	},
+	&gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      "tls-gateway",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "cilium",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Hostname: ptr.To[gatewayv1.Hostname]("*.cilium.io"),
+					Protocol: "HTTPS",
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "cert-tls"},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+func Test_SecretSync_Reconcile_TypeChange(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(secretFixtureTypeChange...).
+		Build()
+
+	gatewayHandler := gateway_api.NewSecretSyncHandler(c, logger, testSecretSyncControllerName)
+
+	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
+		{
+			RefObject:            &gatewayv1.Gateway{},
+			RefObjectEnqueueFunc: gatewayHandler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   gatewayHandler.IsReferencedByGateway,
+			SecretsNamespace:     secretsNamespace,
+		},
+	},
+		time.Minute,
+		0.1,
+	)
+
+	t.Run("synced secret type is updated when source secret type changes", func(t *testing.T) {
+		synced := &corev1.Secret{}
+		err := c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-cert-tls"}, synced)
+		require.NoError(t, err)
+		require.Equal(t, corev1.SecretTypeOpaque, synced.Type)
+
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: "test",
+				Name:      "cert-tls",
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, resultHasResync(result))
+		synced = &corev1.Secret{}
+		err = c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-cert-tls"}, synced)
+		require.NoError(t, err)
+		require.Equal(t, corev1.SecretTypeTLS, synced.Type, "synced secret should adopt the source secret's type")
+		require.Equal(t, []byte("cert"), synced.Data["tls.crt"])
+		require.Equal(t, []byte("key"), synced.Data["tls.key"])
+		require.NotEqual(t, types.UID("stale-opaque-uid"), synced.UID,
+			"synced secret must be recreated (new UID) since Secret.Type is immutable")
+	})
+}
+
 var secretFixtureDefaultSecret = []client.Object{
 	&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -368,11 +475,12 @@ func Test_SecretSync_Reconcile_WithDefaultSecret(t *testing.T) {
 		WithScheme(testScheme()).
 		WithObjects(secretFixtureDefaultSecret...).
 		Build()
+	gatewayHandler := gateway_api.NewSecretSyncHandler(c, logger, testSecretSyncControllerName)
 	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
 		{
 			RefObject:            &gatewayv1.Gateway{},
-			RefObjectEnqueueFunc: gateway_api.EnqueueTLSSecrets(c, logger),
-			RefObjectCheckFunc:   gateway_api.IsReferencedByCiliumGateway,
+			RefObjectEnqueueFunc: gatewayHandler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   gatewayHandler.IsReferencedByGateway,
 			SecretsNamespace:     secretsNamespace,
 			DefaultSecret: &secretsync.DefaultSecret{
 				Namespace: "test",

@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.19.0
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: ciliumnodes.cilium.io
 spec:
   group: cilium.io
@@ -84,6 +84,7 @@ spec:
                     type: string
                   cidr-block:
                     description: CIDRBlock is vpc ipv4 CIDR
+                    format: cidr
                     type: string
                   instance-type:
                     description: InstanceType is the ECS instance type, e.g. "ecs.g6.2xlarge"
@@ -355,11 +356,18 @@ spec:
                             IPAMPoolAllocation describes an allocation of an IPAM pool from the operator to the
                             node. It contains the assigned PodCIDRs allocated from this pool
                           properties:
+                            allowFirstIP:
+                              description: AllowFirstIP allows the first IP of each
+                                allocated CIDR to be used.
+                              type: boolean
+                            allowLastIP:
+                              description: AllowLastIP allows the last IP of each
+                                allocated CIDR to be used.
+                              type: boolean
                             cidrs:
                               description: CIDRs contains a list of pod CIDRs currently
                                 allocated from this pool
                               items:
-                                description: IPAMCIDR is a CIDR used for IPAM
                                 format: cidr
                                 type: string
                               type: array
@@ -424,11 +432,6 @@ spec:
                       filter Elastic IP Addresses.
                     type: object
                 type: object
-              nodeidentity:
-                description: NodeIdentity is the Cilium numeric identity allocated
-                  for the node, if any.
-                format: int64
-                type: integer
             type: object
           status:
             description: |-
@@ -487,14 +490,17 @@ spec:
                           properties:
                             cidr:
                               description: CIDRBlock is the VPC IPv4 CIDR
+                              format: cidr
                               type: string
                             ipv6-cidr:
                               description: IPv6CIDRBlock is the VPC IPv6 CIDR
+                              format: cidr
                               type: string
                             secondary-cidrs:
                               description: SecondaryCIDRs is the list of Secondary
                                 CIDRs associated with the VPC
                               items:
+                                format: cidr
                                 type: string
                               type: array
                             vpc-id:
@@ -506,9 +512,11 @@ spec:
                           properties:
                             cidr:
                               description: CIDRBlock is the vSwitch IPv4 CIDR
+                              format: cidr
                               type: string
                             ipv6-cidr:
                               description: IPv6CIDRBlock is the vSwitch IPv6 CIDR
+                              format: cidr
                               type: string
                             vswitch-id:
                               description: VSwitchID is the vSwitch to which the ENI
@@ -532,8 +540,10 @@ spec:
                       properties:
                         addresses:
                           description: |-
-                            Addresses is the list of all IPs associated with the interface,
-                            including all secondary addresses
+                            Addresses is the list of secondary IPs associated with the interface.
+                            The primary IP is tracked separately in the IP field, but is also
+                            included here when the operator is configured to expose it for
+                            allocation.
                           items:
                             description: AzureAddress is an IP address assigned to
                               an AzureInterface
@@ -546,14 +556,21 @@ spec:
                                   address
                                 type: string
                               subnet:
-                                description: Subnet is the subnet the address belongs
-                                  to
+                                description: |-
+                                  Subnet is the subnet the address belongs to.
+
+                                  Deprecated: use AzureInterface.Subnet.ID. Populated as a mirror for one
+                                  release so external consumers of CiliumNode.Status.Azure can migrate.
                                 type: string
                             type: object
                           type: array
                         cidr:
-                          description: CIDR is the range that the interface belongs
-                            to.
+                          description: |-
+                            CIDR is the range that the interface belongs to.
+
+                            Deprecated: use Subnet.CIDR. Retained for one release so agent/operator
+                            rolling upgrades work in either order.
+                          format: cidr
                           type: string
                         gateway:
                           description: Gateway is the interface's subnet's default
@@ -561,6 +578,9 @@ spec:
                           type: string
                         id:
                           description: ID is the identifier
+                          type: string
+                        ip:
+                          description: IP is the primary IP of the interface
                           type: string
                         mac:
                           description: MAC is the mac address
@@ -575,6 +595,19 @@ spec:
                         state:
                           description: State is the provisioning state
                           type: string
+                        subnet:
+                          description: Subnet is the subnet the interface is attached
+                            to.
+                          properties:
+                            cidr:
+                              description: CIDR is the CIDR range associated with
+                                the subnet
+                              format: cidr
+                              type: string
+                            id:
+                              description: ID is the resource ID of the subnet
+                              type: string
+                          type: object
                       type: object
                     type: array
                 type: object
@@ -621,6 +654,7 @@ spec:
                           description: Prefixes is the list of all /28 prefixes associated
                             with the ENI
                           items:
+                            format: cidr
                             type: string
                           type: array
                         public-ip:
@@ -640,6 +674,7 @@ spec:
                             cidr:
                               description: CIDR is the CIDR range associated with
                                 the subnet
+                              format: cidr
                               type: string
                             id:
                               description: ID is the ID of the subnet
@@ -660,6 +695,7 @@ spec:
                               description: CIDRs is the list of CIDR ranges associated
                                 with the VPC
                               items:
+                                format: cidr
                                 type: string
                               type: array
                             id:
@@ -668,6 +704,7 @@ spec:
                             primary-cidr:
                               description: PrimaryCIDR is the primary CIDR of the
                                 VPC
+                              format: cidr
                               type: string
                           type: object
                       type: object

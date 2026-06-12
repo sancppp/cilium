@@ -11,7 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 )
 
 const (
@@ -26,8 +26,13 @@ const (
 	HTTPRouteKind         string = "httproutes"
 	GRPCRouteKind         string = "grpcroutes"
 	ReferenceGrantKind    string = "referencegrants"
+	BackendTLSPolicyKind  string = "backendtlspolicies"
 	TLSRouteKind          string = "tlsroutes"
 	TLSRouteListKind      string = "tlsroutelists"
+	TCPRouteKind          string = "tcproutes"
+	TCPRouteListKind      string = "tcproutelists"
+	UDPRouteKind          string = "udproutes"
+	UDPRouteListKind      string = "udproutelists"
 	ServiceImportKind     string = "serviceimports"
 	ServiceImportListKind string = "serviceimportlists"
 )
@@ -80,7 +85,7 @@ func IsService(be gatewayv1.BackendObjectReference) bool {
 }
 
 func IsServiceImport(be gatewayv1.BackendObjectReference) bool {
-	return be.Kind != nil && *be.Kind == kindServiceImport && be.Group != nil && *be.Group == mcsapiv1alpha1.GroupName
+	return be.Kind != nil && *be.Kind == kindServiceImport && be.Group != nil && *be.Group == mcsapiv1beta1.GroupName
 }
 
 func IsSecret(secret gatewayv1.SecretObjectReference) bool {
@@ -102,15 +107,27 @@ func GetConcreteObject(schemaType schema.GroupVersionKind) runtime.Object {
 
 	switch kind {
 	case TLSRouteKind:
-		return &gatewayv1alpha2.TLSRoute{}
+		return &gatewayv1.TLSRoute{}
 	case TLSRouteListKind:
-		return &gatewayv1alpha2.TLSRouteList{}
+		return &gatewayv1.TLSRouteList{}
+	case TCPRouteKind:
+		return &gatewayv1alpha2.TCPRoute{}
+	case TCPRouteListKind:
+		return &gatewayv1alpha2.TCPRouteList{}
+	case UDPRouteKind:
+		return &gatewayv1alpha2.UDPRoute{}
+	case UDPRouteListKind:
+		return &gatewayv1alpha2.UDPRouteList{}
 	case ServiceImportKind:
-		return &mcsapiv1alpha1.ServiceImport{}
+		return &mcsapiv1beta1.ServiceImport{}
 	case ServiceImportListKind:
-		return &mcsapiv1alpha1.ServiceImportList{}
+		return &mcsapiv1beta1.ServiceImportList{}
 	default:
 		// panic is okay here because this is a progammer error
 		panic(fmt.Sprintf("Tried to get a concrete type that is not implemented, %s", schemaType.Kind))
 	}
+}
+
+func IsValidGammaService(svc *corev1.Service) bool {
+	return svc.Spec.Type == corev1.ServiceTypeClusterIP
 }

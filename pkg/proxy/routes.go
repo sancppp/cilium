@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"syscall"
 
@@ -17,7 +16,6 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
 	"github.com/cilium/cilium/pkg/datapath/linux/route/reconciler"
-	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/option"
@@ -50,8 +48,9 @@ func (p *Proxy) ReinstallRoutingRules(ctx context.Context, mtu int, ipsecEnabled
 	fromIngressProxy, fromEgressProxy, mtu := requireFromProxyRoutes(ipsecEnabled, wireguardEnabled, mtu)
 
 	rxn := p.db.ReadTxn()
-	hostDevice, _, hostDeviceFound := p.devices.Get(rxn, tables.DeviceNameIndex.Query(defaults.HostDevice))
-	lo, _, loFound := p.devices.Get(rxn, tables.DeviceNameIndex.Query("lo"))
+	hostDevice, _, hostDeviceFound := p.devices.Get(rxn, tables.DeviceByName(defaults.HostDevice))
+	ciliumNetDevice, _, ciliumNetDeviceFound := p.devices.Get(rxn, tables.DeviceByName(defaults.SecondHostDevice))
+	lo, _, loFound := p.devices.Get(rxn, tables.DeviceByName("lo"))
 
 	if option.Config.EnableIPv4 && p.enabled {
 		if !loFound {
@@ -89,15 +88,17 @@ func (p *Proxy) ReinstallRoutingRules(ctx context.Context, mtu int, ipsecEnabled
 		}
 
 		if fromIngressProxy || fromEgressProxy {
-			ipv6, err := getCiliumNetIPv6()
-			if err != nil {
-				return err
-			}
 			if !hostDeviceFound {
 				return fmt.Errorf("failed to get host device %s", defaults.HostDevice)
 			}
-			netIP, _ := netipx.FromStdIP(ipv6)
-			if err := installFromProxyRoutesIPv6(p.routeOwner, p.routeManager, netIP, hostDevice, fromIngressProxy, fromEgressProxy, mtu); err != nil {
+			if !ciliumNetDeviceFound {
+				return fmt.Errorf("failed to get second host device %s", defaults.SecondHostDevice)
+			}
+			ipv6, err := getCiliumNetIPv6(ciliumNetDevice)
+			if err != nil {
+				return err
+			}
+			if err := installFromProxyRoutesIPv6(p.routeOwner, p.routeManager, ipv6, hostDevice, fromIngressProxy, fromEgressProxy, mtu); err != nil {
 				return err
 			}
 		} else {
@@ -147,18 +148,14 @@ func requireFromProxyRoutes(ipsecEnabled, wireguardEnabled bool, mtuIn int) (fro
 }
 
 // getCiliumNetIPv6 retrieves the first IPv6 address from the cilium_net device.
-func getCiliumNetIPv6() (net.IP, error) {
-	link, err := safenetlink.LinkByName(defaults.SecondHostDevice)
-	if err != nil {
-		return nil, fmt.Errorf("cannot find link '%s': %w", defaults.SecondHostDevice, err)
+func getCiliumNetIPv6(device *tables.Device) (netip.Addr, error) {
+	for _, addr := range device.Addrs {
+		if addr.Addr.Is6() {
+			return addr.Addr.Unmap(), nil
+		}
 	}
 
-	addrList, err := safenetlink.AddrList(link, netlink.FAMILY_V6)
-	if err == nil && len(addrList) > 0 {
-		return addrList[0].IP, nil
-	}
-
-	return nil, fmt.Errorf("failed to find valid IPv6 address for cilium_net")
+	return netip.Addr{}, fmt.Errorf("failed to find valid IPv6 address for cilium_net")
 }
 
 // installToProxyRoutesIPv4 configures routes and rules needed to redirect ingress

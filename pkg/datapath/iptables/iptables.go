@@ -46,6 +46,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/versioncheck"
+	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
 const (
@@ -1515,8 +1516,6 @@ func (m *manager) installMasqueradeRules(
 	// If this option is enabled, then it takes precedence over the catch-all
 	// MASQUERADE further below.
 	if m.sharedCfg.EnableMasqueradeRouteSource {
-		var defaultRoutes []netlink.Route
-
 		if len(m.sharedCfg.MasqueradeInterfaces) > 0 {
 			devices = m.sharedCfg.MasqueradeInterfaces
 		}
@@ -1524,86 +1523,9 @@ func (m *manager) installMasqueradeRules(
 		if prog == m.ip6tables {
 			family = netlink.FAMILY_V6
 		}
-		initialPass := true
 		if routes, err := safenetlink.RouteList(nil, family); err == nil {
-		nextPass:
-			for _, r := range routes {
-				var link netlink.Link
-				match := false
-				if r.LinkIndex > 0 {
-					link, err = netlink.LinkByIndex(r.LinkIndex)
-					if err != nil {
-						continue
-					}
-					// Routes are dedicated to the specific interface, so we
-					// need to install the SNAT rules also for that interface
-					// via -o. If we cannot correlate to anything because no
-					// devices were specified, we need to bail out.
-					if len(devices) == 0 {
-						return fmt.Errorf("cannot correlate source route device for generating masquerading rules")
-					}
-					for _, device := range devices {
-						filter := tables.DeviceFilter{device}
-						m, reverse := filter.Match(link.Attrs().Name)
-						if m {
-							match = !reverse
-							break
-						}
-					}
-				} else {
-					// There might be next hop groups where ifindex is zero
-					// and the underlying next hop devices might not be known
-					// to Cilium. In this case, assume match and don't encode
-					// -o device.
-					match = true
-				}
-				_, exclusionCIDR, err := net.ParseCIDR(snatDstExclusionCIDR)
-				if !match || r.Src == nil || (err == nil && cidr.Equal(r.Dst, exclusionCIDR)) {
-					continue
-				}
-				if initialPass && cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
-					defaultRoutes = append(defaultRoutes, r)
-					continue
-				}
-				progArgs := []string{
-					"-t", "nat",
-					"-A", ciliumPostNatChain,
-					"-s", allocRange,
-				}
-				if cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
-					progArgs = append(
-						progArgs,
-						"!", "-d", snatDstExclusionCIDR)
-				} else {
-					progArgs = append(
-						progArgs,
-						"-d", r.Dst.String())
-				}
-				if link != nil {
-					progArgs = append(
-						progArgs,
-						"-o", link.Attrs().Name)
-				} else {
-					progArgs = append(
-						progArgs,
-						"!", "-o", "cilium_+")
-				}
-				progArgs = append(
-					progArgs,
-					"-m", "comment", "--comment", "cilium snat non-cluster via source route",
-					"-j", "SNAT",
-					"--to-source", r.Src.String())
-				if m.cfg.IPTablesRandomFully {
-					progArgs = append(progArgs, "--random-fully")
-				}
-				if err := prog.runProg(progArgs); err != nil {
-					return err
-				}
-			}
-			if initialPass {
-				initialPass = false
-				routes = defaultRoutes
-				goto nextPass
+			if err := m.installMasqueradeRouteSourceRules(prog, routes, netlink.LinkByIndex, devices, snatDstExclusionCIDR, allocRange); err != nil {
+				return err
 			}
 		}
 	} else {
@@ -1717,6 +1639,93 @@ func (m *manager) installMasqueradeRules(
 		}
 	}
 
+	return nil
+}
+
+func (m *manager) installMasqueradeRouteSourceRules(
+	prog runnable, routes []netlink.Route, linkByIndex func(int) (netlink.Link, error),
+	devices []string, snatDstExclusionCIDR, allocRange string,
+) error {
+	slices.SortFunc(routes, func(a, b netlink.Route) int {
+		aPfx, bPfx := 0, 0
+		if a.Dst != nil {
+			aPfx, _ = a.Dst.Mask.Size()
+		}
+		if b.Dst != nil {
+			bPfx, _ = b.Dst.Mask.Size()
+		}
+		return bPfx - aPfx
+	})
+	for _, r := range routes {
+		var link netlink.Link
+		match := false
+		if r.LinkIndex > 0 {
+			var err error
+			link, err = linkByIndex(r.LinkIndex)
+			if err != nil {
+				continue
+			}
+			// Routes are dedicated to the specific interface, so we
+			// need to install the SNAT rules also for that interface
+			// via -o. If we cannot correlate to anything because no
+			// devices were specified, we need to bail out.
+			if len(devices) == 0 {
+				return fmt.Errorf("cannot correlate source route device for generating masquerading rules")
+			}
+			for _, device := range devices {
+				filter := tables.DeviceFilter{device}
+				m, reverse := filter.Match(link.Attrs().Name)
+				if m {
+					match = !reverse
+					break
+				}
+			}
+		} else {
+			// There might be next hop groups where ifindex is zero
+			// and the underlying next hop devices might not be known
+			// to Cilium. In this case, assume match and don't encode
+			// -o device.
+			match = true
+		}
+		_, exclusionCIDR, err := net.ParseCIDR(snatDstExclusionCIDR)
+		if !match || r.Src == nil || (err == nil && cidr.Equal(r.Dst, exclusionCIDR)) {
+			continue
+		}
+		progArgs := []string{
+			"-t", "nat",
+			"-A", ciliumPostNatChain,
+			"-s", allocRange,
+		}
+		if cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
+			progArgs = append(
+				progArgs,
+				"!", "-d", snatDstExclusionCIDR)
+		} else {
+			progArgs = append(
+				progArgs,
+				"-d", r.Dst.String())
+		}
+		if link != nil {
+			progArgs = append(
+				progArgs,
+				"-o", link.Attrs().Name)
+		} else {
+			progArgs = append(
+				progArgs,
+				"!", "-o", "cilium_+")
+		}
+		progArgs = append(
+			progArgs,
+			"-m", "comment", "--comment", "cilium snat non-cluster via source route",
+			"-j", "SNAT",
+			"--to-source", r.Src.String())
+		if m.cfg.IPTablesRandomFully {
+			progArgs = append(progArgs, "--random-fully")
+		}
+		if err := prog.runProg(progArgs); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1842,7 +1851,7 @@ func (m *manager) installRules(state desiredState) error {
 			return fmt.Errorf("cannot install host traffic mark rule: %w", err)
 		}
 
-		if m.sharedCfg.IptablesMasqueradingIPv4Enabled && state.localNodeInfo.internalIPv4 != nil {
+		if m.sharedCfg.IptablesMasqueradingIPv4Enabled && state.localNodeInfo.internalIPv4.IsValid() {
 			if err := m.installMasqueradeRules(m.ip4tables, state.devices.UnsortedList(), localDeliveryInterface,
 				m.remoteSNATDstAddrExclusionCIDR(state.localNodeInfo.ipv4NativeRoutingCIDR, state.localNodeInfo.ipv4AllocCIDR),
 				state.localNodeInfo.ipv4AllocCIDR,
@@ -1858,7 +1867,7 @@ func (m *manager) installRules(state desiredState) error {
 			return fmt.Errorf("cannot install host traffic mark rule: %w", err)
 		}
 
-		if m.sharedCfg.IptablesMasqueradingIPv6Enabled && state.localNodeInfo.internalIPv6 != nil {
+		if m.sharedCfg.IptablesMasqueradingIPv6Enabled && state.localNodeInfo.internalIPv6.IsValid() {
 			if err := m.installMasqueradeRules(m.ip6tables, state.devices.UnsortedList(), localDeliveryInterface,
 				m.remoteSNATDstAddrExclusionCIDR(state.localNodeInfo.ipv6NativeRoutingCIDR, state.localNodeInfo.ipv6AllocCIDR),
 				state.localNodeInfo.ipv6AllocCIDR,
@@ -1970,6 +1979,10 @@ func (m *manager) addCiliumAcceptEncryptionRules() error {
 		return nil
 	}
 
+	if m.sharedCfg.EnableWireguard {
+		return m.addCiliumAcceptWireguardRules()
+	}
+
 	insertAcceptEncrypt := func(ipt iptablesInterface, table, chain string) error {
 		matchDecrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkDecrypt, linux_defaults.RouteMarkMask)
 		matchEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
@@ -2013,6 +2026,10 @@ func (m *manager) addCiliumAcceptEncryptionRules() error {
 }
 
 func (m *manager) addCiliumNoTrackEncryptionRules() (err error) {
+	if m.sharedCfg.EnableWireguard {
+		return m.addCiliumNoTrackWireguardRules()
+	}
+
 	if m.sharedCfg.EnableIPv4 {
 		if err = m.ciliumNoTrackEncryptionRules(m.ip4tables, "-I"); err != nil {
 			return
@@ -2362,4 +2379,83 @@ func (m *manager) setNoTrackHostPorts(currentState noTrackHostPortsByPod, podNam
 
 	return m.replaceNoTrackHostPortRules(oldPorts, newPorts)
 
+}
+
+func (m *manager) addCiliumAcceptWireguardRules() error {
+	cmds := [][]string{{
+		"-t", "filter",
+		"-A", ciliumOutputChain,
+		"-p", "udp",
+		"--dport", strconv.Itoa(int(wgTypes.ListenPort)),
+		"-m", "comment", "--comment", "cilium: ACCEPT for wireguard traffic",
+		"-j", "ACCEPT",
+	}, {
+		"-t", "filter",
+		"-A", ciliumInputChain,
+		"-p", "udp",
+		"--dport", strconv.Itoa(int(wgTypes.ListenPort)),
+		"-m", "comment", "--comment", "cilium: ACCEPT for wireguard traffic",
+		"-j", "ACCEPT",
+	}}
+
+	for _, cmd := range cmds {
+		if m.sharedCfg.EnableIPv4 {
+			if err := m.ip4tables.runProg(cmd); err != nil {
+				return err
+			}
+		}
+
+		if m.sharedCfg.EnableIPv6 {
+			if err := m.ip6tables.runProg(cmd); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// ciliumNoTrackWireguardRules adds notrack rules for wireguard tunnel.
+// this way, the kernel doesn't keep CT state for wg tunnels, reducing the
+// performance impact in the packet forwarding.
+func (m *manager) addCiliumNoTrackWireguardRules() error {
+	input := []string{
+		"-t", "raw",
+		"-A", ciliumPreRawChain,
+		"-p", "udp",
+		"--dport", strconv.Itoa(int(wgTypes.ListenPort)),
+		"-m", "comment", "--comment", "cilium: NOTRACK for wireguard traffic",
+		"-j", "CT", "--notrack",
+	}
+
+	output := []string{
+		"-t", "raw",
+		"-A", ciliumOutputRawChain,
+		"-p", "udp",
+		"--dport", strconv.Itoa(int(wgTypes.ListenPort)),
+		"-m", "comment", "--comment", "cilium: NOTRACK for wireguard traffic",
+		"-j", "CT", "--notrack",
+	}
+
+	if m.sharedCfg.EnableIPv4 {
+		if err := m.ip4tables.runProg(input); err != nil {
+			return err
+		}
+
+		if err := m.ip4tables.runProg(output); err != nil {
+			return err
+		}
+	}
+
+	if m.sharedCfg.EnableIPv6 {
+		if err := m.ip6tables.runProg(input); err != nil {
+			return err
+		}
+
+		if err := m.ip6tables.runProg(output); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

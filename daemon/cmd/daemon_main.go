@@ -32,6 +32,7 @@ import (
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/defaults"
+	endpointTypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/flowdebug"
@@ -206,6 +207,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(option.EnableIPv6Name, defaults.EnableIPv6, "Enable IPv6 support")
 	option.BindEnv(vp, option.EnableIPv6Name)
 
+	flags.Bool(option.PreferIpv6Name, defaults.PreferIpv6, "Prefer IPv6 addresses over IPv4 when both are available")
+	option.BindEnv(vp, option.PreferIpv6Name)
+
 	flags.Bool(option.EnableNat46X64Gateway, false, "Enable NAT46 and NAT64 gateway")
 	option.BindEnv(vp, option.EnableNat46X64Gateway)
 
@@ -321,18 +325,6 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Duration(option.L2AnnouncerRetryPeriod, 2*time.Second, "Timeout after a renew failure, before the next retry")
 	option.BindEnv(vp, option.L2AnnouncerRetryPeriod)
-
-	flags.Bool(option.EnableEncryptionStrictMode, false, "Enable encryption strict mode")
-	flags.MarkDeprecated(option.EnableEncryptionStrictMode, "Please use --enable-encryption-strict-mode-egress instead. This option will be removed in v1.20")
-	option.BindEnv(vp, option.EnableEncryptionStrictMode)
-
-	flags.String(option.EncryptionStrictModeCIDR, "", "In strict-mode encryption, all unencrypted traffic coming from this CIDR and going to this same CIDR will be dropped.")
-	flags.MarkDeprecated(option.EncryptionStrictModeCIDR, "Please use --encryption-strict-egress-cidr instead. This option will be removed in v1.20")
-	option.BindEnv(vp, option.EncryptionStrictModeCIDR)
-
-	flags.Bool(option.EncryptionStrictModeAllowRemoteNodeIdentities, false, "Allows unencrypted traffic from pods to remote node identities within the strict mode CIDR. This is required when tunneling is used or direct routing is used and the node CIDR and pod CIDR overlap.")
-	flags.MarkDeprecated(option.EncryptionStrictModeAllowRemoteNodeIdentities, "Please use --encryption-strict-egress-allow-remote-node-identities instead. This option will be removed in v1.20")
-	option.BindEnv(vp, option.EncryptionStrictModeAllowRemoteNodeIdentities)
 
 	flags.Bool(option.EnableEncryptionStrictModeEgress, false, "Enable strict mode encryption enforcement for egress traffic")
 	option.BindEnv(vp, option.EnableEncryptionStrictModeEgress)
@@ -653,6 +645,7 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	option.BindEnv(vp, option.FQDNRegexCompileLRUSize)
 
 	flags.String(option.ToFQDNsPreCache, defaults.ToFQDNsPreCache, "DNS cache data at this path is preloaded on agent startup")
+	flags.MarkDeprecated(option.ToFQDNsPreCache, "This option is obsolete and will be removed in v1.21")
 	option.BindEnv(vp, option.ToFQDNsPreCache)
 
 	flags.Int(option.DNSProxyConcurrencyLimit, 0, "Limit concurrency of DNS message processing")
@@ -823,6 +816,10 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(option.EnableCiliumNodeCRDName, defaults.EnableCiliumNodeCRD, "Enable use of CiliumNode CRD")
 	flags.MarkHidden(option.EnableCiliumNodeCRDName)
 	option.BindEnv(vp, option.EnableCiliumNodeCRDName)
+
+	flags.Bool(option.EnableDatapathPlugins, defaults.EnableDatapathPlugins, "Enable use of datapath plugins and the CiliumDatapathPlugins CRD")
+	flags.MarkHidden(option.EnableDatapathPlugins)
+	option.BindEnv(vp, option.EnableDatapathPlugins)
 
 	if err := vp.BindPFlags(flags); err != nil {
 		logging.Fatal(logger, "BindPFlags failed", logfields.Error, err)
@@ -1057,8 +1054,8 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 		logging.Fatal(logger, "Unable to parse Label prefix configuration", logfields.Error, err)
 	}
 
-	if option.Config.EnableL7Proxy && !option.Config.InstallIptRules {
-		logging.Fatal(logger, "L7 proxy requires iptables rules (--install-iptables-rules=\"true\")")
+	if option.Config.EnableL7Proxy && !option.Config.InstallIptRules && !option.Config.EnableBPFTProxy {
+		logging.Fatal(logger, "L7 proxy requires iptables rules (--install-iptables-rules=\"true\") or BPF TProxy (--enable-bpf-tproxy=\"true\")")
 	}
 
 	if option.Config.EnableRemoteNodeMasquerade && !option.Config.EnableBPFMasquerade {
@@ -1090,12 +1087,8 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 	}
 
 	if option.Config.LocalRouterIPv4 != "" || option.Config.LocalRouterIPv6 != "" {
-		// TODO(weil0ng): add a proper check for ipam in PR# 15429.
 		if option.Config.TunnelingEnabled() {
 			logging.Fatal(logger, fmt.Sprintf("Cannot specify %s or %s in tunnel mode.", option.LocalRouterIPv4, option.LocalRouterIPv6))
-		}
-		if !option.Config.EnableEndpointRoutes {
-			logging.Fatal(logger, fmt.Sprintf("Cannot specify %s or %s  without %s.", option.LocalRouterIPv4, option.LocalRouterIPv6, option.EnableEndpointRoutes))
 		}
 	}
 
@@ -1224,6 +1217,7 @@ type daemonParams struct {
 	Devices             statedb.Table[*datapathTables.Device]
 	DirectRoutingDevice datapathTables.DirectRoutingDevice
 	IPsecAgent          ipsec.Agent
+	Orchestrator        endpointTypes.Orchestrator
 	SyncHostIPs         *syncHostIPs
 	NodeDiscovery       *nodediscovery.NodeDiscovery
 	IPAMInitializer     *ipamcell.IPAMInitializer

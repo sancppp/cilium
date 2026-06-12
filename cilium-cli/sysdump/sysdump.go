@@ -892,6 +892,20 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
+			Description: "Collecting Cilium L2 Announcement Policies",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumL2AnnouncementPolicies(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium L2 announcement policies: %w", err)
+				}
+				if err := c.WriteYAML(ciliumL2AnnouncementPoliciesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium L2 announcement policies: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: fmt.Sprintf("Checking if %s exists in %s namespace", ciliumEtcdSecretsSecretName, c.Options.CiliumNamespace),
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -2152,6 +2166,21 @@ func (c *Collector) getGatewayAPITasks() []Task {
 			},
 		},
 		{
+			Description: "Collecting BackendTLSPolicy entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, backendTLSPolicy, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect BackendTLSPolicy entries: %w", err)
+				}
+				if err := c.WriteYAML(backendTLSPoliciesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect BackendTLSPolicy entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting GRPCRoute entries",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -2192,6 +2221,21 @@ func (c *Collector) getGatewayAPITasks() []Task {
 				}
 				if err := c.WriteYAML(udpRoutesFileName, v); err != nil {
 					return fmt.Errorf("failed to collect UDPRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting CiliumGatewayClassConfig entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, ciliumGatewayClassConfig, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect CiliumGatewayClassConfig entries: %w", err)
+				}
+				if err := c.WriteYAML(ciliumGatewayClassConfigsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect CiliumGatewayClassConfig entries: %w", err)
 				}
 				return nil
 			},

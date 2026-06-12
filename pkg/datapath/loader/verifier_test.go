@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/hive/hivetest"
 
@@ -89,62 +88,84 @@ func TestPrivilegedVerifier(t *testing.T) {
 		records.WriteToFile(path)
 	})
 
-	t.Run("LXC", func(t *testing.T) {
-		t.Parallel()
-		i := 1
-		for perm := range buildPermutations("bpf_lxc", kv, lxcLoadPermutations) {
-			t.Run(strconv.Itoa(i), compileAndLoad(perm, "lxc", endpointProg, endpointObj, i, &records))
-			i++
-		}
-	})
+	for _, c := range collections {
+		c.Run(t, kv, &records)
+	}
+}
 
-	t.Run("Host", func(t *testing.T) {
-		t.Parallel()
-		i := 1
-		for perm := range buildPermutations("bpf_host", kv, hostLoadPermutations) {
-			t.Run(strconv.Itoa(i), compileAndLoad(perm, "host", hostEndpointProg, hostEndpointObj, i, &records))
-			i++
-		}
-	})
+var collections = []collection{
+	{
+		name:             "LXC",
+		progDir:          "bpf_lxc",
+		loadPermutations: lxcLoadPermutations,
+		collection:       "lxc",
+		source:           endpointProg,
+		output:           endpointObj,
+	},
+	{
+		name:             "Host",
+		progDir:          "bpf_host",
+		loadPermutations: hostLoadPermutations,
+		collection:       "host",
+		source:           hostEndpointProg,
+		output:           hostEndpointObj,
+	},
+	{
+		name:             "Overlay",
+		progDir:          "bpf_overlay",
+		loadPermutations: overlayLoadPermutations,
+		collection:       "overlay",
+		source:           overlayProg,
+		output:           overlayObj,
+	},
+	{
+		name:             "Sock",
+		progDir:          "bpf_sock",
+		loadPermutations: sockLoadPermutations,
+		collection:       "sock",
+		source:           socketProg,
+		output:           socketObj,
+	},
+	{
+		name:             "Wireguard",
+		progDir:          "bpf_wireguard",
+		loadPermutations: wireguardLoadPermutations,
+		collection:       "wireguard",
+		source:           wireguardProg,
+		output:           wireguardObj,
+	},
+	{
+		name:             "XDP",
+		progDir:          "bpf_xdp",
+		loadPermutations: xdpLoadPermutations,
+		collection:       "xdp",
+		source:           xdpProg,
+		output:           xdpObj,
+	},
+}
 
-	t.Run("Overlay", func(t *testing.T) {
-		t.Parallel()
-		i := 1
-		for perm := range buildPermutations("bpf_overlay", kv, overlayLoadPermutations) {
-			t.Run(strconv.Itoa(i), compileAndLoad(perm, "overlay", overlayProg, overlayObj, i, &records))
-			i++
-		}
-	})
+type collection struct {
+	name             string
+	progDir          string
+	loadPermutations *loadPermutationBuilder
+	collection       string
+	source           string
+	output           string
+}
 
-	t.Run("Sock", func(t *testing.T) {
+func (c *collection) Run(t *testing.T, kv kernelVersion, records *verifierComplexityRecords) {
+	t.Run(c.name, func(t *testing.T) {
 		t.Parallel()
 		i := 1
-		for perm := range buildPermutations("bpf_sock", kv, sockLoadPermutations) {
-			t.Run(strconv.Itoa(i), compileAndLoad(perm, "sock", socketProg, socketObj, i, &records))
-			i++
-		}
-	})
-
-	t.Run("Wireguard", func(t *testing.T) {
-		t.Parallel()
-		i := 1
-		for perm := range buildPermutations("bpf_wireguard", kv, wireguardLoadPermutations) {
-			t.Run(strconv.Itoa(i), compileAndLoad(perm, "wireguard", wireguardProg, wireguardObj, i, &records))
-			i++
-		}
-	})
-
-	t.Run("XDP", func(t *testing.T) {
-		t.Parallel()
-		i := 1
-		for perm := range buildPermutations("bpf_xdp", kv, xdpLoadPermutations) {
-			t.Run(strconv.Itoa(i), compileAndLoad(perm, "xdp", xdpProg, xdpObj, i, &records))
+		for perm := range buildPermutations(c.progDir, kv, c.loadPermutations) {
+			t.Run(strconv.Itoa(i), compileAndLoad(perm, c.collection, c.source, c.output, kv, i, records))
 			i++
 		}
 	})
 }
 
-func compileAndLoad[T any](perm buildPermutation[T], collection, source, output string, build int, records *verifierComplexityRecords) func(t *testing.T) {
+func compileAndLoad(perm buildPermutation, collection, source, output string, kv kernelVersion,
+	build int, records *verifierComplexityRecords) func(t *testing.T) {
 	return func(t *testing.T) {
 		t.Parallel()
 
@@ -186,7 +207,7 @@ func compileAndLoad[T any](perm buildPermutation[T], collection, source, output 
 				spec,
 				constants,
 				collection,
-				build, ii,
+				kv, build, ii,
 				records,
 			))
 			ii++
@@ -207,6 +228,7 @@ func loadAndRecordComplexity(
 	spec *ebpf.CollectionSpec,
 	constants any,
 	collection string,
+	kv kernelVersion,
 	build, load int,
 	records *verifierComplexityRecords,
 ) func(t *testing.T) {
@@ -319,6 +341,7 @@ func loadAndRecordComplexity(
 			// The part of the log we are interested in is at the end. And looks like this:
 			//   verification time 355643 usec
 			//   stack depth 144+280+120
+			//   insns processed 12591+75421+455  <-- only on newer kernels
 			//   processed 88467 insns (limit 1000000) max_states_per_insn 44 total_states 4141 peak_states 1137 mark_read 56
 
 			// Remove trailing newline so strings.LastIndex finds the newline ahead of the last log line.
@@ -343,23 +366,19 @@ func loadAndRecordComplexity(
 				t.Fatalf("Failed to parse verifier log for program %s: %v", n, err)
 			}
 
-			// Extract the second to last line, which looks like:
-			//   stack depth 144+280+120
 			stackDepthIndex := strings.LastIndex(p.VerifierLog[:lastLineIndex], "\n")
-			stackDepthLine := strings.TrimPrefix(strings.TrimSpace(p.VerifierLog[stackDepthIndex+1:lastOff]), "stack depth ")
-
-			// Remove prefix so we are just left with plus separated stack depths, and parse them into ints.
-			//   144+280+120
-			// Split and parse to ints
-			var depths []int
-			for part := range strings.SplitSeq(stackDepthLine, "+") {
-				depth, err := strconv.Atoi(part)
+			// On older kernels, the max field is missing in verifier logs so
+			// we can't easily retrieve the max stack size. We'll just return
+			// it for bpf-next, where it's likely already the highest value
+			// anyway.
+			if kv == kernelVersionNetNext {
+				var stackDepth int
+				stackDepth, stackDepthIndex, err = parseStackDepth(s, p.VerifierLog, lastLineIndex, lastOff)
 				if err != nil {
 					t.Fatalf("Failed to parse stack depth for program %s: %v", n, err)
 				}
-				depths = append(depths, depth)
+				r.StackDepth = stackDepth
 			}
-			r.StackDepth = maxStackDepth(s, depths)
 
 			// Extract the third to last line, which looks like:
 			//   verification time 355643 usec
@@ -381,46 +400,36 @@ func loadAndRecordComplexity(
 	}
 }
 
-func maxStackDepth(spec *ebpf.ProgramSpec, stackDepths []int) int {
-	insns := spec.Instructions
-	graph := make(map[string][]string)
-	sizes := make(map[string]int)
-
-	// The stack depths in the verifier log are in the same order as the functions in the instructions.
-	// We iterate through the instructions, and whenever we see a function definition, we take the next stack depth
-	// from the log and associate it with that function. Also record calls to construct a call graph.
-	var cur string
-	for _, insn := range insns {
-		if insn.IsFunctionCall() {
-			graph[cur] = append(graph[cur], insn.Reference())
-			continue
-		}
-		if fn := btf.FuncMetadata(&insn); fn != nil {
-			cur = fn.Name
-			sizes[cur] = stackDepths[0]
-			stackDepths = stackDepths[1:]
+// Extract the second to last line, which looks like:
+//
+//	stack depth 144+280+120
+func parseStackDepth(s *ebpf.ProgramSpec, verifierLogs string, lastLineIndex, lastOff int) (int, int, error) {
+	stackDepthIndex := strings.LastIndex(verifierLogs[:lastLineIndex], "\n")
+	stackDepthLine := verifierLogs[stackDepthIndex+1 : lastOff]
+	if !strings.Contains(stackDepthLine, "stack depth ") {
+		lastOff = stackDepthIndex + 1
+		stackDepthIndex = strings.LastIndex(verifierLogs[:stackDepthIndex], "\n")
+		stackDepthLine = verifierLogs[stackDepthIndex+1 : lastOff]
+		if !strings.Contains(stackDepthLine, "stack depth ") {
+			return 0, stackDepthIndex, fmt.Errorf("Couldn't find stack depths line in verifier logs")
 		}
 	}
+	stackDepthLine = strings.TrimPrefix(strings.TrimSpace(stackDepthLine), "stack depth ")
+	// On newer kernels, the stack depth line may look as follows, so we need
+	// to remove the max info at the end.
+	//   stack depth 144+255 max 400
+	stackDepthInfo := strings.Split(stackDepthLine, " max ")
 
-	// Recursively visit the call graph to calculate the maximum stack depth, by summing the stack sizes of called
-	// functions. This is safe to do since the verifier will have rejected any program with recursive calls, so we know
-	// the graph is acyclic.
-	maxDepth := 0
-	var visit func(callstack []string)
-	visit = func(callstack []string) {
-		depth := 0
-		for _, fn := range callstack {
-			depth += sizes[fn]
-		}
-		maxDepth = max(maxDepth, depth)
-
-		for _, callee := range graph[callstack[len(callstack)-1]] {
-			visit(append(callstack, callee))
-		}
+	// The max field isn't reported on older kernels.
+	if len(stackDepthInfo) != 2 {
+		return 0, stackDepthIndex, fmt.Errorf("Couldn't find max stack depth value in verifier logs")
 	}
-	visit([]string{spec.Name})
 
-	return maxDepth
+	maxDepth, err := strconv.Atoi(stackDepthInfo[1])
+	if err != nil {
+		return 0, stackDepthIndex, err
+	}
+	return maxDepth, stackDepthIndex, nil
 }
 
 type verifierComplexityRecord struct {
@@ -507,13 +516,13 @@ func kernelVersionFromString(s string) (kernelVersion, error) {
 	}
 }
 
-type buildPermutation[T any] struct {
+type buildPermutation struct {
 	options          []string
-	loadPermutations iter.Seq[T]
+	loadPermutations iter.Seq[[]any]
 }
 
-func buildPermutations[T any](progDir string, kernel kernelVersion, loadPerm func() iter.Seq[T]) iter.Seq[buildPermutation[T]] {
-	return func(yield func(buildPermutation[T]) bool) {
+func buildPermutations(progDir string, kernel kernelVersion, loadPerm *loadPermutationBuilder) iter.Seq[buildPermutation] {
+	return func(yield func(buildPermutation) bool) {
 		dir := path.Join(*flagCiliumBasePath, "bpf", "complexity-tests", kernel.String(), progDir)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -529,12 +538,210 @@ func buildPermutations[T any](progDir string, kernel kernelVersion, loadPerm fun
 
 			optionsSlice := strings.Split(string(contents), "\n")
 
-			if !yield(buildPermutation[T]{
+			if !yield(buildPermutation{
 				options:          optionsSlice,
-				loadPermutations: loadPerm(),
+				loadPermutations: loadPerm.build(),
 			}) {
 				return
 			}
+		}
+	}
+}
+
+type loadPermutationBuilder struct {
+	constructors []func() any
+	options      []configOption
+}
+
+func (b *loadPermutationBuilder) addConstructor(constructor func() any) {
+	b.constructors = append(b.constructors, constructor)
+}
+
+func (b *loadPermutationBuilder) addOptions(options ...configOption) {
+	b.options = append(b.options, options...)
+}
+
+// build a sequence of configuration slices from the registered constructors and options.
+func (b *loadPermutationBuilder) build() iter.Seq[[]any] {
+	var alwaysSetters []configSetter
+	var incrementSetters []configSetter
+	var permuteSetters []configSetter
+
+	for _, option := range b.options {
+		switch option.typ {
+		case configAlways:
+			alwaysSetters = append(alwaysSetters, option.fn)
+		case configIncrement:
+			incrementSetters = append(incrementSetters, option.fn)
+		case configPermute:
+			permuteSetters = append(permuteSetters, option.fn)
+		case configIncrementOrPermute:
+			if testing.Short() {
+				incrementSetters = append(incrementSetters, option.fn)
+			} else {
+				permuteSetters = append(permuteSetters, option.fn)
+			}
+		default:
+			panic("unknown option type")
+		}
+	}
+
+	return func(yield func([]any) bool) {
+		// given a number of bools, returns a sequence of all unique permutations of those bools being true or false.
+		// If n=0, then a single empty slice is returned.
+		permute := func(n int) iter.Seq[[]bool] {
+			permutation := make([]bool, n)
+			return func(yield func([]bool) bool) {
+				for i := range uint64(1 << n) {
+					for j := range n {
+						permutation[j] = (i & (1 << j)) != 0
+					}
+					if !yield(permutation) {
+						return
+					}
+				}
+			}
+		}
+
+		// For each permutation of the `Permute` options, or just once if there are none.
+		for permutations := range permute(len(permuteSetters)) {
+			// For each incremental combination of the `Increment` options, or just once if there are none.
+			// it's len + 1, because we always want to yield the configuration with all options disabled, and then
+			// incrementally enable options until all are enabled.
+			for i := range len(incrementSetters) + 1 {
+				// Construct a configuration object from each registered constructor.
+				cfgs := make([]any, len(b.constructors))
+				for j, constructor := range b.constructors {
+					cfgs[j] = constructor()
+				}
+
+				for _, setter := range alwaysSetters {
+					for _, cfg := range cfgs {
+						setter(cfg, true)
+					}
+				}
+
+				for oi, setter := range incrementSetters {
+					for _, cfg := range cfgs {
+						setter(cfg, oi < i)
+					}
+				}
+
+				for oi, setter := range permuteSetters {
+					for _, cfg := range cfgs {
+						setter(cfg, permutations[oi])
+					}
+				}
+
+				if !yield(cfgs) {
+					return
+				}
+			}
+		}
+	}
+}
+
+type configType int
+
+const (
+	configAlways configType = iota
+	configIncrement
+	configPermute
+	configIncrementOrPermute
+)
+
+type configOption struct {
+	typ configType
+	fn  configSetter
+}
+
+type configSetter func(c any, v bool)
+
+func callWithT[T any](fn func(*T, bool)) configSetter {
+	return func(c any, v bool) {
+		if cfg, ok := c.(*T); ok {
+			fn(cfg, v)
+		}
+	}
+}
+
+// Always apply `fn` to the configuration, regardless of the permutation.
+func Always[T any](fn func(*T, bool)) configOption {
+	return configOption{typ: configAlways, fn: callWithT(fn)}
+}
+
+// Apply `fn` to the configuration, incrementally enabling the option for each permutation.
+// `fn` is always invoked, the boolean parameter indicates whether the option should be enabled for this permutation.
+func Increment[T any](fn func(*T, bool)) configOption {
+	return configOption{typ: configIncrement, fn: callWithT(fn)}
+}
+
+// Apply `fn` to the configuration, permuting the option on or off for each permutation.
+// `fn` is always invoked, the boolean parameter indicates whether the option should be enabled for this permutation.
+//
+// Note: permuting options exponentially increases the number of permutations to be checked.
+func Permute[T any](fn func(*T, bool)) configOption {
+	return configOption{typ: configPermute, fn: callWithT(fn)}
+}
+
+// When -short is set, use Increment behavior, otherwise use Permute behavior.
+func IncrementOrPermute[T any](fn func(*T, bool)) configOption {
+	return configOption{typ: configIncrementOrPermute, fn: callWithT(fn)}
+}
+
+func TestTable(t *testing.T) {
+	type configA struct {
+		enableA bool
+		enableB bool
+		enableC bool
+	}
+
+	type configB struct {
+		enableD bool
+		enableE bool
+		enableF bool
+	}
+
+	builder := loadPermutationBuilder{
+		constructors: []func() any{
+			func() any { return &configA{} },
+			func() any { return &configB{} },
+		},
+		options: []configOption{
+			Always(func(c *configA, _ bool) { c.enableA = true }),
+			Increment(func(c *configA, v bool) { c.enableB = v }),
+			Permute(func(c *configA, v bool) { c.enableC = v }),
+			Always(func(c *configB, _ bool) { c.enableD = true }),
+			Increment(func(c *configB, v bool) { c.enableE = v }),
+			Permute(func(c *configB, v bool) { c.enableF = v }),
+		},
+	}
+
+	result := slices.Collect(builder.build())
+	if len(result) != 12 {
+		t.Fatalf("expected 12 configurations, got %d", len(result))
+	}
+	expected := [][]any{
+		{&configA{true, false, false}, &configB{true, false, false}},
+		{&configA{true, true, false}, &configB{true, false, false}},
+		{&configA{true, true, false}, &configB{true, true, false}},
+		{&configA{true, false, true}, &configB{true, false, false}},
+		{&configA{true, true, true}, &configB{true, false, false}},
+		{&configA{true, true, true}, &configB{true, true, false}},
+		{&configA{true, false, false}, &configB{true, false, true}},
+		{&configA{true, true, false}, &configB{true, false, true}},
+		{&configA{true, true, false}, &configB{true, true, true}},
+		{&configA{true, false, true}, &configB{true, false, true}},
+		{&configA{true, true, true}, &configB{true, false, true}},
+		{&configA{true, true, true}, &configB{true, true, true}},
+	}
+	for i, cfg := range result {
+		gotA := cfg[0].(*configA)
+		gotB := cfg[1].(*configB)
+		expA := expected[i][0].(*configA)
+		expB := expected[i][1].(*configB)
+		if *gotA != *expA || *gotB != *expB {
+			t.Errorf("configuration %d does not match expected: got (%+v, %+v), want (%+v, %+v)", i, gotA, gotB, expA, expB)
 		}
 	}
 }

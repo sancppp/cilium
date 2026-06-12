@@ -5,15 +5,17 @@ package logging
 
 import (
 	"bytes"
-	"flag"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
 
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -60,52 +62,142 @@ func TestSetDefaultLogLevel(t *testing.T) {
 	require.Equal(t, DefaultLogLevel, GetSlogLevel(DefaultSlogLogger))
 }
 
-func TestSetupLogging2(t *testing.T) {
+func TestKlogBridgeLevelOverrides(t *testing.T) {
 	var out bytes.Buffer
 	logger := slog.New(
-		slog.NewTextHandler(&out,
+		slog.NewJSONHandler(&out,
 			&slog.HandlerOptions{
 				ReplaceAttr: ReplaceAttrFnWithoutTimestamp,
 			},
 		),
 	)
-	log := logger.With(logfields.LogSubsys, "logging-test")
+	log := logger.With(logfields.LogSubsys, "klog")
+
 	overrides := []logLevelOverride{
 		{
 			matcher:     regexp.MustCompile("^please override (this|foo)!$"),
 			targetLevel: slog.LevelInfo,
 		},
 	}
-	errWriter, err := severityOverrideWriter(slog.LevelError, log, overrides)
-	assert.NoError(t, err)
+	handler := &klogOverrideHandler{
+		inner:     log.Handler(),
+		overrides: overrides,
+	}
+	klog.SetSlogLogger(slog.New(handler))
 
-	klogFlags := flag.NewFlagSet("cilium", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
-	klogFlags.Set("logtostderr", "false")
-	klogFlags.Set("skip_headers", "true")
-	klogFlags.Set("one_output", "true")
-
-	klog.SetOutputBySeverity("ERROR", errWriter)
-	klog.SetOutputBySeverity("INFO", &out)
-	klog.Error("please do not override this!")
-	klog.Error("please override this!")
-	klog.Error("please override foo!")
-	klog.Error("final log")
+	klog.ErrorS(nil, "please do not override this!")
+	klog.ErrorS(nil, "please override this!")
+	klog.ErrorS(nil, "please override foo!")
+	klog.ErrorS(fmt.Errorf("something failed"), "final log", "key", "value")
 	klog.Flush()
-	var lines []string
-	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
-		logout := strings.Trim(out.String(), "\n")
-		lines = strings.Split(logout, "\n")
-		assert.Len(collect, lines, 4)
-	}, time.Second, time.Millisecond*50)
+
+	logout := strings.Trim(out.String(), "\n")
+	lines := strings.Split(logout, "\n")
+	require.Len(t, lines, 4)
+
 	for _, line := range lines {
-		if strings.Contains(line, "please override this!") || strings.Contains(line, "please override foo!") {
-			assert.Contains(t, line, "level=info")
-		} else {
-			assert.Contains(t, line, "level=error")
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+
+		msg, _ := entry["msg"].(string)
+		level, _ := entry["level"].(string)
+
+		// Verify subsys is propagated
+		assert.Equal(t, "klog", entry[logfields.LogSubsys])
+
+		switch {
+		case msg == "please override this!" || msg == "please override foo!":
+			assert.Equal(t, "info", level, "overridden messages should be info, got line: %s", line)
+		case msg == "please do not override this!":
+			assert.Equal(t, "error", level, "non-overridden error should stay error, got line: %s", line)
+		case msg == "final log":
+			assert.Equal(t, "error", level, "non-overridden error should stay error, got line: %s", line)
+			assert.Equal(t, "value", entry["key"], "structured key-value pairs should be preserved")
+			assert.Equal(t, "something failed", entry[logfields.Error], "error should be preserved as a structured field")
 		}
 	}
+}
 
+func TestKlogBridgeErrPredicate(t *testing.T) {
+	var out bytes.Buffer
+	logger := slog.New(
+		slog.NewJSONHandler(&out,
+			&slog.HandlerOptions{
+				ReplaceAttr: ReplaceAttrFnWithoutTimestamp,
+			},
+		),
+	)
+	log := logger.With(logfields.LogSubsys, "klog")
+
+	overrides := []logLevelOverride{
+		{
+			matcher:      regexp.MustCompile("Failed to update lease"),
+			errPredicate: apierrors.IsConflict,
+			targetLevel:  slog.LevelInfo,
+		},
+	}
+	handler := &klogOverrideHandler{
+		inner:     log.Handler(),
+		overrides: overrides,
+	}
+	klog.SetSlogLogger(slog.New(handler))
+
+	lease := schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}
+	conflict := apierrors.NewConflict(lease, "cilium-operator-resource-lock",
+		fmt.Errorf("the object has been modified"))
+	timeout := apierrors.NewServerTimeout(lease, "update", 1)
+
+	klog.ErrorS(conflict, "Failed to update lease")
+	klog.ErrorS(timeout, "Failed to update lease")
+	klog.ErrorS(nil, "Failed to update lease")
+	klog.Flush()
+
+	logout := strings.Trim(out.String(), "\n")
+	lines := strings.Split(logout, "\n")
+	require.Len(t, lines, 3)
+
+	for i, line := range lines {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+
+		level, _ := entry["level"].(string)
+		switch i {
+		case 0:
+			assert.Equal(t, "info", level, "conflict should be downgraded, got line: %s", line)
+		default:
+			assert.Equal(t, "error", level, "non-conflict should stay error, got line: %s", line)
+		}
+	}
+}
+
+func TestKlogBridgeStructuredFields(t *testing.T) {
+	var out bytes.Buffer
+	logger := slog.New(
+		slog.NewJSONHandler(&out,
+			&slog.HandlerOptions{
+				ReplaceAttr: ReplaceAttrFnWithoutTimestamp,
+			},
+		),
+	)
+
+	log := logger.With(logfields.LogSubsys, "klog")
+	handler := &klogOverrideHandler{
+		inner:     log.Handler(),
+		overrides: nil,
+	}
+	klog.SetSlogLogger(slog.New(handler))
+
+	klog.InfoS("test message", "pod", "my-pod", "namespace", "default")
+	klog.Flush()
+
+	logout := strings.Trim(out.String(), "\n")
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal([]byte(logout), &entry))
+
+	assert.Equal(t, "test message", entry["msg"])
+	assert.Equal(t, "my-pod", entry["pod"])
+	assert.Equal(t, "default", entry["namespace"])
+	assert.Equal(t, "klog", entry[logfields.LogSubsys])
 }
 
 func TestSetupLogging(t *testing.T) {

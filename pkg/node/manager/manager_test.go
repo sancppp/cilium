@@ -106,16 +106,8 @@ func (i *ipcacheMock) UpsertMetadata(prefix cmtypes.PrefixCluster, src source.So
 	i.Upsert(prefix.String(), nil, 0, nil, ipcache.Identity{}, aux...)
 }
 
-func (i *ipcacheMock) OverrideIdentity(prefix cmtypes.PrefixCluster, identityLabels labels.Labels, src source.Source, resource ipcacheTypes.ResourceID) {
-	i.UpsertMetadata(prefix, src, resource)
-}
-
 func (i *ipcacheMock) RemoveMetadata(prefix cmtypes.PrefixCluster, resource ipcacheTypes.ResourceID, aux ...ipcache.IPMetadata) {
 	i.Delete(prefix.String(), source.CustomResource, aux...)
-}
-
-func (i *ipcacheMock) RemoveIdentityOverride(prefix cmtypes.PrefixCluster, identityLabels labels.Labels, resource ipcacheTypes.ResourceID) {
-	i.Delete(prefix.String(), source.CustomResource)
 }
 
 func (i *ipcacheMock) UpsertMetadataBatch(updates ...ipcache.MU) (revision uint64) {
@@ -361,14 +353,11 @@ func TestNodeLabels(t *testing.T) {
 	require.NoError(t, err)
 	mngr.NodeUpdated(nRemote)
 
-	if err := labelsfilter.ParseLabelPrefixCfg(logger, nil, nil, ""); err != nil {
-		t.Fatal("ParseLabelPrefixCfg() failed")
-	}
-
 	tests := []struct {
 		name               string
 		node               nodeTypes.Node
 		nodeSelectorLabels bool
+		nodeLabelPrefixes  []string
 		setupWanted        func() labels.Labels
 	}{{
 		name:               "Local node with node selector labels enabled",
@@ -408,13 +397,29 @@ func TestNodeLabels(t *testing.T) {
 		setupWanted: func() labels.Labels {
 			return labels.NewFrom(labels.LabelRemoteNode)
 		},
+	}, {
+		name:               "Remote node with node selector labels enabled and filtered labels",
+		node:               nRemote,
+		nodeSelectorLabels: true,
+		nodeLabelPrefixes:  []string{"node:test-label"},
+		setupWanted: func() labels.Labels {
+			want := labels.NewFrom(labels.LabelRemoteNode)
+			want.MergeLabels(labels.Map2Labels(map[string]string{
+				"test-label": "test-value",
+			}, labels.LabelSourceNode))
+			want.MergeLabels(labels.Map2Labels(map[string]string{
+				"io.cilium.k8s.policy.cluster": "default",
+			}, labels.LabelSourceK8s))
+			return want
+		},
 	}}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, labelsfilter.ParseLabelPrefixCfg(logger, nil, tt.nodeLabelPrefixes, ""))
 			option.Config.EnableNodeSelectorLabels = tt.nodeSelectorLabels
 			option.Config.ClusterName = "default"
-			got, _ := mngr.nodeIdentityLabels(tt.node)
+			got := mngr.nodeIdentityLabels(tt.node)
 			want := tt.setupWanted()
 			assert.True(t, want.Equals(got), "Mismatched labels: want=%v got=%v", want, got)
 		})

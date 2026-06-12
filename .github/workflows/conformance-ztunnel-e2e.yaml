@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/cilium/.github/actions/set-commit-status@main
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -83,6 +83,9 @@ jobs:
         uses: ./.github/actions/wait-for-images
         with:
           SHA: ${{ inputs.SHA || github.sha }}
+          login-host: ${{ vars.DOCKER_READ_HOST }}
+          login-username: ${{ vars.DOCKER_READ_USERNAME }}
+          login-password: ${{ secrets.DOCKER_READ_PASSWORD }}
 
   setup-and-test:
     needs: [wait-for-images]
@@ -107,6 +110,11 @@ jobs:
 
     timeout-minutes: 75
     steps:
+      - name: Set commit status to pending
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
+        with:
+          sha: ${{ inputs.SHA || github.sha }}
+
       - name: Collect Workflow Telemetry
         uses: cilium/workflow-telemetry-action@b1a318f80a08acede58027afe1455d037379966f # v2.2.0
         with:
@@ -145,19 +153,24 @@ jobs:
         uses: ./.github/actions/cilium-config
         with:
           image-tag: ${{ steps.vars.outputs.sha }}
+          registry_host: ${{ vars.DOCKER_READ_HOST }}
+          registry_organization: ${{ vars.DOCKER_READ_ORG }}
           chart-dir: './untrusted/install/kubernetes/cilium'
           tunnel: ${{ matrix.tunnel }}
           kpr: ${{ matrix.kpr }}
           encryption: 'ztunnel'
           mutual-auth: false
+          image-pull-secret: "cilium-registry"
 
       - name: Set Kind params
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         id: kind-params
         shell: bash
         run: |
           echo params="--xdp --secondary-network \"\" 3 \"\" \"\" ${{ matrix.kube-proxy }} dual" >> $GITHUB_OUTPUT
 
       - name: Provision K8s on LVH VM
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         id: lvh-kind
         uses: ./.github/actions/lvh-kind
         with:
@@ -166,8 +179,17 @@ jobs:
           kind-params: "${{ steps.kind-params.outputs.params }}"
           kind-image: ${{ env.KIND_K8S_IMAGE }}
 
+      - name: Create imagePullSecret
+        run: |
+          kubectl create secret docker-registry cilium-registry \
+            --namespace kube-system \
+            --docker-server=${{ vars.DOCKER_READ_HOST }} \
+            --docker-username="${{ vars.DOCKER_READ_USERNAME }}" \
+            --docker-password="${{ secrets.DOCKER_READ_PASSWORD }}"
+
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@3ce83aa3b4ea3ce6d97023c4d83c22b73a4ed3b4 # v0.19.2
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
+        uses: cilium/cilium-cli@2c40f81b9180be6a5e52b8caf7f1de75202ec0fc # v0.19.4
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -178,6 +200,7 @@ jobs:
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ steps.vars.outputs.sha }}
@@ -187,9 +210,11 @@ jobs:
             install/kubernetes/cilium
 
       - name: Generate ZTunnel certificates
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         uses: ./.github/actions/ztunnel-certs
 
       - name: Install Cilium
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         id: install-cilium
         shell: bash
         run: |
@@ -200,6 +225,7 @@ jobs:
           kubectl -n kube-system exec daemonset/cilium -c cilium-agent -- cilium-dbg status
 
       - name: Wait for ZTunnel DaemonSet
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         shell: bash
         run: |
           echo "Waiting for ztunnel-cilium DaemonSet to be ready..."
@@ -207,12 +233,14 @@ jobs:
           kubectl -n kube-system get pods -l app=ztunnel -o wide
 
       - name: Get connectivity test flags
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         id: e2e_config
         uses: ./.github/actions/cli-test-config
         with:
           include-unsafe-tests: true
 
       - name: Run connectivity tests (${{ matrix.name }})
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         shell: bash
         run: |
           mkdir -p cilium-junits
@@ -223,6 +251,7 @@ jobs:
             --junit-property github_job_step="Run tests (${{ matrix.name }})"
 
       - name: Features tested
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
         uses: ./.github/actions/feature-status
         with:
           title: "Summary of all features tested"

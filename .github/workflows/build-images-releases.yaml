@@ -16,9 +16,7 @@ jobs:
   build-and-push:
     timeout-minutes: 45
     name: Build and Push Images
-    environment:
-      name: release
-      deployment: false
+    environment: release
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -46,9 +44,6 @@ jobs:
 
           - name: clustermesh-apiserver
             dockerfile: ./images/clustermesh-apiserver/Dockerfile
-
-          - name: docker-plugin
-            dockerfile: ./images/cilium-docker-plugin/Dockerfile
 
     steps:
       - name: Checkout main branch to access local actions
@@ -78,10 +73,10 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_RELEASE_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_RELEASE_PASSWORD }}
 
-      - name: Login to quay.io
+      - name: Login to ${{ env.REGISTRY }}
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          registry: quay.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ secrets.QUAY_USERNAME_RELEASE_USERNAME }}
           password: ${{ secrets.QUAY_PASSWORD_RELEASE_PASSWORD }}
 
@@ -91,9 +86,9 @@ jobs:
           tag=${GITHUB_REF##*/}
           echo tag=$tag >> $GITHUB_OUTPUT
           if [ "${{ env.PUSH_TO_DOCKER_HUB }}" == "true" ]; then
-            echo image_tags=${{ github.repository_owner }}/${{ matrix.name }}:$tag,quay.io/${{ env.QUAY_ORGANIZATION }}/${{ matrix.name }}:$tag >> $GITHUB_OUTPUT
+            echo image_tags=${{ github.repository_owner }}/${{ matrix.name }}:$tag,${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/${{ matrix.name }}:$tag >> $GITHUB_OUTPUT
           else
-            echo image_tags=quay.io/${{ env.QUAY_ORGANIZATION }}/${{ matrix.name }}:$tag >> $GITHUB_OUTPUT
+            echo image_tags=${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/${{ matrix.name }}:$tag >> $GITHUB_OUTPUT
           fi
 
       - name: Checkout Source Code
@@ -111,7 +106,7 @@ jobs:
           repository: ${{ env.CILIUM_RUNTIME_IMAGE_PREFIX }}
 
       - name: Release Build ${{ matrix.name }}
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         id: docker_build_release
         with:
           provenance: false
@@ -128,8 +123,8 @@ jobs:
       - name: Generate SBOM, Sign Images, and Attach Attestations
         uses: ./.github/actions/cosign
         with:
-          image: "quay.io/${{ env.QUAY_ORGANIZATION }}/${{ matrix.name }}@${{ steps.docker_build_release.outputs.digest }}"
-          image_tag: "quay.io/${{ env.QUAY_ORGANIZATION }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}"
+          image: "${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/${{ matrix.name }}@${{ steps.docker_build_release.outputs.digest }}"
+          image_tag: "${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}"
           sbom_name: "${{ matrix.name }}_${{ steps.tag.outputs.tag }}"
           upload_sbom_release_assets: 'false'
 
@@ -137,7 +132,7 @@ jobs:
         if: ${{ env.PUSH_TO_DOCKER_HUB == 'true' }}
         uses: ./.github/actions/cosign
         with:
-          image: "docker.io/${{ github.repository_owner }}/${{ matrix.name }}@${{ steps.docker_build_release.outputs.digest }}"
+          image: "${{ env.BACKUP_REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}@${{ steps.docker_build_release.outputs.digest }}"
           sbom_name: "${{ matrix.name }}_${{ steps.tag.outputs.tag }}"
           generate_sbom: 'false'
           install_cosign: 'false'
@@ -155,14 +150,14 @@ jobs:
           echo "### ${{ matrix.name }}" > image-digest/${{ matrix.name }}.txt
           echo "" >> image-digest/${{ matrix.name }}.txt
           if [ "${{ env.PUSH_TO_DOCKERHUB }}" == "true" ]; then
-            echo "\`docker.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}@${{ steps.docker_build_release.outputs.digest }}\`" >> image-digest/${{ matrix.name }}.txt
+            echo "\`${{ env.BACKUP_REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}@${{ steps.docker_build_release.outputs.digest }}\`" >> image-digest/${{ matrix.name }}.txt
           fi
-          echo "\`quay.io/${{ env.QUAY_ORGANIZATION }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}@${{ steps.docker_build_release.outputs.digest }}\`" >> image-digest/${{ matrix.name }}.txt
+          echo "\`${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}@${{ steps.docker_build_release.outputs.digest }}\`" >> image-digest/${{ matrix.name }}.txt
           echo "" >> image-digest/${{ matrix.name }}.txt
 
       # Upload artifact digests
       - name: Upload artifact digests
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-digest ${{ matrix.name }}
           path: image-digest
@@ -208,14 +203,14 @@ jobs:
 
       # Upload artifact digests
       - name: Upload artifact digests
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-digest-output.txt-${{ steps.tag.outputs.tag }}
           path: image-digest-output.txt
 
       # Upload artifact digests
       - name: Upload artifact digests
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Makefile.digests-${{ steps.tag.outputs.tag }}
           path: Makefile.digests
@@ -223,7 +218,7 @@ jobs:
   call-post-release:
     if: github.repository_owner == 'cilium'
     name: Call Post-Release Tool
-    uses: cilium/cilium/.github/workflows/release.yaml@main
+    uses: cilium/cilium/.github/workflows/release.yaml@main # main
     needs: image-digests
     with:
       step: "4-post-release"
@@ -246,7 +241,7 @@ jobs:
       contents: read
       # Required to generate OIDC tokens for `sigstore/cosign-installer` authentication
       id-token: write
-    uses: cilium/cilium/.github/workflows/release.yaml@main
+    uses: cilium/cilium/.github/workflows/release.yaml@main # main
     needs: image-digests
     with:
       step: "5-publish-helm"

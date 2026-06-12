@@ -4,24 +4,18 @@
 package ipam
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"net"
 	"net/netip"
 	"testing"
 	"time"
 
-	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
-	"github.com/cilium/hive/job"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	azureTypes "github.com/cilium/cilium/pkg/azure/types"
-	"github.com/cilium/cilium/pkg/hive"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/ipmasq"
@@ -33,48 +27,92 @@ import (
 	"github.com/cilium/cilium/pkg/trigger"
 )
 
+func TestAzureInterfaceCIDR(t *testing.T) {
+	tests := []struct {
+		name  string
+		iface azureTypes.AzureInterface
+		want  netip.Prefix
+	}{
+		{
+			name: "new operator: Subnet.CIDR populated, flat CIDR mirrored",
+			iface: azureTypes.AzureInterface{
+				Subnet: azureTypes.AzureSubnet{CIDR: iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24"))},
+				CIDR:   iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24")), //nolint:staticcheck // exercises the dual-write path
+			},
+			want: netip.MustParsePrefix("10.0.0.0/24"),
+		},
+		{
+			name: "old operator: only flat CIDR set, fallback used",
+			iface: azureTypes.AzureInterface{
+				CIDR: iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24")), //nolint:staticcheck // exercises the legacy-only path
+			},
+			want: netip.MustParsePrefix("10.0.0.0/24"),
+		},
+		{
+			name: "Subnet.CIDR wins when fields disagree",
+			iface: azureTypes.AzureInterface{
+				Subnet: azureTypes.AzureSubnet{CIDR: iputil.PrefixFrom(netip.MustParsePrefix("10.0.1.0/24"))},
+				CIDR:   iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24")), //nolint:staticcheck // exercises preference order
+			},
+			want: netip.MustParsePrefix("10.0.1.0/24"),
+		},
+		{
+			name:  "neither field set: zero Prefix",
+			iface: azureTypes.AzureInterface{},
+			want:  netip.Prefix{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, azureInterfaceCIDR(tt.iface))
+		})
+	}
+}
+
 func TestIPNotAvailableInPoolError(t *testing.T) {
-	err := NewIPNotAvailableInPoolError(net.ParseIP("1.1.1.1"))
-	err2 := NewIPNotAvailableInPoolError(net.ParseIP("1.1.1.1"))
+	err := NewIPNotAvailableInPoolError(netip.MustParseAddr("1.1.1.1"))
+	err2 := NewIPNotAvailableInPoolError(netip.MustParseAddr("1.1.1.1"))
 	assert.Equal(t, err, err2)
 	assert.ErrorIs(t, err, err2)
 
-	err = NewIPNotAvailableInPoolError(net.ParseIP("2.1.1.1"))
-	err2 = NewIPNotAvailableInPoolError(net.ParseIP("1.1.1.1"))
+	err = NewIPNotAvailableInPoolError(netip.MustParseAddr("2.1.1.1"))
+	err2 = NewIPNotAvailableInPoolError(netip.MustParseAddr("1.1.1.1"))
 	assert.NotEqual(t, err, err2)
 	assert.NotErrorIs(t, err, err2)
 
-	err = NewIPNotAvailableInPoolError(net.ParseIP("2.1.1.1"))
+	err = NewIPNotAvailableInPoolError(netip.MustParseAddr("2.1.1.1"))
 	err2 = errors.New("another error")
 	assert.NotEqual(t, err, err2)
 	assert.NotErrorIs(t, err, err2)
 
 	err = errors.New("another error")
-	err2 = NewIPNotAvailableInPoolError(net.ParseIP("2.1.1.1"))
+	err2 = NewIPNotAvailableInPoolError(netip.MustParseAddr("2.1.1.1"))
 	assert.NotEqual(t, err, err2)
 	assert.NotErrorIs(t, err, err2)
 
-	err = NewIPNotAvailableInPoolError(net.ParseIP("1.1.1.1"))
+	err = NewIPNotAvailableInPoolError(netip.MustParseAddr("1.1.1.1"))
 	err2 = nil
 	assert.NotErrorIs(t, err, err2)
 
 	err = nil
-	err2 = NewIPNotAvailableInPoolError(net.ParseIP("1.1.1.1"))
+	err2 = NewIPNotAvailableInPoolError(netip.MustParseAddr("1.1.1.1"))
 	assert.NotErrorIs(t, err, err2)
 
 	// We don't match against strings. It must be the sentinel value.
 	err = errors.New("IP 2.1.1.1 is not available")
-	err2 = NewIPNotAvailableInPoolError(net.ParseIP("2.1.1.1"))
+	err2 = NewIPNotAvailableInPoolError(netip.MustParseAddr("2.1.1.1"))
 	assert.NotEqual(t, err, err2)
 	assert.NotErrorIs(t, err, err2)
 }
 
-var testConfigurationCRD = &option.DaemonConfig{
-	EnableIPv4:              true,
-	EnableIPv6:              false,
-	EnableHealthChecking:    true,
-	EnableUnreachableRoutes: false,
-	IPAM:                    ipamOption.IPAMCRD,
+func testDaemonConfig() *option.DaemonConfig {
+	return &option.DaemonConfig{
+		EnableIPv4:              true,
+		EnableIPv6:              false,
+		EnableHealthChecking:    true,
+		EnableUnreachableRoutes: false,
+		IPAM:                    ipamOption.IPAMCRD,
+	}
 }
 
 func newFakeNodeStore(conf *option.DaemonConfig, t *testing.T) *nodeStore {
@@ -103,7 +141,7 @@ func TestMarkForReleaseNoAllocate(t *testing.T) {
 	}
 
 	fakeAddressing := fakenode.NewAddressing()
-	conf := testConfigurationCRD
+	conf := testDaemonConfig()
 	initNodeStore.Do(func() {}) // Ensure the real initNodeStore is not called
 	sharedNodeStore = newFakeNodeStore(conf, t)
 	sharedNodeStore.ownNode = cn
@@ -125,7 +163,7 @@ func TestMarkForReleaseNoAllocate(t *testing.T) {
 	// Allocate the first 3 IPs
 	for i := 1; i <= 3; i++ {
 		epipv4 := netip.MustParseAddr(fmt.Sprintf("1.1.1.%d", i))
-		_, err := ipam.ipv4Allocator.Allocate(epipv4.AsSlice(), fmt.Sprintf("test%d", i), PoolDefault())
+		_, err := ipam.ipv4Allocator.Allocate(epipv4, fmt.Sprintf("test%d", i), PoolDefault())
 		require.NoError(t, err)
 	}
 
@@ -133,7 +171,7 @@ func TestMarkForReleaseNoAllocate(t *testing.T) {
 	cn.Status.IPAM.ReleaseIPs["1.1.1.4"] = ipamOption.IPAMMarkForRelease
 	// Attempts to allocate 1.1.1.4 should fail, since it's already marked for release
 	epipv4 := netip.MustParseAddr("1.1.1.4")
-	_, err := ipam.ipv4Allocator.Allocate(epipv4.AsSlice(), "test", PoolDefault())
+	_, err := ipam.ipv4Allocator.Allocate(epipv4, "test", PoolDefault())
 	require.Error(t, err)
 	// Call agent's CRD update function. status for 1.1.1.4 should change from marked for release to ready for release
 	sharedNodeStore.updateLocalNodeResource(cn)
@@ -153,92 +191,6 @@ func (m ipMasqMapDummy) Delete(netip.Prefix) error { return nil }
 
 func (m ipMasqMapDummy) Dump() ([]netip.Prefix, error) { return []netip.Prefix{}, nil }
 
-func TestIPMasq(t *testing.T) {
-	cn := newCiliumNode("node1", 4, 4, 0)
-	dummyResource := ipamTypes.AllocationIP{Resource: "eni-1"}
-	cn.Spec.IPAM.Pool["10.1.1.226"] = dummyResource
-	cn.Status.ENI.ENIs = map[string]eniTypes.ENI{
-		"eni-1": {
-			ID: "eni-1",
-			Addresses: []string{
-				"10.1.1.226",
-				"10.1.1.229",
-			},
-			VPC: eniTypes.AwsVPC{
-				ID:          "vpc-1",
-				PrimaryCIDR: "10.1.0.0/16",
-				CIDRs: []string{
-					"10.2.0.0/16",
-				},
-			},
-		},
-	}
-
-	fakeAddressing := fakenode.NewAddressing()
-	conf := testConfigurationCRD
-	conf.IPAM = ipamOption.IPAMENI
-	conf.EnableIPMasqAgent = true
-	ipMasqAgent := ipmasq.NewIPMasqAgent(hivetest.Logger(t), "", ipMasqMapDummy{})
-	err := ipMasqAgent.Start()
-	require.NoError(t, err)
-
-	initNodeStore.Do(func() {}) // Ensure the real initNodeStore is not called
-	sharedNodeStore = newFakeNodeStore(conf, t)
-	sharedNodeStore.ownNode = cn
-
-	var jg job.Group
-	h := hive.New(
-		cell.Invoke(func(jg_ job.Group) { jg = jg_ }),
-	)
-	tlog := hivetest.Logger(t, hivetest.LogLevel(slog.LevelError))
-	require.NoError(t, h.Start(tlog, t.Context()))
-	t.Cleanup(func() { h.Stop(tlog, context.Background()) })
-
-	localNodeStore := node.NewTestLocalNodeStore(node.LocalNode{})
-	ipam := NewIPAM(NewIPAMParams{
-		Logger:         hivetest.Logger(t),
-		NodeAddressing: fakeAddressing,
-		AgentConfig:    conf,
-		NodeDiscovery:  &ownerMock{},
-		LocalNodeStore: localNodeStore,
-		K8sEventReg:    &ownerMock{},
-		NodeResource:   &resourceMock{},
-		MTUConfig:      &mtuMock,
-		IPMasqAgent:    ipMasqAgent,
-		JobGroup:       jg,
-	})
-	ipam.ConfigureAllocator()
-
-	epipv4 := netip.MustParseAddr("10.1.1.226")
-	result, err := ipam.ipv4Allocator.Allocate(epipv4.AsSlice(), "test1", PoolDefault())
-	require.NoError(t, err)
-	// The resulting CIDRs should contain the VPC CIDRs and the default ip-masq-agent CIDRs from pkg/ipmasq/ipmasq.go
-	require.ElementsMatch(
-		t,
-		[]string{
-			// VPC CIDRs
-			"10.1.0.0/16",
-			"10.2.0.0/16",
-			// Default ip-masq-agent CIDRs
-			"10.0.0.0/8",
-			"172.16.0.0/12",
-			"192.168.0.0/16",
-			"100.64.0.0/10",
-			"192.0.0.0/24",
-			"192.0.2.0/24",
-			"192.88.99.0/24",
-			"198.18.0.0/15",
-			"198.51.100.0/24",
-			"203.0.113.0/24",
-			"240.0.0.0/4",
-			"169.254.0.0/16",
-		},
-		result.CIDRs,
-	)
-
-	ipMasqAgent.Stop()
-}
-
 func TestAzureIPMasq(t *testing.T) {
 	cn := newCiliumNode("node1", 4, 4, 0)
 	dummyResource := ipamTypes.AllocationIP{Resource: "azure-interface-1"}
@@ -248,16 +200,19 @@ func TestAzureIPMasq(t *testing.T) {
 			ID:      "azure-interface-1",
 			Name:    "eth0",
 			MAC:     "00:00:5e:00:53:01",
-			Gateway: "10.10.1.1",
-			CIDR:    "10.10.1.0/24",
+			Gateway: iputil.AddrFrom(netip.MustParseAddr("10.10.1.1")),
+			Subnet: azureTypes.AzureSubnet{
+				ID:   "subnet-1",
+				CIDR: iputil.PrefixFrom(netip.MustParsePrefix("10.10.1.0/24")),
+			},
 			Addresses: []azureTypes.AzureAddress{
-				{IP: "10.10.1.5", Subnet: "subnet-1", State: azureTypes.StateSucceeded},
+				{IP: iputil.AddrFrom(netip.MustParseAddr("10.10.1.5")), State: azureTypes.StateSucceeded},
 			},
 		},
 	}
 
 	fakeAddressing := fakenode.NewAddressing()
-	conf := testConfigurationCRD
+	conf := testDaemonConfig()
 	conf.IPAM = ipamOption.IPAMAzure
 	conf.EnableIPMasqAgent = true
 	ipMasqAgent := ipmasq.NewIPMasqAgent(hivetest.Logger(t), "", ipMasqMapDummy{})
@@ -283,27 +238,27 @@ func TestAzureIPMasq(t *testing.T) {
 	ipam.ConfigureAllocator()
 
 	epipv4 := netip.MustParseAddr("10.10.1.5")
-	result, err := ipam.ipv4Allocator.Allocate(epipv4.AsSlice(), "test1", PoolDefault())
+	result, err := ipam.ipv4Allocator.Allocate(epipv4, "test1", PoolDefault())
 	require.NoError(t, err)
 	// The resulting CIDRs should contain the Azure interface CIDR and the default ip-masq-agent CIDRs
 	require.ElementsMatch(
 		t,
-		[]string{
+		[]netip.Prefix{
 			// Azure interface CIDR
-			"10.10.1.0/24",
+			netip.MustParsePrefix("10.10.1.0/24"),
 			// Default ip-masq-agent CIDRs
-			"10.0.0.0/8",
-			"172.16.0.0/12",
-			"192.168.0.0/16",
-			"100.64.0.0/10",
-			"192.0.0.0/24",
-			"192.0.2.0/24",
-			"192.88.99.0/24",
-			"198.18.0.0/15",
-			"198.51.100.0/24",
-			"203.0.113.0/24",
-			"240.0.0.0/4",
-			"169.254.0.0/16",
+			netip.MustParsePrefix("10.0.0.0/8"),
+			netip.MustParsePrefix("172.16.0.0/12"),
+			netip.MustParsePrefix("192.168.0.0/16"),
+			netip.MustParsePrefix("100.64.0.0/10"),
+			netip.MustParsePrefix("192.0.0.0/24"),
+			netip.MustParsePrefix("192.0.2.0/24"),
+			netip.MustParsePrefix("192.88.99.0/24"),
+			netip.MustParsePrefix("198.18.0.0/15"),
+			netip.MustParsePrefix("198.51.100.0/24"),
+			netip.MustParsePrefix("203.0.113.0/24"),
+			netip.MustParsePrefix("240.0.0.0/4"),
+			netip.MustParsePrefix("169.254.0.0/16"),
 		},
 		result.CIDRs,
 	)

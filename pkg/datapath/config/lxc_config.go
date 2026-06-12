@@ -14,8 +14,7 @@ import "github.com/cilium/cilium/pkg/datapath/types"
 type BPFLXC struct {
 	// Allow ICMP_FRAG_NEEDED messages when applying Network Policy.
 	AllowICMPFragNeeded bool `config:"allow_icmp_frag_needed"`
-	// MTU of the device the bpf program is attached to (default: MTU set in
-	// node_config.h by agent).
+	// MTU of the device the bpf program is attached to.
 	DeviceMTU uint16 `config:"device_mtu"`
 	// Respond to ARP requests from local containers to resolve the default
 	// gateway.
@@ -48,8 +47,6 @@ type BPFLXC struct {
 	EndpointNetNSCookie uint64 `config:"endpoint_netns_cookie"`
 	// Ephemeral port range minimun.
 	EphemeralMin uint16 `config:"ephemeral_min"`
-	// FIB routing table ID for egress lookups.
-	FIBTableID uint32 `config:"fib_table_id"`
 	// The host endpoint ID.
 	HostEPID uint16 `config:"host_ep_id"`
 	// Enable hybrid mode routing based on subnet IDs.
@@ -66,6 +63,8 @@ type BPFLXC struct {
 	PolicyVerdictLogFilter uint32 `config:"policy_verdict_log_filter"`
 	// Whether to redirect to the proxy via cilium_net (hairpin) or via stack.
 	ProxyRedirectViaCiliumNet bool `config:"proxy_redirect_via_cilium_net"`
+	// FIB routing table ID for egress lookups.
+	RtInfo uint32 `config:"rt_info"`
 	// The endpoint's security label.
 	SecurityLabel uint32 `config:"security_label"`
 	// Port number used for the overlay network.
@@ -79,12 +78,12 @@ type BPFLXC struct {
 }
 
 func NewBPFLXC(node Node) *BPFLXC {
-	return &BPFLXC{false, 0x5dc, false, false, false, false, false, false, false,
-		false, false, false, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
+	return &BPFLXC{false, 0x0, false, false, false, false, false, false, false, false,
+		false, false, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
 		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
-		0x0, 0x0, 0x0, 0x0, false, 0x0,
+		0x0, 0x0, 0x0, false, 0x0,
 		cast[types.MACAddr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
 		cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
 		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
-		0x0, false, 0x0, 0x0, 0x0, 0x0, node}
+		0x0, false, 0x0, 0x0, 0x0, 0x0, 0x0, node}
 }

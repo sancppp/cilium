@@ -759,6 +759,17 @@ Name                               Labels                           Default     
 ``fqdn_selectors``                                                  Enabled      Number of registered ToFQDN selectors
 ================================== ================================ ============ ========================================================
 
+Hive
+~~~~
+
+============================ ===================== ============ ========================================================
+Name                         Labels                Default      Description
+============================ ===================== ============ ========================================================
+``hive_start_duration``                            Enabled      Duration of the hive.Start method
+``hive_stop_duration``                             Disabled     Duration of the hive.Stop method. Not reported when metrics are handled by a hive (common in cilium-agent and cilium-operator)
+``hive_populate_duration``                         Enabled      Duration of the hive.Populate method
+============================ ===================== ============ ========================================================
+
 Jobs
 ~~~~
 
@@ -796,15 +807,15 @@ Name                                           Labels                           
 BGP Control Plane
 ~~~~~~~~~~~~~~~~~
 
-================================== =============================================================== ======== ===================================================================
-Name                               Labels                                                          Default  Description
-================================== =============================================================== ======== ===================================================================
-``session_state``                  ``vrouter``, ``neighbor``, ``neighbor_asn``                     Enabled  Current state of the BGP session with the peer, Up = 1 or Down = 0
-``advertised_routes``              ``vrouter``, ``neighbor``, ``neighbor_asn``, ``afi``, ``safi``  Enabled  Number of routes advertised to the peer
-``received_routes``                ``vrouter``, ``neighbor``, ``neighbor_asn``, ``afi``, ``safi``  Enabled  Number of routes received from the peer
-``reconcile_errors_total``         ``vrouter``                                                     Enabled  Number of reconciliation runs that returned an error
-``reconcile_run_duration_seconds`` ``vrouter``                                                     Enabled  Histogram of reconciliation run duration
-================================== =============================================================== ======== ===================================================================
+=================================== ==================================================================================== ======== ===================================================================
+Name                                Labels                                                                               Default  Description
+=================================== ==================================================================================== ======== ===================================================================
+``session_state``                   ``instance_name``, ``local_asn``, ``neighbor``, ``neighbor_asn``                     Enabled  Current state of the BGP session with the peer, Up = 1 or Down = 0
+``advertised_routes``               ``instance_name``, ``local_asn``, ``neighbor``, ``neighbor_asn``, ``afi``, ``safi``  Enabled  Number of routes advertised to the peer
+``received_routes``                 ``instance_name``, ``local_asn``, ``neighbor``, ``neighbor_asn``, ``afi``, ``safi``  Enabled  Number of routes received from the peer
+``reconcile_errors_total``          ``instance_name``                                                                    Enabled  Number of reconciliation runs that returned an error
+``reconcile_run_duration_seconds``  ``instance_name``                                                                    Enabled  Histogram of reconciliation run duration
+=================================== ==================================================================================== ======== ===================================================================
 
 All metrics are enabled only when the BGP Control Plane is enabled.
 

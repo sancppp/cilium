@@ -131,13 +131,18 @@ Telco
 Terraform
 Tierney
 ToR
+Triager
 Triagers
+Triaging
 Twilio
 Uncompress
 Uncordon
 VM
+VMSS
+VMs
 VMware
 VNet
+VNets
 VPC
 Vagrantcloud
 Vagrantfile
@@ -362,6 +367,7 @@ externallyCreated
 extraConfig
 facto
 failover
+falsy
 fcfs
 fec
 fieldAggregate
@@ -665,6 +671,7 @@ powershell
 pprof
 pre
 preconfigured
+preferIpv
 prefilter
 preflight
 preload
@@ -722,6 +729,7 @@ reproducibility
 reqid
 requireIPv
 resizable
+resolvers
 resync
 retpoline
 retransmission
@@ -743,6 +751,7 @@ seccomp
 secretName
 secretsBackend
 secretsNamespace
+selectorless
 selftest
 selftests
 serverinfo
@@ -833,6 +842,9 @@ tracepoint
 tracepoints
 tracestate
 transpiling
+triager
+triagers
+truthy
 tsne
 tunables
 tunings

@@ -15,10 +15,14 @@ metadata:
     app.kubernetes.io/part-of: cilium
     app.kubernetes.io/name: cilium-envoy
     name: cilium-envoy
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  {{- if .Values.envoy.minReadySeconds }}
+  minReadySeconds: {{ .Values.envoy.minReadySeconds }}
+  {{- end }}
   selector:
     matchLabels:
       k8s-app: cilium-envoy
@@ -46,6 +50,7 @@ spec:
         name: cilium-envoy
         app.kubernetes.io/name: cilium-envoy
         app.kubernetes.io/part-of: cilium
+        helm.sh/chart: {{ include "cilium.chart" . }}
         {{- with .Values.commonLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -185,6 +190,13 @@ spec:
           failureThreshold: {{ .Values.envoy.readinessProbe.failureThreshold }}
           initialDelaySeconds: {{ .Values.envoy.readinessProbe.initialDelaySeconds }}
           timeoutSeconds: {{ .Values.envoy.readinessProbe.timeoutSeconds }}
+
+        {{- $lifecycleHooks := include "envoy.lifecycle" . | trim }}
+        {{- if $lifecycleHooks }}
+        lifecycle:
+        {{- $lifecycleHooks | nindent 10 }}
+        {{- end }}
+
         env:
         - name: K8S_NODE_NAME
           valueFrom:

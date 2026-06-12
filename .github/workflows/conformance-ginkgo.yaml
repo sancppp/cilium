@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/cilium/.github/actions/set-commit-status@main
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -167,7 +167,7 @@ jobs:
 
       # Load Ginkgo build from GitHub
       - name: Load ginkgo E2E from GH cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: cache
         with:
           path: /tmp/.ginkgo-build/
@@ -178,7 +178,7 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.26.1
+          go-version: 1.26.4
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -225,6 +225,9 @@ jobs:
         uses: ./.github/actions/wait-for-images
         with:
           SHA: ${{ inputs.SHA || github.sha }}${{ needs.setup-vars.outputs.image_tag_suffix }}
+          login-host: ${{ vars.DOCKER_READ_HOST }}
+          login-username: ${{ vars.DOCKER_READ_USERNAME }}
+          login-password: ${{ secrets.DOCKER_READ_PASSWORD }}
 
   generate-matrix:
     name: Generate Job Matrix from YAMLs
@@ -311,7 +314,7 @@ jobs:
 
     steps:
       - name: Set commit status to pending
-        uses: cilium/cilium/.github/actions/set-commit-status@main
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -339,9 +342,10 @@ jobs:
         with:
           ref: ${{ inputs.SHA || github.sha }}
           persist-credentials: false
+          path: untrusted
 
       - name: Install cilium-cli
-        uses: cilium/cilium-cli@3ce83aa3b4ea3ce6d97023c4d83c22b73a4ed3b4 # v0.19.2
+        uses: cilium/cilium-cli@2c40f81b9180be6a5e52b8caf7f1de75202ec0fc # v0.19.4
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -354,14 +358,14 @@ jobs:
         shell: bash
         run: |
           cid=$(docker create ${{ env.CILIUM_CLI_IMAGE_REPO }}:${{ needs.setup-vars.outputs.SHA }} ls)
-          docker cp $cid:/usr/local/bin/cilium "$PWD/cilium-cli-bin"
+          docker cp $cid:/usr/local/bin/cilium "untrusted/cilium-cli-bin"
           docker rm $cid
 
       - name: Copy cilium-cli from released binary
         if: ${{ env.CILIUM_CLI_VERSION != '' }}
         shell: bash
         run: |
-          cp /usr/local/bin/cilium "$PWD/cilium-cli-bin"
+          cp /usr/local/bin/cilium "untrusted/cilium-cli-bin"
 
       - name: Install helm
         shell: bash
@@ -370,21 +374,21 @@ jobs:
           HELM_VERSION=v3.13.1
           wget "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
           tar -xf "helm-${HELM_VERSION}-linux-amd64.tar.gz"
-          mv ./linux-amd64/helm ./helm
+          mv ./linux-amd64/helm untrusted/helm
 
       - name: Provision LVH VMs
         id: provision-vh-vms
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         with:
           test-name: datapath-conformance
           install-dependencies: true
           image-version: ${{ matrix.kernel }}
           images-folder-parent: "/tmp"
-          host-mount: ./
+          host-mount: untrusted/
           cpu: 4
           mem: 12G
           # renovate: datasource=github-tags depName=cilium/little-vm-helper
-          lvh-version: "v0.0.28"
+          lvh-version: "v0.0.30"
           cmd: |
             git config --global --add safe.directory /host
             mv /host/helm /usr/bin
@@ -392,7 +396,7 @@ jobs:
 
       - name: Provision kind
         timeout-minutes: 5
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -409,7 +413,7 @@ jobs:
 
       # Load Ginkgo build from GitHub
       - name: Load ${{ matrix.name }} Ginkgo build from GitHub
-        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: cache
         with:
           path: /tmp/.ginkgo-build/
@@ -421,7 +425,7 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.26.1
+          go-version: 1.26.4
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -434,7 +438,7 @@ jobs:
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         shell: bash
         run: |
-          cd test
+          cd untrusted/test
           /home/runner/go/bin/ginkgo build
           strip test.test
           tar -cz test.test -f test.tgz
@@ -444,21 +448,21 @@ jobs:
         shell: bash
         run: |
           mkdir -p /tmp/.ginkgo-build/
-          if [ -f test/test.tgz ]; then
-            cp test/test.tgz /tmp/.ginkgo-build/
+          if [ -f untrusted/test/test.tgz ]; then
+            cp untrusted/test/test.tgz /tmp/.ginkgo-build/
             echo "file copied"
           fi
 
       - name: Copy Ginkgo binary
         shell: bash
         run: |
-          cd test/
+          cd untrusted/test/
           tar -xf /tmp/.ginkgo-build/test.tgz
 
       - name: Run tests
         id: run-tests
         timeout-minutes: 40
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -492,11 +496,11 @@ jobs:
              --skip=\"${{ matrix.cliSkip }}\" \
              --seed=1679952881 \
              -v -- \
-             -cilium.image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci \
+             -cilium.image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/cilium-ci \
              -cilium.tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }}  \
-             -cilium.operator-image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/operator \
+             -cilium.operator-image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/operator \
              -cilium.operator-tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }} \
-             -cilium.hubble-relay-image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/hubble-relay-ci \
+             -cilium.hubble-relay-image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/hubble-relay-ci \
              -cilium.hubble-relay-tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }} \
              -cilium.kubeconfig=/root/.kube/config \
              -cilium.operator-suffix=-ci ${{ env.CILIUM_GINKGO_EXTRA_ARGS }}"
@@ -506,18 +510,18 @@ jobs:
                --ginkgo.skip="${{ matrix.cliSkip }}" \
                --ginkgo.seed=1679952881 \
                --ginkgo.v -- \
-               -cilium.image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci \
+               -cilium.image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/cilium-ci \
                -cilium.tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }}  \
-               -cilium.operator-image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/operator \
+               -cilium.operator-image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/operator \
                -cilium.operator-tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }} \
-               -cilium.hubble-relay-image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/hubble-relay-ci \
+               -cilium.hubble-relay-image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/hubble-relay-ci \
                -cilium.hubble-relay-tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }} \
                -cilium.kubeconfig=/root/.kube/config \
                -cilium.operator-suffix=-ci ${{ env.CILIUM_GINKGO_EXTRA_ARGS }}
 
       - name: Fetch artifacts
         if: ${{ !success() && steps.provision-vh-vms.outcome == 'success' }}
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -529,6 +533,7 @@ jobs:
         if: ${{ always() && steps.run-tests.outcome != 'skipped' }}
         shell: bash
         run: |
+          cd untrusted
           sudo chown $USER:$USER -R ./test
           find . -type f -iname 'feature-status-*.json' | while IFS= read -r file; do
             basename_file=$(basename "$file")
@@ -551,13 +556,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p cilium-junits
-          cd test/
+          cd untrusted/test/
           junit_filename="${{ env.job_name }}.xml"
-          for filename in *.xml; do cp "${filename}" "../cilium-junits/${junit_filename}"; done;
+          for filename in *.xml; do cp "${filename}" "../../cilium-junits/${junit_filename}"; done;
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cilium-sysdumps-bugtool-${{ matrix.k8s-version }}-${{matrix.focus}}
           path: |

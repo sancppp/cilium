@@ -48,7 +48,7 @@ func (r regexMatcher) IsMatch(log string) bool {
 // NoErrorsInLogs checks whether there are no error messages in cilium-agent
 // logs. The error messages are defined in badLogMsgsWithExceptions, which key
 // is an error message, while values is a list of ignored messages.
-func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, externalTarget string, externalOtherTarget string, startTime time.Time) check.Scenario {
+func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, extraExceptions []string, externalTarget string, externalOtherTarget string, startTime time.Time) check.Scenario {
 	// Exceptions for level=error should only be added as a last resort, if the
 	// error cannot be fixed in Cilium or in the test.
 	errorLogExceptions := []logMatcher{
@@ -63,17 +63,23 @@ func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, external
 		legacyBGPFeature, etcdTimeout, endpointRestoreFailed, unableRestoreRouterIP,
 		routerIPReallocated, cantFindIdentityInCache, keyAllocFailedFoundMaster,
 		cantRecreateMasterKey, cantUpdateCRDIdentity, cantDeleteFromPolicyMap, failedToListCRDs,
-		hubbleQueueFull, reflectPanic, svcNotFound, gobgpWarnings,
+		hubbleQueueFull, reflectPanic, svcNotFound, gobgpv3Warnings, gobgpNotification, gobgpNoMatchingWithdrawPath,
+		gobgpReceivedNotification, gobgpFailedToSend,
 		endpointMapDeleteFailed, etcdReconnection, failedToRetrieveRemoteClusterCfg, epRestoreMissingState, mutationDetectorKlog,
 		hubbleFailedCreatePeer, fqdnDpUpdatesTimeout, longNetpolUpdate, failedToGetEpLabels,
 		failedCreategRPCClient, unableReallocateIngressIP, fqdnMaxIPPerHostname, failedGetMetricsAPI,
 		envoyExternalTargetTLSWarning, envoyExternalOtherTargetTLSWarning,
 		hubbleUIEnvVarFallback, k8sClientNetworkStatusError, bgpAlphaResourceDeprecation, ccgAlphaResourceDeprecation,
-		k8sEndpointDeprecatedWarn, proxylibDeprecatedWarn, certloaderInitialLoadWarn}
+		k8sEndpointDeprecatedWarn, proxylibDeprecatedWarn, certloaderInitialLoadWarn, localKeyAlreadyAllocated}
 
 	if ciliumVersion.LT(semver.MustParse("1.18.0")) {
 		errorLogExceptions = append(errorLogExceptions, linkNotFound, removeInexistentID)
 		warningLogExceptions = append(warningLogExceptions, linkNotFound, removeInexistentID)
+	}
+
+	for _, exception := range extraExceptions {
+		errorLogExceptions = append(errorLogExceptions, stringMatcher(exception))
+		warningLogExceptions = append(warningLogExceptions, stringMatcher(exception))
 	}
 
 	// The list is adopted from cilium/cilium/test/helper/utils.go
@@ -452,7 +458,10 @@ const (
 	hubbleQueueFull                  stringMatcher = "hubble events queue is full"                                           // Because we run without monitor aggregation
 	reflectPanic                     stringMatcher = "reflect.Value.SetUint using value obtained using unexported field"     // cf. https://github.com/cilium/cilium/issues/33766
 	svcNotFound                      stringMatcher = "service not found"                                                     // cf. https://github.com/cilium/cilium/issues/35768
-	gobgpWarnings                    stringMatcher = "component=gobgp.BgpServerInstance"                                     // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpv3Warnings                  stringMatcher = "component=gobgp.BgpServerInstance"                                     // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpNotification                stringMatcher = "sent notification"                                                     // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpNoMatchingWithdrawPath      stringMatcher = "No matching path for withdraw found"                                   // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpReceivedNotification        stringMatcher = "received notification"                                                 // cf. https://github.com/cilium/cilium/issues/35799
 	etcdReconnection                 stringMatcher = "Error observed on etcd connection, reconnecting etcd"                  // cf. https://github.com/cilium/cilium/issues/35865
 	failedToRetrieveRemoteClusterCfg stringMatcher = "failed to retrieve cluster configuration: not found"                   // Possible race condition in KVStoreMesh mode
 	epRestoreMissingState            stringMatcher = "Couldn't find state, ignoring endpoint"                                // cf. https://github.com/cilium/cilium/issues/35869
@@ -467,6 +476,7 @@ const (
 	failedGetMetricsAPI              stringMatcher = "retrieve the complete list of server APIs: metrics.k8s.io/v1beta1"     // cf. https://github.com/cilium/cilium/issues/36085
 	hubbleUIEnvVarFallback           stringMatcher = "using fallback value for env var"                                      // cf. https://github.com/cilium/hubble-ui/pull/940
 	k8sClientNetworkStatusError      stringMatcher = "Network status error received, restarting client connections"          // cf. https://github.com/cilium/cilium/issues/37712
+	localKeyAlreadyAllocated         stringMatcher = "local key already allocated with different value"                      // cf. https://github.com/cilium/cilium/issues/41280
 
 	k8sEndpointDeprecatedWarn stringMatcher = "v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice" // cf. https://github.com/cilium/cilium/issues/39105
 	proxylibDeprecatedWarn    stringMatcher = "The support for Envoy Go Extensions (proxylib) has been deprecated"          // cf. https://github.com/cilium/cilium/issues/38224
@@ -493,6 +503,9 @@ var (
 	bgpAlphaResourceDeprecation = regexMatcher{regexp.MustCompile(`cilium.io/v2alpha1 CiliumBGP\w+ is deprecated`)}
 	// ccgAlphaResourceDeprecation is the same as bgpAlphaResourceDeprecation but for the CiliumCIDRGroup.
 	ccgAlphaResourceDeprecation = regexMatcher{regexp.MustCompile(`cilium.io/v2alpha1 CiliumCIDRGroup is deprecated`)}
+	// gobgpFailedToSend ignores GoBGPv4's "failed to send" warning, but only when the write
+	// failed because the peer connection was torn down (closed connection or broken pipe);
+	gobgpFailedToSend = regexMatcher{regexp.MustCompile(`osrg/gobgp/v4/pkg/server.*msg="failed to send".*(use of closed network connection|broken pipe)`)}
 	// For https://github.com/cilium/cilium/issues/39370: Fixed only in cilium version >= 1.18
 	linkNotFound = regexMatcher{regexp.MustCompile(`retrieving device .+\: Link not found`)}
 )

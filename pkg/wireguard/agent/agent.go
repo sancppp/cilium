@@ -266,9 +266,19 @@ func (a *Agent) init() error {
 		return fmt.Errorf("failed to load or generate private key: %w", err)
 	}
 
+	// Best-effort MTU computation: account for WireGuard overhead including padding.
+	// Without this, the kernel defaults to 1500 - 80 = 1420, ignoring alignment padding.
+	// Worst case we set 1500 - 95 = 1405; the mtuReconciler will adjust once the MTU table is populated.
+	deviceMTU := mtu.EthernetMTU
+	if mtuRoute, _, _, found := a.mtuTable.GetWatch(a.db.ReadTxn(), mtu.MTURouteIndex.Query(mtu.DefaultPrefixV4)); found {
+		deviceMTU = mtuRoute.DeviceMTU
+	}
+	linkMTU := deviceMTU - mtu.WireguardOverhead
+
 	link := &netlink.Wireguard{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: types.IfaceName,
+			MTU:  linkMTU,
 		},
 	}
 
@@ -329,6 +339,14 @@ func (a *Agent) mtuReconciler(ctx context.Context, health cell.Health) error {
 			}
 
 			linkMTU := mtuRoute.DeviceMTU - mtu.WireguardOverhead
+
+			if a.config.EnableIPv6 && linkMTU < mtu.IPv6MinMTU {
+				a.logger.Warn("Requested link MTU is below the minimum value, clamping",
+					logfields.MTU, linkMTU,
+					logfields.MinMTU, mtu.IPv6MinMTU,
+				)
+				linkMTU = mtu.IPv6MinMTU
+			}
 
 			if link.Attrs().MTU != linkMTU {
 				if err = netlink.LinkSetMTU(link, linkMTU); err != nil {

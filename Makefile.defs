@@ -10,6 +10,8 @@ space := $(empty) $(empty)
 comma := ,
 join-with-comma = $(subst $(space),$(comma),$(strip $1))
 
+shellquote = '$(subst ','\'',$(1))'
+
 define newline
 
 
@@ -60,8 +62,8 @@ ifeq ($(DOCKER_IMAGE_TAG),)
 endif
 
 # renovate: datasource=docker depName=gcr.io/etcd-development/etcd
-ETCD_IMAGE_VERSION = v3.6.10
-ETCD_IMAGE_SHA = sha256:f65c61039e7b7fd6e651f7ec2459b880589892cb13cf79c2f71c92aa08fc5144
+ETCD_IMAGE_VERSION = v3.6.11
+ETCD_IMAGE_SHA = sha256:fbab3d2954652f592b2653cc1b9decdbe2a633de9320735e9f364b185b6b309a
 ETCD_IMAGE=gcr.io/etcd-development/etcd:$(ETCD_IMAGE_VERSION)@$(ETCD_IMAGE_SHA)
 
 export CILIUM_CLI ?= cilium
@@ -106,7 +108,7 @@ ifneq ($(shell command -v go-junit-report),)
 		>(go-junit-report -parser gojson \
 			-code-owners=$(CODEOWNERS_PATH) \
 			-code-owners-prefix github.com/cilium/cilium/ \
-			-out "$(JUNIT_PATH)") \
+			-out $(call shellquote,$(JUNIT_PATH))) \
 		>($(GO) run $(ROOT_DIR)/tools/testowners \
 			--code-owners=$(CODEOWNERS_PATH)) \
 		>(tparse $(GOTEST_FORMATTER_FLAGS)) \
@@ -129,8 +131,8 @@ ifneq ($(GOTEST_FORMATTER),cat)
 endif
 
 # renovate: datasource=docker depName=golangci/golangci-lint
-GOLANGCILINT_WANT_VERSION = v2.11.4
-GOLANGCILINT_IMAGE_SHA = sha256:67dfc9eeeb0eb13fc1a36329c2c378197dc561f1edf1a7792e3f771606bb0e15
+GOLANGCILINT_WANT_VERSION = v2.12.2
+GOLANGCILINT_IMAGE_SHA = sha256:5cceeef04e53efe1470638d4b4b4f5ceefd574955ab3941b2d9a68a8c9ad5240
 GOLANGCILINT_VERSION = $(shell golangci-lint version --short 2>/dev/null)
 
 VERSION = $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))/VERSION)
@@ -202,9 +204,6 @@ GO_CLEAN_FLAGS += -mod=vendor
 
 CGO_ENABLED ?= 0
 
-# See https://pkg.go.dev/internal/goexperiment
-GOEXPERIMENT ?=
-
 # Support CGO cross-compiling for amd64 and arm64 targets
 GO_BUILD_ENV = CGO_ENABLED=$(CGO_ENABLED)
 CROSS_ARCH =
@@ -225,10 +224,6 @@ ifneq ($(GOOS),)
     GO_BUILD_ENV += GOOS=$(GOOS)
 endif
 
-ifneq ($(GOEXPERIMENT),)
-    GO_BUILD_ENV += GOEXPERIMENT=$(GOEXPERIMENT)
-endif
-
 ifneq ($(RACE),)
     GO_BUILD_FLAGS += -race
     GO_TEST_FLAGS += -race
@@ -245,11 +240,6 @@ endif
 
 ifneq ($(LOCKDEBUG),)
     GO_TAGS_FLAGS += lockdebug
-endif
-
-ifneq ($(findstring boringcrypto,$(GOEXPERIMENT)),)
-    CGO_ENABLED = 1
-    GO_BUILD_LDFLAGS += -linkmode external -extldflags "-static --enable-static-nss"
 endif
 
 GO_BUILD_FLAGS += -ldflags '$(GO_BUILD_LDFLAGS) $(EXTRA_GO_BUILD_LDFLAGS)' -tags=$(call join-with-comma,$(GO_TAGS_FLAGS)) $(EXTRA_GO_BUILD_FLAGS)
@@ -271,9 +261,8 @@ HELM_TOOLBOX_VERSION ?= "v1.1.0"
 HELM_TOOLBOX_SHA ?= "961693f182b9b456ed90e5274ac5df81e4af4343104e252666959cdf9570ce9e"
 HELM_TOOLBOX_IMAGE ?= "quay.io/cilium/helm-toolbox:$(HELM_TOOLBOX_VERSION)@sha256:$(HELM_TOOLBOX_SHA)"
 
-YQ_VERSION ?= "4.40.5"
-YQ_SHA ?= "32be61dc94d0acc44f513ba69d0fc05f1f92c2e760491f2a27e11fc13cde6327"
-YQ_IMAGE ?= "docker.io/mikefarah/yq:$(YQ_VERSION)@sha256:$(YQ_SHA)"
+# renovate: datasource=docker
+YQ_IMAGE ?= "docker.io/mikefarah/yq@sha256:32be61dc94d0acc44f513ba69d0fc05f1f92c2e760491f2a27e11fc13cde6327" # 4.40.5
 
 define print_help_line
   @printf "  \033[36m%-29s\033[0m %s.\n" $(1) $(2)

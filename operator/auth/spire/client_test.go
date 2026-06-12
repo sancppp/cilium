@@ -14,6 +14,7 @@ import (
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -61,10 +62,16 @@ func (m mockEntryClient) SyncAuthorizedEntries(ctx context.Context, opts ...grpc
 	panic("implement me")
 }
 
+// defaultTestEntryConfig returns the default SpireEntryConfig for tests.
+func defaultTestEntryConfig() SpireEntryConfig {
+	return DefaultSpireEntryConfig()
+}
+
 func TestClient_Upsert(t *testing.T) {
 	cfg := ClientConfig{
 		SpiffeTrustDomain: "dummy.trusted.domain",
 	}
+	entryCfg := defaultTestEntryConfig()
 	type fields struct {
 		entry entryv1.EntryClient
 	}
@@ -196,12 +203,15 @@ func TestClient_Upsert(t *testing.T) {
 							},
 						}, in)
 						return &entryv1.ListEntriesResponse{
-							Entries: []*types.Entry{{}},
+							Entries: []*types.Entry{{Id: "existing-entry-id"}},
 						}, nil
 					},
 					BatchUpdateEntryFunc: func(ctx context.Context, in *entryv1.BatchUpdateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchUpdateEntryResponse, error) {
+						// The update entry must carry the Id of the existing
+						// entry; otherwise SPIRE cannot resolve the row.
 						require.ElementsMatch(t, in.Entries, []*types.Entry{
 							{
+								Id: "existing-entry-id",
 								SpiffeId: &types.SPIFFEID{
 									TrustDomain: "dummy.trusted.domain",
 									Path:        "/identity/dummy-id",
@@ -213,17 +223,51 @@ func TestClient_Upsert(t *testing.T) {
 								Selectors: defaultSelectors,
 							},
 						})
-						return &entryv1.BatchUpdateEntryResponse{}, nil
+						return &entryv1.BatchUpdateEntryResponse{
+							Results: []*entryv1.BatchUpdateEntryResponse_Result{
+								{Status: &types.Status{Code: int32(codes.OK)}},
+							},
+						}, nil
 					},
 				},
 			},
+		},
+		{
+			name: "entry exists but update returns per-entry failure",
+			args: args{
+				id: "dummy-id",
+			},
+			fields: fields{
+				entry: mockEntryClient{
+					ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+						return &entryv1.ListEntriesResponse{
+							Entries: []*types.Entry{{Id: "existing-entry-id"}},
+						}, nil
+					},
+					BatchUpdateEntryFunc: func(ctx context.Context, in *entryv1.BatchUpdateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchUpdateEntryResponse, error) {
+						require.Equal(t, "existing-entry-id", in.Entries[0].Id)
+						// Top-level err is nil but the per-entry status fails;
+						// the caller must surface this as an error.
+						return &entryv1.BatchUpdateEntryResponse{
+							Results: []*entryv1.BatchUpdateEntryResponse_Result{
+								{Status: &types.Status{
+									Code:    int32(codes.NotFound),
+									Message: "Failed to update entry",
+								}},
+							},
+						}, nil
+					},
+				},
+			},
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Client{
-				cfg:   cfg,
-				entry: tt.fields.entry,
+				cfg:      cfg,
+				entryCfg: entryCfg,
+				entry:    tt.fields.entry,
 			}
 			if err := c.Upsert(t.Context(), tt.args.id); (err != nil) != tt.wantErr {
 				t.Errorf("Upsert() error = %v, wantErr %v", err, tt.wantErr)
@@ -236,6 +280,7 @@ func TestClient_Delete(t *testing.T) {
 	cfg := ClientConfig{
 		SpiffeTrustDomain: "dummy.trusted.domain",
 	}
+	entryCfg := defaultTestEntryConfig()
 	type fields struct {
 		entry entryv1.EntryClient
 	}
@@ -403,8 +448,9 @@ func TestClient_Delete(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Client{
-				cfg:   cfg,
-				entry: tt.fields.entry,
+				cfg:      cfg,
+				entryCfg: entryCfg,
+				entry:    tt.fields.entry,
 			}
 			if err := c.Delete(t.Context(), tt.args.id); (err != nil) != tt.wantErr {
 				t.Errorf("Delete() error = %v, wantErr %v", err, tt.wantErr)
@@ -489,4 +535,362 @@ func Test_resolvedK8sService(t *testing.T) {
 
 func addressOf[T any](v T) *T {
 	return &v
+}
+
+func TestClient_UpsertBatch(t *testing.T) {
+	cfg := ClientConfig{
+		SpiffeTrustDomain: "dummy.trusted.domain",
+	}
+	entryCfg := defaultTestEntryConfig()
+	log := hivetest.Logger(t)
+
+	tests := []struct {
+		name    string
+		entry   entryv1.EntryClient
+		ids     []string
+		wantErr bool
+	}{
+		{
+			name:    "client not initialized",
+			entry:   nil,
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name:    "empty ids",
+			entry:   mockEntryClient{},
+			ids:     []string{},
+			wantErr: false,
+		},
+		{
+			name: "successful batch create all new",
+			entry: mockEntryClient{
+				BatchCreateEntryFunc: func(ctx context.Context, in *entryv1.BatchCreateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchCreateEntryResponse, error) {
+					require.Len(t, in.Entries, 2)
+					// Verify entries have correct structure
+					for _, e := range in.Entries {
+						require.Equal(t, "dummy.trusted.domain", e.SpiffeId.TrustDomain)
+						require.Equal(t, "/cilium-operator", e.ParentId.Path)
+					}
+					return &entryv1.BatchCreateEntryResponse{
+						Results: []*entryv1.BatchCreateEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.OK)}},
+							{Status: &types.Status{Code: int32(codes.OK)}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1", "id2"},
+			wantErr: false,
+		},
+		{
+			name: "batch upsert with existing entries triggers update",
+			entry: mockEntryClient{
+				BatchCreateEntryFunc: func(ctx context.Context, in *entryv1.BatchCreateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchCreateEntryResponse, error) {
+					return &entryv1.BatchCreateEntryResponse{
+						Results: []*entryv1.BatchCreateEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.OK)}},
+							{
+								Status: &types.Status{Code: int32(codes.AlreadyExists)},
+								// SPIRE returns the existing entry (with its Id)
+								// on AlreadyExists.
+								Entry: &types.Entry{Id: "existing-id2"},
+							},
+						},
+					}, nil
+				},
+				BatchUpdateEntryFunc: func(ctx context.Context, in *entryv1.BatchUpdateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchUpdateEntryResponse, error) {
+					require.Len(t, in.Entries, 1)
+					require.Equal(t, "/identity/id2", in.Entries[0].SpiffeId.Path)
+					// The update entry must carry the existing Id.
+					require.Equal(t, "existing-id2", in.Entries[0].Id)
+					return &entryv1.BatchUpdateEntryResponse{
+						Results: []*entryv1.BatchUpdateEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.OK)}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1", "id2"},
+			wantErr: false,
+		},
+		{
+			name: "batch update per-entry failure surfaces error",
+			entry: mockEntryClient{
+				BatchCreateEntryFunc: func(ctx context.Context, in *entryv1.BatchCreateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchCreateEntryResponse, error) {
+					return &entryv1.BatchCreateEntryResponse{
+						Results: []*entryv1.BatchCreateEntryResponse_Result{
+							{
+								Status: &types.Status{Code: int32(codes.AlreadyExists)},
+								Entry:  &types.Entry{Id: "existing-id1"},
+							},
+						},
+					}, nil
+				},
+				BatchUpdateEntryFunc: func(ctx context.Context, in *entryv1.BatchUpdateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchUpdateEntryResponse, error) {
+					require.Equal(t, "existing-id1", in.Entries[0].Id)
+					// Top-level err is nil; failure is per-entry only.
+					return &entryv1.BatchUpdateEntryResponse{
+						Results: []*entryv1.BatchUpdateEntryResponse_Result{
+							{Status: &types.Status{
+								Code:    int32(codes.NotFound),
+								Message: "Failed to update entry",
+							}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name: "batch upsert AlreadyExists without returned Id surfaces error",
+			entry: mockEntryClient{
+				BatchCreateEntryFunc: func(ctx context.Context, in *entryv1.BatchCreateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchCreateEntryResponse, error) {
+					return &entryv1.BatchCreateEntryResponse{
+						Results: []*entryv1.BatchCreateEntryResponse_Result{
+							// AlreadyExists but no Entry returned: we must not
+							// attempt an Id-less update (which would loop).
+							{Status: &types.Status{Code: int32(codes.AlreadyExists)}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name: "batch create RPC error",
+			entry: mockEntryClient{
+				BatchCreateEntryFunc: func(ctx context.Context, in *entryv1.BatchCreateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchCreateEntryResponse, error) {
+					return nil, fmt.Errorf("connection refused")
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name: "batch update RPC error",
+			entry: mockEntryClient{
+				BatchCreateEntryFunc: func(ctx context.Context, in *entryv1.BatchCreateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchCreateEntryResponse, error) {
+					return &entryv1.BatchCreateEntryResponse{
+						Results: []*entryv1.BatchCreateEntryResponse_Result{
+							{
+								Status: &types.Status{Code: int32(codes.AlreadyExists)},
+								Entry:  &types.Entry{Id: "existing-id1"},
+							},
+						},
+					}, nil
+				},
+				BatchUpdateEntryFunc: func(ctx context.Context, in *entryv1.BatchUpdateEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchUpdateEntryResponse, error) {
+					return nil, fmt.Errorf("update failed")
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{
+				cfg:      cfg,
+				entryCfg: entryCfg,
+				entry:    tt.entry,
+				log:      log,
+			}
+			err := c.UpsertBatch(t.Context(), tt.ids)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("UpsertBatch() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestClient_DeleteBatch(t *testing.T) {
+	cfg := ClientConfig{
+		SpiffeTrustDomain: "dummy.trusted.domain",
+	}
+	entryCfg := defaultTestEntryConfig()
+	log := hivetest.Logger(t)
+
+	tests := []struct {
+		name    string
+		entry   entryv1.EntryClient
+		ids     []string
+		wantErr bool
+	}{
+		{
+			name:    "client not initialized",
+			entry:   nil,
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name:    "empty ids",
+			entry:   mockEntryClient{},
+			ids:     []string{},
+			wantErr: false,
+		},
+		{
+			name: "successful delete batch",
+			entry: mockEntryClient{
+				ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					// Verify we're listing by parent ID
+					require.Equal(t, "/cilium-operator", in.Filter.ByParentId.Path)
+					return &entryv1.ListEntriesResponse{
+						Entries: []*types.Entry{
+							{Id: "entry-1", SpiffeId: &types.SPIFFEID{Path: "/identity/id1"}},
+							{Id: "entry-2", SpiffeId: &types.SPIFFEID{Path: "/identity/id2"}},
+							{Id: "entry-3", SpiffeId: &types.SPIFFEID{Path: "/identity/other"}}, // Not in delete list
+						},
+					}, nil
+				},
+				BatchDeleteEntryFunc: func(ctx context.Context, in *entryv1.BatchDeleteEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchDeleteEntryResponse, error) {
+					require.ElementsMatch(t, []string{"entry-1", "entry-2"}, in.Ids)
+					return &entryv1.BatchDeleteEntryResponse{
+						Results: []*entryv1.BatchDeleteEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.OK)}},
+							{Status: &types.Status{Code: int32(codes.OK)}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1", "id2"},
+			wantErr: false,
+		},
+		{
+			name: "delete batch with not found is ignored",
+			entry: mockEntryClient{
+				ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					return &entryv1.ListEntriesResponse{
+						Entries: []*types.Entry{
+							{Id: "entry-1", SpiffeId: &types.SPIFFEID{Path: "/identity/id1"}},
+						},
+					}, nil
+				},
+				BatchDeleteEntryFunc: func(ctx context.Context, in *entryv1.BatchDeleteEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchDeleteEntryResponse, error) {
+					return &entryv1.BatchDeleteEntryResponse{
+						Results: []*entryv1.BatchDeleteEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.NotFound)}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: false,
+		},
+		{
+			name: "delete batch with no matching entries",
+			entry: mockEntryClient{
+				ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					return &entryv1.ListEntriesResponse{
+						Entries: []*types.Entry{
+							{Id: "entry-1", SpiffeId: &types.SPIFFEID{Path: "/identity/other"}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1", "id2"},
+			wantErr: false,
+		},
+		{
+			name: "list entries error",
+			entry: mockEntryClient{
+				ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					return nil, fmt.Errorf("connection refused")
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name: "batch delete RPC error",
+			entry: mockEntryClient{
+				ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					return &entryv1.ListEntriesResponse{
+						Entries: []*types.Entry{
+							{Id: "entry-1", SpiffeId: &types.SPIFFEID{Path: "/identity/id1"}},
+						},
+					}, nil
+				},
+				BatchDeleteEntryFunc: func(ctx context.Context, in *entryv1.BatchDeleteEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchDeleteEntryResponse, error) {
+					return nil, fmt.Errorf("delete failed")
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name: "batch delete with permission denied returns error",
+			entry: mockEntryClient{
+				ListEntriesFunc: func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					return &entryv1.ListEntriesResponse{
+						Entries: []*types.Entry{
+							{Id: "entry-1", SpiffeId: &types.SPIFFEID{Path: "/identity/id1"}},
+						},
+					}, nil
+				},
+				BatchDeleteEntryFunc: func(ctx context.Context, in *entryv1.BatchDeleteEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchDeleteEntryResponse, error) {
+					return &entryv1.BatchDeleteEntryResponse{
+						Results: []*entryv1.BatchDeleteEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.PermissionDenied), Message: "permission denied"}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1"},
+			wantErr: true,
+		},
+		{
+			name: "delete batch with pagination",
+			entry: mockEntryClient{
+				ListEntriesFunc: func() func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+					callCount := 0
+					return func(ctx context.Context, in *entryv1.ListEntriesRequest, opts ...grpc.CallOption) (*entryv1.ListEntriesResponse, error) {
+						callCount++
+						if callCount == 1 {
+							return &entryv1.ListEntriesResponse{
+								Entries: []*types.Entry{
+									{Id: "entry-1", SpiffeId: &types.SPIFFEID{Path: "/identity/id1"}},
+								},
+								NextPageToken: "page2",
+							}, nil
+						}
+						return &entryv1.ListEntriesResponse{
+							Entries: []*types.Entry{
+								{Id: "entry-2", SpiffeId: &types.SPIFFEID{Path: "/identity/id2"}},
+							},
+						}, nil
+					}
+				}(),
+				BatchDeleteEntryFunc: func(ctx context.Context, in *entryv1.BatchDeleteEntryRequest, opts ...grpc.CallOption) (*entryv1.BatchDeleteEntryResponse, error) {
+					require.ElementsMatch(t, []string{"entry-1", "entry-2"}, in.Ids)
+					return &entryv1.BatchDeleteEntryResponse{
+						Results: []*entryv1.BatchDeleteEntryResponse_Result{
+							{Status: &types.Status{Code: int32(codes.OK)}},
+							{Status: &types.Status{Code: int32(codes.OK)}},
+						},
+					}, nil
+				},
+			},
+			ids:     []string{"id1", "id2"},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{
+				cfg:      cfg,
+				entryCfg: entryCfg,
+				entry:    tt.entry,
+				log:      log,
+			}
+			err := c.DeleteBatch(t.Context(), tt.ids)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("DeleteBatch() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
 }

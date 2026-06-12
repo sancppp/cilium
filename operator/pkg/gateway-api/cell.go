@@ -20,11 +20,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrlRuntime "sigs.k8s.io/controller-runtime"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 
 	operatorOption "github.com/cilium/cilium/operator/option"
+	"github.com/cilium/cilium/operator/pkg/ciliumenvoyconfig"
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	gatewayApiTranslation "github.com/cilium/cilium/operator/pkg/model/translation/gateway-api"
@@ -39,6 +39,10 @@ import (
 )
 
 // Cell manages the Gateway API related controllers.
+const (
+	defaultControllerName = "io.cilium/gateway-controller"
+)
+
 var Cell = cell.Module(
 	"gateway-api",
 	"Manages the Gateway API controllers",
@@ -54,6 +58,7 @@ var Cell = cell.Module(
 
 		GatewayAPIHostnetworkEnabled:           false,
 		GatewayAPIHostnetworkNodelabelselector: "",
+		GatewayAPIUseRemoteAddress:             true,
 	}),
 
 	// Private provider for preconditions - consumed by both initGatewayAPIController
@@ -64,27 +69,14 @@ var Cell = cell.Module(
 	cell.Provide(registerSecretSync),
 )
 
-var requiredGVKs = []schema.GroupVersionKind{
-	gatewayv1.SchemeGroupVersion.WithKind(helpers.GatewayClassKind),
-	gatewayv1.SchemeGroupVersion.WithKind(helpers.GatewayKind),
-	gatewayv1.SchemeGroupVersion.WithKind(helpers.HTTPRouteKind),
-	gatewayv1.SchemeGroupVersion.WithKind(helpers.GRPCRouteKind),
-	gatewayv1beta1.SchemeGroupVersion.WithKind(helpers.ReferenceGrantKind),
-}
-
-var optionalGVKs = []schema.GroupVersionKind{
-	gatewayv1alpha2.SchemeGroupVersion.WithKind(helpers.TLSRouteKind),
-	mcsapiv1alpha1.SchemeGroupVersion.WithKind(helpers.ServiceImportKind),
-}
-
 // gatewayAPIPreconditions holds the result of Gateway API precondition checks.
 // This is provided privately and consumed by both initGatewayAPIController
 // and registerSecretSync to ensure consistent behavior.
 type gatewayAPIPreconditions struct {
 	// Enabled indicates all preconditions are met for Gateway API
 	Enabled bool
-	// InstalledKinds contains the GVKs of installed Gateway API CRDs
-	InstalledKinds []schema.GroupVersionKind
+	// InstalledOptionalKinds contains the GVKs of installed Gateway API CRDs
+	InstalledOptionalKinds []schema.GroupVersionKind
 }
 
 // preconditionParams contains dependencies for checking Gateway API preconditions.
@@ -97,6 +89,9 @@ type preconditionParams struct {
 	OperatorConfig   *operatorOption.OperatorConfig
 	GatewayApiConfig gatewayApiConfig
 }
+
+// crdDiscoveryTimeout is the maximum duration to retry CRD discovery on transient errors.
+const crdDiscoveryTimeout = 30 * time.Second
 
 // newGatewayAPIPreconditions checks all Gateway API preconditions and returns
 // the result. This includes config checks, kube-proxy-replacement check,
@@ -115,16 +110,27 @@ func newGatewayAPIPreconditions(params preconditionParams) (*gatewayAPIPrecondit
 		return nil, err
 	}
 
-	params.Logger.Info(
+	ctx, cancel := context.WithTimeout(context.Background(), crdDiscoveryTimeout)
+	defer cancel()
+
+	return discoverCRDsWithRetry(ctx, params.K8sClient, params.Logger, params.Health)
+}
+
+// discoverCRDsWithRetry attempts to discover required Gateway API CRDs, retrying
+// on transient errors until the context expires. Returns a fatal error if the
+// context expires (causing operator restart) or disables Gateway API gracefully
+// if CRDs are permanently missing.
+func discoverCRDsWithRetry(ctx context.Context, client k8sClient.Clientset, logger *slog.Logger, health cell.Health) (*gatewayAPIPreconditions, error) {
+	logger.Info(
 		"Checking for required and optional GatewayAPI resources",
-		logfields.RequiredGVK, requiredGVKs,
-		logfields.OptionalGVK, optionalGVKs,
+		logfields.RequiredGVK, helpers.RequiredGVKs,
+		logfields.OptionalGVK, helpers.AllOptionalKinds,
 	)
 
 	// Configure exponential backoff for CRD discovery.
 	// This allows the operator to recover if API server is temporarily unavailable at startup.
 	bo := backoff.Exponential{
-		Logger: params.Logger,
+		Logger: logger,
 		Min:    200 * time.Millisecond,
 		Max:    5 * time.Second,
 		Factor: 2.0,
@@ -132,36 +138,50 @@ func newGatewayAPIPreconditions(params preconditionParams) (*gatewayAPIPrecondit
 		Name:   "gateway-api-crd-discovery",
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	for {
-		installedKinds, err := checkCRDs(ctx, params.K8sClient, params.Logger, requiredGVKs, optionalGVKs)
+		installedOptionalKinds, err := checkCRDs(ctx, client, logger, helpers.RequiredGVKs, helpers.AllOptionalKinds)
 		if err == nil {
-			params.Health.OK("Gateway API CRDs discovered")
+			health.OK("Gateway API CRDs discovered")
 			return &gatewayAPIPreconditions{
-				Enabled:        true,
-				InstalledKinds: installedKinds,
+				Enabled:                true,
+				InstalledOptionalKinds: installedOptionalKinds,
 			}, nil
 		}
 
+		// Context expiry errors from checkCRDs bypass isTransientError, silently
+		// disabling Gateway API. Catch them here to trigger an operator restart.
+		if ctx.Err() != nil {
+			logger.Error(
+				"Gateway API CRD discovery timed out after retrying transient errors, operator will restart",
+				logfields.Error, err,
+			)
+			health.Stopped("Gateway API CRD discovery timed out after transient errors")
+			return nil, fmt.Errorf("gateway API CRD discovery timed out: %w", err)
+		}
+
 		if !isTransientError(err) {
-			params.Logger.Error(
+			logger.Error(
 				"Required GatewayAPI resources are not found, please refer to docs for installation instructions",
 				logfields.Error, err,
 			)
-			params.Health.Degraded("Gateway API CRDs not installed", err)
+			health.Degraded("Gateway API CRDs not installed", err)
 			return &gatewayAPIPreconditions{Enabled: false}, nil
 		}
 
-		params.Logger.Warn(
+		logger.Warn(
 			"Failed to check GatewayAPI CRDs due to transient error, will retry",
 			logfields.Error, err,
 		)
-		params.Health.Degraded("Gateway API initialization pending - API server unreachable", err)
+		health.Degraded("Gateway API initialization pending - API server unreachable", err)
 
 		if err := bo.Wait(ctx); err != nil {
-			return nil, err
+			// Context expired during backoff wait - same handling as above.
+			logger.Error(
+				"Gateway API CRD discovery timed out after retrying transient errors, operator will restart",
+				logfields.Error, err,
+			)
+			health.Stopped("Gateway API CRD discovery timed out after transient errors")
+			return nil, fmt.Errorf("gateway API CRD discovery timed out: %w", err)
 		}
 	}
 }
@@ -177,6 +197,7 @@ type gatewayApiConfig struct {
 
 	GatewayAPIHostnetworkEnabled           bool
 	GatewayAPIHostnetworkNodelabelselector string
+	GatewayAPIUseRemoteAddress             bool
 }
 
 func (r gatewayApiConfig) Flags(flags *pflag.FlagSet) {
@@ -188,6 +209,7 @@ func (r gatewayApiConfig) Flags(flags *pflag.FlagSet) {
 	flags.String("gateway-api-service-externaltrafficpolicy", r.GatewayAPIServiceExternalTrafficPolicy, "Kubernetes LoadBalancer Service externalTrafficPolicy for all Gateway instances.")
 	flags.String("gateway-api-secrets-namespace", r.GatewayAPISecretsNamespace, "Namespace having tls secrets used by CEC for Gateway API")
 	flags.Bool("gateway-api-hostnetwork-enabled", r.GatewayAPIHostnetworkEnabled, "Exposes Gateway listeners on the host network.")
+	flags.Bool("gateway-api-use-remote-address", r.GatewayAPIUseRemoteAddress, "Use the immediate client's IP address as the origin client's IP address")
 	flags.String("gateway-api-hostnetwork-nodelabelselector", r.GatewayAPIHostnetworkNodelabelselector, "Label selector that matches the nodes where the gateway listeners should be exposed. It's a list of comma-separated key-value label pairs. e.g. 'kubernetes.io/os=linux,kubernetes.io/hostname=kind-worker'")
 }
 
@@ -202,6 +224,7 @@ type gatewayAPIParams struct {
 	OperatorConfig   *operatorOption.OperatorConfig
 	MCSAPIConfig     mcsapitypes.MCSAPIConfig
 	GatewayApiConfig gatewayApiConfig
+	ProxyTimeouts    ciliumenvoyconfig.EnvoyProxyTimeouts
 
 	// Preconditions is injected from private provider
 	Preconditions *gatewayAPIPreconditions
@@ -212,15 +235,15 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		return nil
 	}
 
-	installedKinds := params.Preconditions.InstalledKinds
+	installedOptionalKinds := params.Preconditions.InstalledOptionalKinds
 
 	// Handle MCS API CRDs
-	if params.MCSAPIConfig.ShouldInstallMCSAPICrds() && !slices.Contains(installedKinds, mcsapiv1alpha1.SchemeGroupVersion.WithKind(helpers.ServiceImportKind)) {
+	if params.MCSAPIConfig.ShouldInstallMCSAPICrds() && !slices.Contains(installedOptionalKinds, mcsapiv1beta1.SchemeGroupVersion.WithKind(helpers.ServiceImportKind)) {
 		// We can just assume ServiceImport are installed if we are going to install it
-		installedKinds = append(installedKinds, mcsapiv1alpha1.SchemeGroupVersion.WithKind(helpers.ServiceImportKind))
+		installedOptionalKinds = append(installedOptionalKinds, mcsapiv1beta1.SchemeGroupVersion.WithKind(helpers.ServiceImportKind))
 	}
 
-	if err := registerGatewayAPITypesToScheme(params.Scheme, installedKinds); err != nil {
+	if err := registerGatewayAPITypesToScheme(params.Scheme, installedOptionalKinds); err != nil {
 		return err
 	}
 
@@ -244,10 +267,10 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		ListenerConfig: translation.ListenerConfig{
 			UseProxyProtocol:         params.GatewayApiConfig.EnableGatewayAPIProxyProtocol,
 			UseAlpn:                  params.GatewayApiConfig.EnableGatewayAPIAlpn,
-			StreamIdleTimeoutSeconds: params.OperatorConfig.ProxyStreamIdleTimeoutSeconds,
+			StreamIdleTimeoutSeconds: params.ProxyTimeouts.ProxyStreamIdleTimeoutSeconds,
 		},
 		ClusterConfig: translation.ClusterConfig{
-			IdleTimeoutSeconds: params.OperatorConfig.ProxyIdleTimeoutSeconds,
+			IdleTimeoutSeconds: params.ProxyTimeouts.ProxyIdleTimeoutSeconds,
 			UseAppProtocol:     params.GatewayApiConfig.EnableGatewayAPIAppProtocol,
 		},
 		RouteConfig: translation.RouteConfig{
@@ -255,6 +278,7 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		},
 		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
 			XFFNumTrustedHops: params.GatewayApiConfig.GatewayAPIXffNumTrustedHops,
+			UseRemoteAddress:  params.GatewayApiConfig.GatewayAPIUseRemoteAddress,
 		},
 	}
 	cecTranslator := translation.NewCECTranslator(cfg)
@@ -265,7 +289,8 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		params.CtrlRuntimeManager,
 		gatewayAPITranslator,
 		params.Logger,
-		installedKinds,
+		defaultControllerName,
+		installedOptionalKinds,
 	); err != nil {
 		return fmt.Errorf("failed to create gateway controller: %w", err)
 	}
@@ -296,17 +321,19 @@ func registerSecretSync(params secretSyncParams) secretsync.SecretSyncRegistrati
 		return secretsync.SecretSyncRegistrationOut{}
 	}
 
+	handler := NewSecretSyncHandler(params.CtrlRuntimeManager.GetClient(), params.Logger, defaultControllerName)
+
 	return secretsync.SecretSyncRegistrationOut{
 		SecretSyncRegistration: &secretsync.SecretSyncRegistration{
 			RefObject:            &gatewayv1.Gateway{},
-			RefObjectEnqueueFunc: EnqueueTLSSecrets(params.CtrlRuntimeManager.GetClient(), params.Logger),
-			RefObjectCheckFunc:   IsReferencedByCiliumGateway,
+			RefObjectEnqueueFunc: handler.EnqueueTLSSecrets(),
+			RefObjectCheckFunc:   handler.IsReferencedByGateway,
 			SecretsNamespace:     params.GatewayApiConfig.GatewayAPISecretsNamespace,
 		},
 		ConfigMapSyncRegistration: &secretsync.ConfigMapSyncRegistration{
 			RefObject:            &gatewayv1.BackendTLSPolicy{},
-			RefObjectEnqueueFunc: EnqueueBackendTLSPolicyConfigMaps(params.CtrlRuntimeManager.GetClient(), params.Logger),
-			RefObjectCheckFunc:   ConfigMapIsReferencedInCiliumGateway,
+			RefObjectEnqueueFunc: handler.EnqueueBackendTLSPolicyConfigMaps(),
+			RefObjectCheckFunc:   handler.ConfigMapIsReferencedInGateway,
 			SecretsNamespace:     params.GatewayApiConfig.GatewayAPISecretsNamespace,
 		},
 	}
@@ -380,7 +407,7 @@ func checkCRD(ctx context.Context, clientset k8sClient.Clientset, gvk schema.Gro
 // schema.GroupVersionKind of any optional CRDs that are installed.
 func checkCRDs(ctx context.Context, clientset k8sClient.Clientset, logger *slog.Logger, requiredGVKs, optionalGVKs []schema.GroupVersionKind) ([]schema.GroupVersionKind, error) {
 	var res error
-	var presentGVKs []schema.GroupVersionKind
+	var presentOptionalGVKs []schema.GroupVersionKind
 
 	for _, gvk := range requiredGVKs {
 		if err := checkCRD(ctx, clientset, gvk); err != nil {
@@ -395,22 +422,23 @@ func checkCRDs(ctx context.Context, clientset k8sClient.Clientset, logger *slog.
 		}
 		// note that the .Kind field contains the _resource_ name -
 		// the plural, lowercase version of the name.
-		presentGVKs = append(presentGVKs, optionalGVK)
+		presentOptionalGVKs = append(presentOptionalGVKs, optionalGVK)
 	}
 
-	return presentGVKs, res
+	return presentOptionalGVKs, res
 }
 
 // registerReconcilers registers Gateway API reconcilers to the controller-runtime library manager.
 // optionalKinds are previously autodetected based on what CRDs are present in the cluster.
-func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Translator, logger *slog.Logger, installedCRDs []schema.GroupVersionKind) error {
+func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Translator, logger *slog.Logger, controllerName string, installedOptionalCRDs []schema.GroupVersionKind) error {
 	requiredReconcilers := []interface {
 		SetupWithManager(mgr ctrlRuntime.Manager) error
 	}{
-		newGatewayClassReconciler(mgr, logger),
-		newGatewayReconciler(mgr, translator, logger, installedCRDs),
-		newGammaReconciler(mgr, translator, logger),
+		newGatewayClassReconciler(mgr, logger, controllerName),
+		newGatewayReconciler(mgr, translator, logger, controllerName),
+		newGammaReconciler(mgr, translator, logger, controllerName),
 		newGatewayClassConfigReconciler(mgr, logger),
+		newEndpointSliceReconciler(mgr, logger),
 	}
 
 	for _, r := range requiredReconcilers {
@@ -423,12 +451,16 @@ func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Transla
 	// the optionalGVKs global.
 	// Note that optionalKinds contains the lower-case, plural version of the
 	// name.
-	for _, gvk := range installedCRDs {
+	for _, gvk := range installedOptionalCRDs {
 		switch gvk.Kind {
-		case helpers.TLSRouteKind:
-			// TLSRoute is reconciled by the Gateway API reconciler, but log that the
+		case helpers.TCPRouteKind:
+			// TCPRoute is reconciled by the Gateway API reconciler, but log that the
 			// support has been successfully enabled.
-			logger.Info("TLSRoute CRD is installed, TLSRoute support is enabled")
+			logger.Info("TCPRoute CRD is installed, TCPRoute support is enabled")
+		case helpers.UDPRouteKind:
+			// UDPRoute is reconciled by the Gateway API reconciler, but log that the
+			// support has been successfully enabled.
+			logger.Info("UDPRoute CRD is installed, UDPRoute support is enabled")
 		case helpers.ServiceImportKind:
 			// we don't need a reconciler, but we do need to tell folks that the
 			// support is working.

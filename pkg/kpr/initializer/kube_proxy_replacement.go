@@ -43,10 +43,6 @@ type kprInitializer struct {
 }
 
 func (r *kprInitializer) InitKubeProxyReplacementOptions() error {
-	if !r.kprCfg.KubeProxyReplacement {
-		option.Config.UnsafeDaemonConfigOption.EnableHostLegacyRouting = true
-	}
-
 	if !option.Config.UnsafeDaemonConfigOption.EnableHostLegacyRouting {
 		msg := ""
 		switch {
@@ -102,8 +98,9 @@ func (r *kprInitializer) InitKubeProxyReplacementOptions() error {
 		}
 
 		dsrIPIP := r.lbConfig.LoadBalancerUsesDSR() && r.lbConfig.DSRDispatch == loadbalancer.DSRDispatchIPIP
-		if dsrIPIP && option.Config.NodePortAcceleration == option.NodePortAccelerationDisabled {
+		if dsrIPIP {
 			option.Config.UnsafeDaemonConfigOption.EnableIPIPDevices = true
+			option.Config.EnableIPIPTermination = true
 		}
 
 		if (option.Config.LoadBalancerRSSv4CIDR != "" || option.Config.LoadBalancerRSSv6CIDR != "") && !dsrIPIP {
@@ -131,12 +128,18 @@ func (r *kprInitializer) InitKubeProxyReplacementOptions() error {
 			return fmt.Errorf("XDP acceleration cannot be used with an IPv6 underlay")
 		}
 
-		if option.Config.TunnelingEnabled() && r.tunnelConfig.EncapProtocol() == tunnel.VXLAN &&
-			r.lbConfig.LoadBalancerUsesDSR() {
-			return fmt.Errorf("Node Port %q mode cannot be used with %s tunneling.", r.lbConfig.LBMode, tunnel.VXLAN)
+		if option.Config.TunnelingEnabled() && r.tunnelConfig.EncapProtocol() == tunnel.VXLAN {
+			if r.lbConfig.LBMode != loadbalancer.LBModeSNAT {
+				return fmt.Errorf("Node Port %q mode cannot be used with %s tunneling.", r.lbConfig.LBMode, tunnel.VXLAN)
+			}
+			if r.lbConfig.LBModeAnnotation && r.lbConfig.DSRDispatch != loadbalancer.DSRDispatchIPIP {
+				return fmt.Errorf("Only --%s=%s is supported with %s tunneling when --%s is set",
+					loadbalancer.LoadBalancerDSRDispatchName, loadbalancer.DSRDispatchIPIP,
+					tunnel.VXLAN, loadbalancer.LoadBalancerModeAnnotationName)
+			}
 		}
 
-		if option.Config.TunnelingEnabled() && r.lbConfig.LoadBalancerUsesDSR() &&
+		if option.Config.TunnelingEnabled() && r.lbConfig.LBMode != loadbalancer.LBModeSNAT &&
 			r.lbConfig.DSRDispatch != loadbalancer.DSRDispatchGeneve {
 			return fmt.Errorf("Tunnel routing with Node Port %q mode requires %s dispatch.",
 				r.lbConfig.LBMode, loadbalancer.DSRDispatchGeneve)
@@ -405,8 +408,8 @@ func checkNodePortAndEphemeralPortRanges(lbConfig loadbalancer.Config, sysctl sy
 			break
 		}
 		ports := strings.Split(portRange, "-")
-		if len(ports) == 0 {
-			return fmt.Errorf("Invalid reserved ports range")
+		if len(ports) != 1 && len(ports) != 2 {
+			return fmt.Errorf("Invalid reserved ports range %q", portRange)
 		}
 		from, err := strconv.Atoi(ports[0])
 		if err != nil {
@@ -416,6 +419,9 @@ func checkNodePortAndEphemeralPortRanges(lbConfig loadbalancer.Config, sysctl sy
 		if len(ports) == 2 {
 			if to, err = strconv.Atoi(ports[1]); err != nil {
 				return fmt.Errorf("Unable to parse reserved port %q", ports[1])
+			}
+			if from > to {
+				return fmt.Errorf("Invalid reserved ports range %q: start must be less than or equal to end", portRange)
 			}
 		}
 

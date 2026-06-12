@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 
 	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
+	"go4.org/netipx"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
@@ -33,8 +35,8 @@ const (
 )
 
 // DeriveFamily derives the address family of an IP
-func DeriveFamily(ip net.IP) Family {
-	if ip.To4() == nil {
+func DeriveFamily(addr netip.Addr) Family {
+	if addr.Is6() {
 		return IPv6
 	}
 	return IPv4
@@ -130,11 +132,19 @@ func (ipam *IPAM) ConfigureAllocator() {
 		)
 
 		if ipam.config.IPv6Enabled() {
-			ipam.ipv6Allocator = newHostScopeAllocator(ipam.nodeAddressing.IPv6().AllocationCIDR().IPNet)
+			prefix, ok := netipx.FromStdIPNet(ipam.nodeAddressing.IPv6().AllocationCIDR().IPNet)
+			if !ok {
+				logging.Fatal(ipam.logger, "Invalid IPv6 allocation CIDR")
+			}
+			ipam.ipv6Allocator = newHostScopeAllocator(prefix)
 		}
 
 		if ipam.config.IPv4Enabled() {
-			ipam.ipv4Allocator = newHostScopeAllocator(ipam.nodeAddressing.IPv4().AllocationCIDR().IPNet)
+			prefix, ok := netipx.FromStdIPNet(ipam.nodeAddressing.IPv4().AllocationCIDR().IPNet)
+			if !ok {
+				logging.Fatal(ipam.logger, "Invalid IPv4 allocation CIDR")
+			}
+			ipam.ipv4Allocator = newHostScopeAllocator(prefix)
 		}
 	case ipamOption.IPAMMultiPool:
 		ipam.logger.Info("Initializing MultiPool IPAM")
@@ -159,11 +169,29 @@ func (ipam *IPAM) ConfigureAllocator() {
 		if ipam.config.IPv4Enabled() {
 			ipam.ipv4Allocator = v4Allocator
 		}
-	case ipamOption.IPAMCRD, ipamOption.IPAMENI, ipamOption.IPAMAzure, ipamOption.IPAMAlibabaCloud:
-		ipam.logger.Info("Initializing CRD-based IPAM")
-		if ipam.config.IPAMMode() == ipamOption.IPAMENI {
-			startENIDeviceConfigurator(ipam.logger, ipam.jg, ipam.nodeResource, ipam.mtuConfig, ipam.sysctl)
+	case ipamOption.IPAMENI:
+		ipam.logger.Info("Initializing ENI multi-pool IPAM")
+		startENIDeviceConfigurator(ipam.logger, ipam.jg, ipam.nodeResource, ipam.mtuConfig, ipam.sysctl)
+		v4Allocator, v6Allocator := newENIMultiPoolAllocators(ENIMultiPoolAllocatorParams{
+			Logger:               ipam.logger,
+			IPv4Enabled:          ipam.config.IPv4Enabled(),
+			IPv6Enabled:          ipam.config.IPv6Enabled(),
+			CiliumNodeUpdateRate: ipam.config.IPAMCiliumNodeUpdateRate,
+			Node:                 ipam.nodeResource,
+			LocalNodeStore:       ipam.localNodeStore,
+			CNClient:             ipam.clientset.CiliumV2().CiliumNodes(),
+			JobGroup:             ipam.jg,
+			Conf:                 ipam.config,
+			IPMasqAgent:          ipam.ipMasqAgent,
+		})
+		if ipam.config.IPv6Enabled() {
+			ipam.ipv6Allocator = v6Allocator
 		}
+		if ipam.config.IPv4Enabled() {
+			ipam.ipv4Allocator = v4Allocator
+		}
+	case ipamOption.IPAMCRD, ipamOption.IPAMAzure, ipamOption.IPAMAlibabaCloud:
+		ipam.logger.Info("Initializing CRD-based IPAM")
 		if ipam.config.IPv6Enabled() {
 			ipam.ipv6Allocator = newCRDAllocator(ipam.logger, IPv6, ipam.config, ipam.nodeDiscovery, ipam.localNodeStore, ipam.clientset, ipam.k8sEventReg, ipam.mtuConfig, ipam.sysctl, ipam.ipMasqAgent)
 		}

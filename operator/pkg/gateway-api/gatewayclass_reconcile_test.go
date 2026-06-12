@@ -19,6 +19,7 @@ import (
 	gwconformanceconfig "sigs.k8s.io/gateway-api/conformance/utils/config"
 	gwconformance "sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
 
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 )
 
@@ -95,7 +96,7 @@ var (
 
 func Test_gatewayClassReconciler_Reconcile(t *testing.T) {
 	c := fake.NewClientBuilder().
-		WithScheme(testScheme()).
+		WithScheme(helpers.TestScheme(helpers.AllOptionalKinds)).
 		WithObjects(gwcFixture...).
 		WithObjects(cgwccFixture...).
 		WithStatusSubresource(&gatewayv1.GatewayClass{}).
@@ -186,5 +187,38 @@ func Test_gatewayClassReconciler_Reconcile(t *testing.T) {
 
 		require.NoError(t, err, "Error getting gateway class")
 		require.Empty(t, gwc.Status.Conditions, "Gateway class should not have any conditions")
+	})
+}
+
+func Test_hasNamespacedName(t *testing.T) {
+	t.Run("missing both namespace and name", func(t *testing.T) {
+		ref := &gatewayv1.ParametersReference{}
+		require.False(t, hasNamespacedName(ref))
+	})
+	t.Run("missing namespace but has name", func(t *testing.T) {
+		ref := &gatewayv1.ParametersReference{
+			Name: "fake",
+		}
+		require.False(t, hasNamespacedName(ref))
+	})
+	t.Run("has empty namespace string but has name", func(t *testing.T) {
+		ref := &gatewayv1.ParametersReference{
+			Namespace: ptr.To(gatewayv1.Namespace("")),
+			Name:      "fake",
+		}
+		require.False(t, hasNamespacedName(ref))
+	})
+	t.Run("has namespace but missing name", func(t *testing.T) {
+		ref := &gatewayv1.ParametersReference{
+			Namespace: ptr.To(gatewayv1.Namespace("fake")),
+		}
+		require.False(t, hasNamespacedName(ref))
+	})
+	t.Run("has both valid namespace and name", func(t *testing.T) {
+		ref := &gatewayv1.ParametersReference{
+			Namespace: ptr.To(gatewayv1.Namespace("fake")),
+			Name:      "fake",
+		}
+		require.True(t, hasNamespacedName(ref))
 	})
 }

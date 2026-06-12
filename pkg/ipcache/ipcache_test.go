@@ -30,6 +30,16 @@ type IPCacheTestSuite struct {
 	Allocator       *testidentity.MockIdentityAllocator
 }
 
+func getNamedPorts(npm types.NamedPortMultiMap, name string, proto u8proto.U8proto, nid identityPkg.NumericIdentity) []uint16 {
+	var ports []uint16
+	for resultNID, port := range npm.GetNamedPorts(name, proto, slices.Values([]identityPkg.NumericIdentity{nid})) {
+		if resultNID == nid {
+			ports = append(ports, port)
+		}
+	}
+	return ports
+}
+
 func setupIPCacheTestSuite(tb testing.TB) *IPCacheTestSuite {
 	s := &IPCacheTestSuite{
 		Allocator:     testidentity.NewMockIdentityAllocator(nil),
@@ -254,7 +264,7 @@ func TestIPCacheNamedPorts(t *testing.T) {
 		PodName:   "app1",
 		NamedPorts: types.NamedPortMap{
 			"http": types.PortProto{Port: 80, Proto: u8proto.TCP},
-			"dns":  types.PortProto{Port: 53},
+			"dns":  types.PortProto{Port: 53, Proto: u8proto.TCP},
 		},
 	}
 
@@ -285,7 +295,7 @@ func TestIPCacheNamedPorts(t *testing.T) {
 	port, err := npm.GetNamedPort("http", u8proto.TCP, idents)
 	require.NoError(t, err)
 	require.Equal(t, uint16(80), port)
-	port, err = npm.GetNamedPort("dns", u8proto.ANY, idents)
+	port, err = npm.GetNamedPort("dns", u8proto.TCP, idents)
 	require.NoError(t, err)
 	require.Equal(t, uint16(53), port)
 
@@ -309,7 +319,7 @@ func TestIPCacheNamedPorts(t *testing.T) {
 		PodName:   "app2",
 		NamedPorts: types.NamedPortMap{
 			"https": types.PortProto{Port: 443, Proto: u8proto.TCP},
-			"dns":   types.PortProto{Port: 53},
+			"dns":   types.PortProto{Port: 53, Proto: u8proto.TCP},
 		},
 	}
 
@@ -338,7 +348,7 @@ func TestIPCacheNamedPorts(t *testing.T) {
 	port, err = npm.GetNamedPort("http", u8proto.TCP, idents)
 	require.NoError(t, err)
 	require.Equal(t, uint16(80), port)
-	port, err = npm.GetNamedPort("dns", u8proto.ANY, idents)
+	port, err = npm.GetNamedPort("dns", u8proto.TCP, idents)
 	require.NoError(t, err)
 	require.Equal(t, uint16(53), port)
 	idents2 := slices.Values([]identityPkg.NumericIdentity{identity2})
@@ -352,7 +362,7 @@ func TestIPCacheNamedPorts(t *testing.T) {
 	require.NotNil(t, npm)
 	require.Equal(t, 2, npm.Len())
 
-	port, err = npm.GetNamedPort("dns", u8proto.ANY, idents2)
+	port, err = npm.GetNamedPort("dns", u8proto.TCP, idents2)
 	require.NoError(t, err)
 	require.Equal(t, uint16(53), port)
 	port, err = npm.GetNamedPort("https", u8proto.TCP, idents2)
@@ -498,6 +508,59 @@ func TestIPCacheNamedPorts(t *testing.T) {
 		require.Nil(t, ips)
 	}
 
+	// Test conflicting concrete ports for the same named port and numeric
+	// identity. GetNamedPort reports the conflict, and GetNamedPorts does
+	// not return an unusable mapping.
+	multiNID := identityPkg.NumericIdentity(88)
+	multiIdentity := Identity{
+		ID:     multiNID,
+		Source: source.Kubernetes,
+	}
+	multiIP1 := "10.2.0.1"
+	multiIP2 := "10.2.0.2"
+	multiMeta1 := K8sMetadata{
+		Namespace: "default",
+		PodName:   "multi-1",
+		NamedPorts: types.NamedPortMap{
+			"http-alt": types.PortProto{Port: 8080, Proto: u8proto.TCP},
+		},
+	}
+	multiMeta2 := K8sMetadata{
+		Namespace: "default",
+		PodName:   "multi-2",
+		NamedPorts: types.NamedPortMap{
+			"http-alt": types.PortProto{Port: 9090, Proto: u8proto.TCP},
+		},
+	}
+	namedPortsChanged, err = s.IPIdentityCache.Upsert(multiIP1, nil, 0, &multiMeta1, multiIdentity)
+	require.NoError(t, err)
+	require.True(t, namedPortsChanged)
+	namedPortsChanged, err = s.IPIdentityCache.Upsert(multiIP2, nil, 0, &multiMeta2, multiIdentity)
+	require.NoError(t, err)
+	require.True(t, namedPortsChanged)
+
+	npm = s.IPIdentityCache.GetNamedPorts()
+	require.NotNil(t, npm)
+	ports := getNamedPorts(npm, "http-alt", u8proto.TCP, multiNID)
+	require.Nil(t, ports)
+	port, err = npm.GetNamedPort("http-alt", u8proto.TCP, slices.Values([]identityPkg.NumericIdentity{multiNID}))
+	require.Equal(t, types.ErrDuplicateNamedPorts, err)
+	require.Equal(t, uint16(0), port)
+
+	namedPortsChanged = s.IPIdentityCache.Delete(multiIP1, source.Kubernetes)
+	require.True(t, namedPortsChanged)
+	npm = s.IPIdentityCache.GetNamedPorts()
+	require.NotNil(t, npm)
+	ports = getNamedPorts(npm, "http-alt", u8proto.TCP, multiNID)
+	require.Equal(t, []uint16{9090}, ports)
+
+	namedPortsChanged = s.IPIdentityCache.Delete(multiIP2, source.Kubernetes)
+	require.True(t, namedPortsChanged)
+	npm = s.IPIdentityCache.GetNamedPorts()
+	require.NotNil(t, npm)
+	ports = getNamedPorts(npm, "http-alt", u8proto.TCP, multiNID)
+	require.Nil(t, ports)
+
 	require.Len(t, s.IPIdentityCache.ipToIdentityCache, 1)
 	require.Len(t, s.IPIdentityCache.identityToIPCache, 1)
 
@@ -505,6 +568,42 @@ func TestIPCacheNamedPorts(t *testing.T) {
 	require.True(t, namedPortsChanged)
 	npm = s.IPIdentityCache.GetNamedPorts()
 	require.Equal(t, 0, npm.Len())
+}
+
+func TestIPCacheNamedPortsMoveOnIdentityChange(t *testing.T) {
+	s := setupIPCacheTestSuite(t)
+	t.Parallel()
+
+	endpointIP := "10.0.0.15"
+	realIdentity := identityPkg.NumericIdentity(68)
+	meta := K8sMetadata{
+		Namespace: "default",
+		PodName:   "app1",
+		NamedPorts: types.NamedPortMap{
+			"http": types.PortProto{Port: 80, Proto: u8proto.TCP},
+		},
+	}
+
+	namedPortsChanged, err := s.IPIdentityCache.Upsert(endpointIP, nil, 0, &meta, Identity{
+		ID:     identityPkg.ReservedIdentityUnmanaged,
+		Source: source.Kubernetes,
+	})
+	require.NoError(t, err)
+	require.False(t, namedPortsChanged)
+
+	npm := s.IPIdentityCache.GetNamedPorts()
+	require.Equal(t, []uint16{80}, getNamedPorts(npm, "http", u8proto.TCP, identityPkg.ReservedIdentityUnmanaged))
+
+	namedPortsChanged, err = s.IPIdentityCache.Upsert(endpointIP, nil, 0, &meta, Identity{
+		ID:     realIdentity,
+		Source: source.CustomResource,
+	})
+	require.NoError(t, err)
+	require.True(t, namedPortsChanged)
+
+	npm = s.IPIdentityCache.GetNamedPorts()
+	require.Empty(t, getNamedPorts(npm, "http", u8proto.TCP, identityPkg.ReservedIdentityUnmanaged))
+	require.Equal(t, []uint16{80}, getNamedPorts(npm, "http", u8proto.TCP, realIdentity))
 }
 
 func BenchmarkIPCacheUpsert10(b *testing.B) {
@@ -530,7 +629,7 @@ func benchmarkIPCacheUpsert(b *testing.B, num int) {
 		PodName:   "app",
 		NamedPorts: types.NamedPortMap{
 			"http": types.PortProto{Port: 80, Proto: u8proto.TCP},
-			"dns":  types.PortProto{Port: 53},
+			"dns":  types.PortProto{Port: 53, Proto: u8proto.UDP},
 		},
 	}
 
@@ -575,12 +674,26 @@ func benchmarkIPCacheUpsert(b *testing.B, num int) {
 
 type dummyListener struct {
 	entries map[string]identityPkg.NumericIdentity
+	events  []recordedChange
 	ipc     *IPCache
+}
+
+type recordedChange struct {
+	modType       CacheModification
+	cidrCluster   cmtypes.PrefixCluster
+	oldHostIP     net.IP
+	newHostIP     net.IP
+	oldID         *Identity
+	newID         Identity
+	encryptKey    uint8
+	k8sMeta       *K8sMetadata
+	endpointFlags uint8
 }
 
 func newDummyListener(ipc *IPCache) *dummyListener {
 	return &dummyListener{
-		ipc: ipc,
+		entries: make(map[string]identityPkg.NumericIdentity),
+		ipc:     ipc,
 	}
 }
 
@@ -594,6 +707,40 @@ func (dl *dummyListener) OnIPIdentityCacheChange(modType CacheModification,
 	default:
 		// Ignore, for simplicity we just clear the cache every time
 	}
+
+	var oldIDCopy *Identity
+	if oldID != nil {
+		copied := *oldID
+		oldIDCopy = &copied
+	}
+
+	var metaCopy *K8sMetadata
+	if k8sMeta != nil {
+		copied := *k8sMeta
+		metaCopy = &copied
+	}
+
+	dl.events = append(dl.events, recordedChange{
+		modType:       modType,
+		cidrCluster:   cidrCluster,
+		oldHostIP:     slices.Clone(oldHostIP),
+		newHostIP:     slices.Clone(newHostIP),
+		oldID:         oldIDCopy,
+		newID:         newID,
+		encryptKey:    encryptKey,
+		k8sMeta:       metaCopy,
+		endpointFlags: endpointFlags,
+	})
+}
+
+func upsertTestEntry(t *testing.T, ipc *IPCache, ip string, hostIP net.IP, hostKey uint8, k8sMeta *K8sMetadata, newIdentity Identity, endpointFlags uint8) {
+	t.Helper()
+
+	ipc.mutex.Lock()
+	defer ipc.mutex.Unlock()
+
+	_, err := ipc.upsertLocked(ip, hostIP, hostKey, k8sMeta, newIdentity, endpointFlags, false, false)
+	require.NoError(t, err)
 }
 
 func (dl *dummyListener) ExpectMapping(t *testing.T, targetIP string, targetIdentity identityPkg.NumericIdentity) {
@@ -655,4 +802,67 @@ func TestIPCacheShadowing(t *testing.T) {
 	ipc.Delete(endpointIP, source.KVStore)
 	_, exists := ipc.LookupByPrefix(cidrOverlap)
 	require.False(t, exists)
+}
+
+func TestIPCacheShadowedCIDRRevivalUsesCurrentAttributes(t *testing.T) {
+	t.Parallel()
+	s := setupIPCacheTestSuite(t)
+
+	const (
+		endpointKey   = uint8(7)
+		cidrKey       = uint8(9)
+		endpointFlags = uint8(0x1)
+		cidrFlags     = uint8(0x2)
+	)
+
+	endpointIP := "10.0.0.15"
+	cidrOverlap := "10.0.0.15/32"
+	endpointHostIP := net.ParseIP("192.0.2.10")
+	cidrHostIP := net.ParseIP("192.0.2.20")
+	endpointMeta := &K8sMetadata{
+		Namespace: "default",
+		PodName:   "pod-a",
+	}
+	cidrMeta := &K8sMetadata{
+		Namespace: "cidr-namespace",
+		PodName:   "cidr-entry",
+	}
+	endpointIdentity := Identity{
+		ID:     identityPkg.NumericIdentity(68),
+		Source: source.KVStore,
+	}
+	cidrIdentity := Identity{
+		ID:     identityPkg.NumericIdentity(202),
+		Source: source.Generated,
+	}
+
+	upsertTestEntry(t, s.IPIdentityCache, endpointIP, endpointHostIP, endpointKey, endpointMeta, endpointIdentity, endpointFlags)
+	upsertTestEntry(t, s.IPIdentityCache, cidrOverlap, cidrHostIP, cidrKey, cidrMeta, cidrIdentity, cidrFlags)
+
+	lookedUpIdentity, exists := s.IPIdentityCache.LookupByPrefix(cidrOverlap)
+	require.True(t, exists)
+	require.Equal(t, endpointIdentity.ID, lookedUpIdentity.ID)
+
+	listener := newDummyListener(s.IPIdentityCache)
+	s.IPIdentityCache.AddListener(listener)
+	listener.events = nil
+
+	s.IPIdentityCache.Delete(endpointIP, source.KVStore)
+
+	lookedUpIdentity, exists = s.IPIdentityCache.LookupByPrefix(cidrOverlap)
+	require.True(t, exists)
+	require.Equal(t, cidrIdentity.ID, lookedUpIdentity.ID)
+
+	require.Len(t, listener.events, 1)
+	event := listener.events[0]
+	require.Equal(t, Upsert, event.modType)
+	require.Equal(t, cidrOverlap, event.cidrCluster.String())
+	require.NotNil(t, event.oldID)
+	require.Equal(t, endpointIdentity.ID, event.oldID.ID)
+	require.Equal(t, cidrIdentity.ID, event.newID.ID)
+	require.True(t, endpointHostIP.Equal(event.oldHostIP))
+	require.True(t, cidrHostIP.Equal(event.newHostIP))
+	require.Equal(t, cidrKey, event.encryptKey)
+	require.Equal(t, cidrMeta, event.k8sMeta)
+	require.Equal(t, cidrFlags, event.endpointFlags)
 }

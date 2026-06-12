@@ -5,6 +5,7 @@ package utils
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"testing"
 
@@ -116,66 +117,102 @@ func TestEndpointSlices(t *testing.T) {
 	tests := []struct {
 		name                    string
 		includeHeadlessServices bool
+		k8sServiceProxy         string
 		want                    []string
 	}{
 		{
-			name:                    "Headless services are included",
+			name:                    "Headless services are included, proxy is foo",
 			includeHeadlessServices: true,
-			want:                    []string{"test-svc-1", "test-svc-3"},
+			k8sServiceProxy:         "foo",
+			want:                    []string{"test-svc-1", "test-svc-4"},
 		},
 		{
-			name:                    "Headless services are excluded",
+			name:                    "Headless services are included, no proxy",
+			includeHeadlessServices: true,
+			k8sServiceProxy:         "",
+			want:                    []string{"test-svc-3", "test-svc-5"},
+		},
+		{
+			name:                    "Headless services are excluded, proxy is foo",
 			includeHeadlessServices: false,
+			k8sServiceProxy:         "foo",
 			want:                    []string{"test-svc-1"},
+		},
+		{
+			name:                    "Headless services are excluded, no proxy",
+			includeHeadlessServices: false,
+			k8sServiceProxy:         "",
+			want:                    []string{"test-svc-3"},
 		},
 	}
 
 	client := fake.NewSimpleClientset()
+	// test-svc-1: proxy=foo, not headless, not remote -> matches proxy=foo
 	meta1 := &metav1.ObjectMeta{
-		Name:   "test-svc-1",
-		Labels: map[string]string{},
+		Name: "test-svc-1",
+		Labels: map[string]string{
+			serviceProxyNameLabel: "foo",
+		},
 	}
+	// test-svc-2: proxy=bar -> never matches (handled by another proxy)
 	meta2 := &metav1.ObjectMeta{
 		Name: "test-svc-2",
 		Labels: map[string]string{
-			discoveryv1.LabelManagedBy: EndpointSliceMeshControllerName,
+			serviceProxyNameLabel: "bar",
 		},
 	}
+	// test-svc-3: no proxy label, not headless -> matches empty proxy
 	meta3 := &metav1.ObjectMeta{
-		Name: "test-svc-3",
+		Name:   "test-svc-3",
+		Labels: map[string]string{},
+	}
+	// test-svc-4: proxy=foo, headless -> matches when includeHeadlessServices
+	meta4 := &metav1.ObjectMeta{
+		Name: "test-svc-4",
+		Labels: map[string]string{
+			serviceProxyNameLabel:    "foo",
+			corev1.IsHeadlessService: "",
+		},
+	}
+	// test-svc-5: no proxy label, headless -> matches empty proxy when includeHeadlessServices
+	meta5 := &metav1.ObjectMeta{
+		Name: "test-svc-5",
 		Labels: map[string]string{
 			corev1.IsHeadlessService: "",
 		},
 	}
-	meta4 := &metav1.ObjectMeta{
-		Name: "test-svc-4",
+	// test-svc-6: remote clustermesh slice -> never matches
+	meta6 := &metav1.ObjectMeta{
+		Name: "test-svc-6",
+		Labels: map[string]string{
+			discoveryv1.LabelManagedBy: EndpointSliceMeshControllerName,
+		},
+	}
+	// test-svc-7: remote clustermesh slice, headless -> never matches
+	meta7 := &metav1.ObjectMeta{
+		Name: "test-svc-7",
 		Labels: map[string]string{
 			corev1.IsHeadlessService:   "",
 			discoveryv1.LabelManagedBy: EndpointSliceMeshControllerName,
 		},
 	}
 
-	for _, meta := range []*metav1.ObjectMeta{meta1, meta2, meta3, meta4} {
-		ep := &corev1.Endpoints{ObjectMeta: *meta}
-		_, err := client.CoreV1().Endpoints("test-ns").Create(context.TODO(), ep, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatalf("Failed to create endpoint %v: %s", ep, err)
-		}
+	for _, meta := range []*metav1.ObjectMeta{meta1, meta2, meta3, meta4, meta5, meta6, meta7} {
 		epSlice := &discoveryv1.EndpointSlice{ObjectMeta: *meta}
-		_, err = client.DiscoveryV1().EndpointSlices("test-ns").Create(context.TODO(), epSlice, metav1.CreateOptions{})
+		_, err := client.DiscoveryV1().EndpointSlices("test-ns").Create(context.TODO(), epSlice, metav1.CreateOptions{})
 		if err != nil {
-			t.Fatalf("Failed to create endpoint slice %v: %s", ep, err)
+			t.Fatalf("Failed to create endpoint slice %v: %s", epSlice, err)
 		}
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			optMod, _ := GetEndpointSliceListOptionsModifier(tt.includeHeadlessServices)
+			optMod, _ := GetEndpointSliceListOptionsModifier(tt.k8sServiceProxy, tt.includeHeadlessServices)
 			options := metav1.ListOptions{}
 			optMod(&options)
 			epSlices, err := client.DiscoveryV1().EndpointSlices("test-ns").List(context.TODO(), options)
 			if err != nil {
-				t.Fatalf("Failed to list services: %s", err)
+				t.Fatalf("Failed to list endpoint slices: %s", err)
 			}
 
 			got := make([]string, len(epSlices.Items))
@@ -430,11 +467,12 @@ func TestSanitizePodLabels(t *testing.T) {
 	namespaceLabelKey := "wow-very-key"
 	namespaceMetaLabelKey := joinPath(k8sconst.PodNamespaceMetaLabels, namespaceLabelKey)
 	testedLabels := map[string]string{
-		k8sconst.PodNamespaceLabel:         "fake-namespace",
-		k8sconst.PolicyLabelServiceAccount: "fake-sa",
-		k8sconst.PolicyLabelCluster:        "fake-cluster-name",
-		namespaceMetaLabelKey:              "fake-namespace-label-val",
-		k8sconst.PodNameLabel:              "fake-pod-name",
+		k8sconst.PodNamespaceLabel:           "fake-namespace",
+		k8sconst.PolicyLabelServiceAccount:   "fake-sa",
+		k8sconst.PolicyLabelCluster:          "fake-cluster-name",
+		k8sconst.NamedPortsIdentityLabelName: "fake-named-ports",
+		namespaceMetaLabelKey:                "fake-namespace-label-val",
+		k8sconst.PodNameLabel:                "fake-pod-name",
 	}
 	trueNamespace := "true-namespace"
 	trueSA := "true-sa"
@@ -490,9 +528,12 @@ func TestSanitizePodLabels(t *testing.T) {
 
 func TestStripPodLabels(t *testing.T) {
 	tests := []struct {
-		name   string
-		labels map[string]string
-		want   map[string]string
+		name string
+
+		labels             map[string]string
+		additionalPrefixes []string
+
+		want map[string]string
 	}{
 		{
 			name: "no stripped labels",
@@ -506,9 +547,10 @@ func TestStripPodLabels(t *testing.T) {
 		{
 			name: "Cilium owned label",
 			labels: map[string]string{
-				"app":                            "foo",
-				"io.cilium.k8s.policy.namespace": "kube-system",
-				"io.cilium.k8s.something":        "cilium internal",
+				"app":                                        "foo",
+				"io.cilium.k8s.policy.namespace":             "kube-system",
+				"io.cilium.k8s.something":                    "cilium internal",
+				"io.cilium.k8s.named-ports":                  "http=80",
 				"io.cilium.k8s.namespace.labels.foo.bar/baz": "foobar",
 			},
 			want: map[string]string{
@@ -525,10 +567,38 @@ func TestStripPodLabels(t *testing.T) {
 				"app": "foo",
 			},
 		},
+		{
+			name: "Additional owned prefixes unset",
+			labels: map[string]string{
+				"corp.acme.vendor-feature": "qux",
+				"io.cilium.k8s.something":  "cilium internal",
+			},
+			want: map[string]string{
+				"corp.acme.vendor-feature": "qux",
+			},
+		},
+		{
+			name: "Additional owned prefixes provided",
+			labels: map[string]string{
+				"app":                      "foo",
+				"io.cilium.k8s.something":  "cilium internal",
+				"corp.acme.vendor-feature": "qux",
+			},
+			additionalPrefixes: []string{
+				"corp.acme",
+			},
+			want: map[string]string{
+				"app": "foo",
+			},
+		},
 	}
 
+	original := slices.Clone(CiliumOwnedLabelPrefixes)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			CiliumOwnedLabelPrefixes = tt.additionalPrefixes
+			defer func() { CiliumOwnedLabelPrefixes = original }()
+
 			got := StripPodSpecialLabels(tt.labels)
 			assert.Equal(t, tt.want, got)
 		})

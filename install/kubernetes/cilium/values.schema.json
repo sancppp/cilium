@@ -768,6 +768,9 @@
           },
           "type": "object"
         },
+        "enforceCAValidityThroughoutLeavesDuration": {
+          "type": "boolean"
+        },
         "extraVolumeMounts": {
           "items": {},
           "type": "array"
@@ -1398,17 +1401,6 @@
             },
             "tls": {
               "properties": {
-                "admin": {
-                  "properties": {
-                    "cert": {
-                      "type": "string"
-                    },
-                    "key": {
-                      "type": "string"
-                    }
-                  },
-                  "type": "object"
-                },
                 "authMode": {
                   "type": "string"
                 },
@@ -1425,39 +1417,28 @@
                     },
                     "method": {
                       "type": "string"
-                    }
-                  },
-                  "type": "object"
-                },
-                "enableSecrets": {
-                  "type": "boolean"
-                },
-                "remote": {
-                  "properties": {
-                    "cert": {
+                    },
+                    "privateKey": {
+                      "type": "object"
+                    },
+                    "schedule": {
                       "type": "string"
                     },
-                    "key": {
-                      "type": "string"
-                    }
-                  },
-                  "type": "object"
-                },
-                "server": {
-                  "properties": {
-                    "cert": {
-                      "type": "string"
+                    "server": {
+                      "properties": {
+                        "extraDnsNames": {
+                          "items": {},
+                          "type": "array"
+                        },
+                        "extraIpAddresses": {
+                          "items": {},
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
                     },
-                    "extraDnsNames": {
-                      "items": {},
-                      "type": "array"
-                    },
-                    "extraIpAddresses": {
-                      "items": {},
-                      "type": "array"
-                    },
-                    "key": {
-                      "type": "string"
+                    "subject": {
+                      "type": "object"
                     }
                   },
                   "type": "object"
@@ -1799,6 +1780,17 @@
       },
       "type": "object"
     },
+    "datapathPlugins": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "stateDir": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "debug": {
       "properties": {
         "enabled": {
@@ -1821,6 +1813,13 @@
     },
     "defaultLBServiceIPAM": {
       "type": "string"
+    },
+    "devices": {
+      "type": [
+        "null",
+        "string",
+        "array"
+      ]
     },
     "directRoutingSkipUnreachable": {
       "type": "boolean"
@@ -1923,9 +1922,6 @@
         },
         "ipsec": {
           "properties": {
-            "encryptedOverlay": {
-              "type": "boolean"
-            },
             "interface": {
               "type": "string"
             },
@@ -1952,12 +1948,6 @@
         },
         "strictMode": {
           "properties": {
-            "allowRemoteNodeIdentities": {
-              "type": "boolean"
-            },
-            "cidr": {
-              "type": "string"
-            },
             "egress": {
               "properties": {
                 "allowRemoteNodeIdentities": {
@@ -1971,9 +1961,6 @@
                 }
               },
               "type": "object"
-            },
-            "enabled": {
-              "type": "boolean"
             },
             "ingress": {
               "properties": {
@@ -2003,6 +1990,17 @@
               "type": "object"
             },
             "annotations": {
+              "type": "object"
+            },
+            "ca": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "spire",
+                    "internal"
+                  ]
+                }
+              },
               "type": "object"
             },
             "caAddress": {
@@ -2048,6 +2046,9 @@
                 }
               },
               "type": "object"
+            },
+            "minReadySeconds": {
+              "type": "integer"
             },
             "nodeSelector": {
               "properties": {
@@ -2418,6 +2419,9 @@
         "clusterMaxConnections": {
           "type": "integer"
         },
+        "clusterMaxPendingRequests": {
+          "type": "integer"
+        },
         "clusterMaxRequests": {
           "type": "integer"
         },
@@ -2598,6 +2602,9 @@
           "type": "integer"
         },
         "maxRequestsPerConnection": {
+          "type": "integer"
+        },
+        "minReadySeconds": {
           "type": "integer"
         },
         "nodeLocality": {
@@ -2948,7 +2955,10 @@
         "gatewayClass": {
           "properties": {
             "create": {
-              "type": "string"
+              "type": [
+                "boolean",
+                "string"
+              ]
             }
           },
           "type": "object"
@@ -2982,6 +2992,12 @@
             }
           },
           "type": "object"
+        },
+        "useRemoteAddress": {
+          "type": [
+            "null",
+            "boolean"
+          ]
         },
         "xffNumTrustedHops": {
           "type": "integer"
@@ -3831,8 +3847,14 @@
                 "method": {
                   "type": "string"
                 },
+                "privateKey": {
+                  "type": "object"
+                },
                 "schedule": {
                   "type": "string"
+                },
+                "subject": {
+                  "type": "object"
                 }
               },
               "type": "object"
@@ -4413,6 +4435,15 @@
             }
           },
           "type": "object"
+        },
+        "useRemoteAddress": {
+          "type": [
+            "null",
+            "boolean"
+          ]
+        },
+        "xffNumTrustedHops": {
+          "type": "integer"
         }
       },
       "type": "object"
@@ -4554,6 +4585,12 @@
     },
     "k8s": {
       "properties": {
+        "apiServerURLs": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
         "requireIPv4PodCIDR": {
           "type": "boolean"
         },
@@ -4704,7 +4741,7 @@
         "enabled": {
           "type": "boolean"
         },
-        "interface": {
+        "interfacePattern": {
           "type": "string"
         }
       },
@@ -4775,6 +4812,9 @@
     },
     "maglev": {
       "type": "object"
+    },
+    "minReadySeconds": {
+      "type": "integer"
     },
     "monitor": {
       "properties": {
@@ -4909,6 +4949,9 @@
             }
           },
           "type": "object"
+        },
+        "minReadySeconds": {
+          "type": "integer"
         },
         "nodeSelector": {
           "properties": {
@@ -5576,6 +5619,9 @@
       },
       "type": "object"
     },
+    "preferIpv6": {
+      "type": "boolean"
+    },
     "preflight": {
       "properties": {
         "affinity": {
@@ -5762,9 +5808,6 @@
         },
         "terminationGracePeriodSeconds": {
           "type": "integer"
-        },
-        "tofqdnsPreCache": {
-          "type": "string"
         },
         "tolerations": {
           "items": {
@@ -6374,6 +6417,9 @@
             }
           },
           "type": "object"
+        },
+        "minReadySeconds": {
+          "type": "integer"
         },
         "nodeSelector": {
           "properties": {

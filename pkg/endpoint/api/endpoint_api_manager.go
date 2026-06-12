@@ -27,6 +27,7 @@ import (
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	endpointmetadata "github.com/cilium/cilium/pkg/endpoint/metadata"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/ipam"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -184,6 +185,10 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 			return invalidDataError(ep, fmt.Errorf("not allowed to add reserved labels: %s", lbls))
 		}
 
+		if apiLabels.IsGenerated() {
+			return invalidDataError(ep, fmt.Errorf("not allowed to add generated labels: %s", apiLabels))
+		}
+
 		apiLabels, _ = labelsfilter.Filter(apiLabels)
 		if len(apiLabels) == 0 {
 			return invalidDataError(ep, fmt.Errorf("no valid labels provided"))
@@ -230,7 +235,7 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 			ep.Logger("api").Warn("Unable to fetch kubernetes labels", logfields.Error, err)
 		} else {
 			ep.SetPod(pod)
-			ep.SetK8sMetadata(k8sMetadata.ContainerPorts)
+			ep.SetK8sMetadata(k8sMetadata.NamedPorts)
 			identityLbls.MergeLabels(k8sMetadata.IdentityLabels)
 			infoLabels.MergeLabels(k8sMetadata.InfoLabels)
 			if _, ok := pod.Annotations[bandwidth.IngressBandwidth]; ok && !m.bandwidthManager.Enabled() {
@@ -261,7 +266,7 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 
 			if tid, ok := pod.Annotations[annotation.FIBTableID]; option.Config.EnableFibTableIDAnnotation && ok {
 				if tidInt, err := strconv.ParseUint(tid, 10, 32); err == nil {
-					ep.SetFibTableID(uint32(tidInt))
+					ep.SetRTInfo(uint32(tidInt), endpointtypes.RTInfoFIB)
 				} else {
 					m.logger.Warn("Unable to parse fib-table-id annotation as uint32, pod will use default routing table.",
 						logfields.K8sPodName, epTemplate.K8sPodName,
@@ -361,13 +366,14 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 // testing purposes.
 var handleOutdatedPodInformerRetryPeriod = 100 * time.Millisecond
 
+// handleOutdatedPodInformer is only used when creating new Endpoints, never for restored endpoints!
 func (m *endpointAPIManager) handleOutdatedPodInformer(ctx context.Context, ep *endpoint.Endpoint) (pod *slim_corev1.Pod, k8sMetadata *endpoint.K8sMetadata, err error) {
 	var once sync.Once
 
 	// Average attempt is every 100ms.
 	err = resiliency.Retry(ctx, handleOutdatedPodInformerRetryPeriod, 20, func(_ context.Context, _ int) (bool, error) {
 		var err2 error
-		pod, k8sMetadata, err2 = m.endpointMetadata.FetchK8sMetadataForEndpoint(ep.K8sNamespace, ep.K8sPodName, ep.K8sUID)
+		pod, k8sMetadata, err2 = m.endpointMetadata.FetchK8sMetadataForEndpoint(ep.K8sNamespace, ep.K8sPodName, ep.K8sUID, true)
 		if ep.K8sUID == "" {
 			// If the CNI did not set the UID, then don't retry and just exit
 			// out of the loop to proceed as normal.

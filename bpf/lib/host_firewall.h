@@ -18,10 +18,38 @@
 #include "proxy.h"
 #include "trace.h"
 
+static __always_inline bool
+need_apply_host_policy_egress(bool is_host_id, bool is_from_proxy)
+{
+	/* Some pod-originating traffic may have a host IP as source IP
+	 * (eg. non-transparent proxy connection, or when using iptables masquerading).
+	 * The response packet will therefore have a host IP as the destination IP.
+	 *
+	 * We don't want to apply egress policy for such packets. But
+	 * to avoid enforcing host policies for response packets to pods, we
+	 * need to create a CT entry for the forward, SNATed packet from the
+	 * pod. Response packets will thus match this CT entry and bypass host
+	 * policies.
+	 * We know the packet is a SNATed packet if the srcid from ipcache is
+	 * HOST_ID, but the actual srcid (derived from the packet mark) isn't.
+	 */
+	if (!is_host_id)
+		return false;
+
+	/* Host packets sent by proxy in response to host requests have had host policy
+	 * already applied to them. We don't want to apply host policy to them again,
+	 * as it creates redirect loops and prevents responses from reaching the proxy.
+	 */
+	if (is_from_proxy)
+		return false;
+
+	return true;
+}
+
 # ifdef ENABLE_IPV6
 static __always_inline bool
-ipv6_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_sec_identity,
-			       __u32 ipcache_srcid, struct ipv6hdr *ip6,
+ipv6_host_policy_egress_lookup(const struct __ctx_buff *ctx, __u32 src_sec_identity,
+			       __u32 ipcache_srcid, const struct ipv6hdr *ip6,
 			       struct ct_buffer6 *ct_buffer)
 {
 	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
@@ -54,11 +82,11 @@ ipv6_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_sec_identity,
 }
 
 static __always_inline int
-__ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
-			  struct ipv6hdr *ip6, struct ct_buffer6 *ct_buffer,
+__ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id, bool is_from_proxy,
+			  const struct ipv6hdr *ip6, const struct ct_buffer6 *ct_buffer,
 			  struct trace_ctx *trace, __s8 *ext_err)
 {
-	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+	const struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
 	int ret = ct_buffer->ret;
 	int verdict = CTX_ACT_OK;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
@@ -67,6 +95,7 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 	__u32 dst_sec_identity = 0;
 	__u16 proxy_port = 0;
 	__u32 cookie = 0;
+	bool apply_policy;
 
 	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
@@ -75,7 +104,8 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 	if (ret == CT_REPLY || ret == CT_RELATED)
 		return CTX_ACT_OK;
 
-	if (is_host_id) {
+	apply_policy = need_apply_host_policy_egress(is_host_id, is_from_proxy);
+	if (apply_policy) {
 		const struct remote_endpoint_info *info;
 		__u32 tunnel_endpoint = 0;
 
@@ -118,7 +148,7 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 			return ret;
 	}
 
-	if (is_host_id) {
+	if (apply_policy) {
 		/* Emit verdict if drop or if allow for CT_NEW. */
 		if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
 			send_policy_verdict_notify(ctx, dst_sec_identity, tuple->dport,
@@ -139,8 +169,8 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 }
 
 static __always_inline int
-ipv6_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
-			__u32 ipcache_srcid, struct ipv6hdr *ip6,
+ipv6_host_policy_egress(struct __ctx_buff *ctx,  bool is_from_proxy, __u32 src_id,
+			__u32 ipcache_srcid, const struct ipv6hdr *ip6,
 			struct trace_ctx *trace, __s8 *ext_err)
 {
 	struct ct_buffer6 ct_buffer = {};
@@ -150,12 +180,12 @@ ipv6_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
 	if (ct_buffer.ret < 0)
 		return ct_buffer.ret;
 
-	return __ipv6_host_policy_egress(ctx, src_id == HOST_ID,
+	return __ipv6_host_policy_egress(ctx, src_id == HOST_ID, is_from_proxy,
 					ip6, &ct_buffer, trace, ext_err);
 }
 
 static __always_inline bool
-ipv6_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
+ipv6_host_policy_ingress_lookup(const struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 				struct ct_buffer6 *ct_buffer)
 {
 	__u32 dst_sec_identity = WORLD_IPV6_ID;
@@ -194,11 +224,11 @@ ipv6_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 }
 
 static __always_inline int
-__ipv6_host_policy_ingress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
-			   struct ct_buffer6 *ct_buffer, __u32 *src_sec_identity,
+__ipv6_host_policy_ingress(struct __ctx_buff *ctx, const struct ipv6hdr *ip6,
+			   const struct ct_buffer6 *ct_buffer, __u32 *src_sec_identity,
 			   struct trace_ctx *trace, __s8 *ext_err)
 {
-	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+	const struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
 	__u32 tunnel_endpoint = 0;
 	int ret = ct_buffer->ret;
 	int verdict = CTX_ACT_OK;
@@ -298,8 +328,8 @@ ipv6_host_policy_ingress(struct __ctx_buff *ctx, __u32 *src_sec_identity,
 
 # ifdef ENABLE_IPV4
 static __always_inline bool
-ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_sec_identity,
-			       __u32 ipcache_srcid, struct iphdr *ip4,
+ipv4_host_policy_egress_lookup(const struct __ctx_buff *ctx, __u32 src_sec_identity,
+			       __u32 ipcache_srcid, const struct iphdr *ip4,
 			       struct ct_buffer4 *ct_buffer)
 {
 	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
@@ -324,11 +354,11 @@ ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_sec_identity,
 }
 
 static __always_inline int
-__ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
-			  struct iphdr *ip4, struct ct_buffer4 *ct_buffer,
+__ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id, bool is_from_proxy,
+			  const struct iphdr *ip4, const struct ct_buffer4 *ct_buffer,
 			  struct trace_ctx *trace, __s8 *ext_err)
 {
-	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+	const struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
 	int ret = ct_buffer->ret;
 	int verdict = CTX_ACT_OK;
 	__u8 policy_match_type = POLICY_MATCH_NONE;
@@ -337,6 +367,7 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 	__u32 dst_sec_identity = 0;
 	__u16 proxy_port = 0;
 	__u32 cookie = 0;
+	bool apply_policy;
 
 	trace->monitor = ct_buffer->monitor;
 	trace->reason = (enum trace_reason)ret;
@@ -345,20 +376,8 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 	if (ret == CT_REPLY || ret == CT_RELATED)
 		return CTX_ACT_OK;
 
-	/* Some pod-originating traffic may have a host IP as source IP
-	 * (eg. non-transparent proxy connection, or when using iptables masquerading).
-	 * The response packet will therefore have a host IP as the destination IP.
-	 *
-	 * We don't want to apply egress policy for such packets. But
-	 * to avoid enforcing host policies for response packets to pods, we
-	 * need to create a CT entry for the forward, SNATed packet from the
-	 * pod. Response packets will thus match this CT entry and bypass host
-	 * policies.
-	 * We know the packet is a SNATed packet if the srcid from ipcache is
-	 * HOST_ID, but the actual srcid (derived from the packet mark) isn't.
-	 */
-
-	if (is_host_id) {
+	apply_policy = need_apply_host_policy_egress(is_host_id, is_from_proxy);
+	if (apply_policy) {
 		const struct remote_endpoint_info *info;
 		__u32 tunnel_endpoint = 0;
 
@@ -401,7 +420,7 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 			return ret;
 	}
 
-	if (is_host_id) {
+	if (apply_policy) {
 		/* Emit verdict if drop or if allow for CT_NEW. */
 		if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
 			send_policy_verdict_notify(ctx, dst_sec_identity, tuple->dport,
@@ -422,8 +441,8 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id,
 }
 
 static __always_inline int
-ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
-			__u32 ipcache_srcid, struct iphdr *ip4,
+ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_from_proxy, __u32 src_id,
+			__u32 ipcache_srcid, const struct iphdr *ip4,
 			struct trace_ctx *trace, __s8 *ext_err)
 {
 	struct ct_buffer4 ct_buffer = {};
@@ -433,11 +452,12 @@ ipv4_host_policy_egress(struct __ctx_buff *ctx, __u32 src_id,
 	if (ct_buffer.ret < 0)
 		return ct_buffer.ret;
 
-	return __ipv4_host_policy_egress(ctx, src_id == HOST_ID, ip4, &ct_buffer, trace, ext_err);
+	return __ipv4_host_policy_egress(ctx, src_id == HOST_ID, is_from_proxy,
+					ip4, &ct_buffer, trace, ext_err);
 }
 
 static __always_inline bool
-ipv4_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct iphdr *ip4,
+ipv4_host_policy_ingress_lookup(const struct __ctx_buff *ctx, const struct iphdr *ip4,
 				struct ct_buffer4 *ct_buffer)
 {
 	__u32 dst_sec_identity = WORLD_IPV4_ID;
@@ -468,11 +488,11 @@ ipv4_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct iphdr *ip4,
 }
 
 static __always_inline int
-__ipv4_host_policy_ingress(struct __ctx_buff *ctx, struct iphdr *ip4,
-			   struct ct_buffer4 *ct_buffer, __u32 *src_sec_identity,
+__ipv4_host_policy_ingress(struct __ctx_buff *ctx, const struct iphdr *ip4,
+			   const struct ct_buffer4 *ct_buffer, __u32 *src_sec_identity,
 			   struct trace_ctx *trace, __s8 *ext_err)
 {
-	struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
+	const struct ipv4_ct_tuple *tuple = &ct_buffer->tuple;
 	__u32 tunnel_endpoint = 0;
 	int ret = ct_buffer->ret;
 	int verdict = CTX_ACT_OK;

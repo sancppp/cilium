@@ -212,7 +212,6 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *config.Config) erro
 
 	cDefinesMap["LB6_REVERSE_NAT_SK_MAP_SIZE"] = fmt.Sprintf("%d", cfg.LBConfig.LBSockRevNatEntries)
 	cDefinesMap["LB4_REVERSE_NAT_SK_MAP_SIZE"] = fmt.Sprintf("%d", cfg.LBConfig.LBSockRevNatEntries)
-	cDefinesMap["MTU"] = fmt.Sprintf("%d", cfg.DeviceMTU)
 
 	// --- WARNING: THIS CONFIGURATION METHOD IS DEPRECATED, SEE FUNCTION DOC ---
 
@@ -413,16 +412,10 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *config.Config) erro
 					break
 				}
 			}
-			if ipv4 == 0 {
-				return fmt.Errorf("IPv4 direct routing device IP not found")
-			}
 			cDefinesMap["IPV4_DIRECT_ROUTING"] = fmt.Sprintf("%d", ipv4)
 		}
 		if option.Config.EnableIPv6 {
 			ip := preferredIPv6Address(drd.Addrs)
-			if ip.IsUnspecified() {
-				return fmt.Errorf("IPv6 direct routing device IP not found")
-			}
 			extraMacrosMap["IPV6_DIRECT_ROUTING"] = ip.String()
 			fw.WriteString(FmtDefineAddress("IPV6_DIRECT_ROUTING", ip.AsSlice()))
 		}
@@ -650,10 +643,6 @@ return false;`))
 
 func (h *HeaderfileWriter) writeNetdevConfig(w io.Writer, opts *option.IntOptions) {
 	fmt.Fprint(w, opts.GetFmtList())
-
-	if option.Config.EnableEndpointRoutes {
-		fmt.Fprint(w, "#define USE_BPF_PROG_FOR_INGRESS_POLICY 1\n")
-	}
 }
 
 // WriteNetdevConfig writes the BPF configuration for the endpoint to a writer.
@@ -673,10 +662,6 @@ func (h *HeaderfileWriter) WriteEndpointConfig(w io.Writer, e endpoint.Config) e
 }
 
 func (h *HeaderfileWriter) writeTemplateConfig(fw *bufio.Writer, e endpoint.Config) error {
-	if e.RequireEgressProg() {
-		fmt.Fprintf(fw, "#define USE_BPF_PROG_FOR_INGRESS_POLICY 1\n")
-	}
-
 	if e.RequireRouting() {
 		fmt.Fprintf(fw, "#define ENABLE_ROUTING 1\n")
 	}

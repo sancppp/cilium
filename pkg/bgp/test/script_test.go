@@ -32,6 +32,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	envoyCfg "github.com/cilium/cilium/pkg/envoy/config"
 	"github.com/cilium/cilium/pkg/hive"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/lbipamconfig"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -86,7 +87,6 @@ func TestPrivilegedScript(t *testing.T) {
 
 	setup := func(t testing.TB, args []string) *script.Engine {
 		var err error
-		var bgpMgr agent.BGPRouterManager
 		var lbWriter *writer.Writer
 
 		// parse the shebang arguments in the script
@@ -126,7 +126,7 @@ func TestPrivilegedScript(t *testing.T) {
 			// Dependencies
 			k8sClient.FakeClientCell(),
 			daemonk8s.ResourcesCell,
-			daemonk8s.TablesCell,
+			k8sTables.TablesCell,
 			node.LocalNodeStoreTestCell,
 			cell.Config(envoyCfg.SecretSyncConfig{}),
 
@@ -159,7 +159,6 @@ func TestPrivilegedScript(t *testing.T) {
 				},
 			),
 			cell.Invoke(func(m agent.BGPRouterManager) {
-				bgpMgr = m
 				m.(*manager.BGPRouterManager).DestroyRouterOnStop(true) // fully destroy GoBGP server on Stop()
 			}),
 			cell.Invoke(func(w *writer.Writer) {
@@ -204,7 +203,6 @@ func TestPrivilegedScript(t *testing.T) {
 		require.NoError(t, err, "ScriptCommands")
 		maps.Insert(cmds, maps.All(script.DefaultCmds()))
 		maps.Insert(cmds, maps.All(commands.GoBGPScriptCmds(gobgpCmdCtx)))
-		maps.Insert(cmds, maps.All(commands.BGPScriptCmds(bgpMgr)))
 		maps.Insert(cmds, maps.All(commands.SvcScriptCmds(lbWriter)))
 
 		return &script.Engine{

@@ -713,6 +713,144 @@ of whether you have configured the routing mode to route traffic using Geneve
                  k8sServiceHost=${API_SERVER_IP}
                  k8sServicePort=${API_SERVER_PORT}
 
+.. _DSR mode with IPIP:
+
+Direct Server Return (DSR) with IPIP
+************************************
+Cilium offers a third DSR dispatch mode, DSR with IPIP, which encapsulates the
+LoadBalancer traffic towards the backend in a plain IPIP (IPv4-in-IPv4) or
+IP6IP6 (IPv6-in-IPv6) tunnel. On the load balancing node, the original client
+packet (with the destination still set to the service IP/port) becomes the inner
+payload. Cilium then adds an outer IP header whose source is the load
+balancing node and whose destination is the IP address of the selected backend
+Pod. The encapsulated packet is routed to the node hosting that Pod, where Cilium
+terminates the tunnel, strips the outer header, DNATs and delivers the inner
+packet to the backend Pod identified by the outer destination address.
+
+Compared to :ref:`DSR mode with Geneve`, the IPIP dispatch does not rely on a
+Geneve option to transport the service IP/port to the backend, and compared to
+the IPv4 option / IPv6 extension header dispatch it avoids the Cilium-specific IP
+options that some network fabrics drop (plus IP options do not work well with GRO).
+This makes DSR with IPIP a robust choice in environments where the other dispatch
+methods experience connectivity issues.
+
+It requires Cilium to be deployed in :ref:`arch_direct_routing`, it will not
+work in :ref:`arch_overlay` mode.
+
+.. note::
+
+    When using the IPIP dispatch, the service frontend port must be equal to the
+    backend (target) port given IPIP does not carry port information unlike Geneve.
+    In the service example below this is the reason why ``port`` and ``targetPort``
+    are both set to ``80``. Matching frontend and backend ports is generally a
+    prerequisite when using IPIP for DSR.
+
+The Helm example configuration below keeps the global default forwarding mode as
+SNAT (``loadBalancer.mode=snat``) and opts into DSR IPIP on a per-service basis
+through the ``service.cilium.io/forwarding-mode: dsr`` annotation. As described
+in `Annotation-based DSR and SNAT Mode`_, this requires
+``bpf.lbModeAnnotation=true`` together with an explicit
+``loadBalancer.dsrDispatch=ipip`` to define how the per-service DSR packets are
+dispatched to backends. The example additionally opts into annotation-based load
+balancing algorithm selection (``bpf.lbAlgorithmAnnotation=true``) so that the
+``service.cilium.io/lb-algorithm`` annotation shown further below takes effect.
+Selecting ``loadBalancer.dsrDispatch=ipip`` automatically enables the inbound IPIP
+termination on the backend nodes (stripping the outer header and delivering the
+inner packet to the local backend Pod), so no additional setting is required:
+
+.. cilium-helm-install::
+   :namespace: kube-system
+   :set: routingMode=native
+         kubeProxyReplacement=true
+         loadBalancer.mode=snat
+         loadBalancer.dsrDispatch=ipip
+         bpf.lbModeAnnotation=true
+         bpf.lbAlgorithmAnnotation=true
+         k8sServiceHost=${API_SERVER_IP}
+         k8sServicePort=${API_SERVER_PORT}
+
+The following example deploys an nginx web server as the backend and exposes it
+through a ``LoadBalancer`` service. In this example we expose the service only
+to certain load-balancing nodes (see also `Selective Service Node Exposure`_):
+
+.. code-block:: shell-session
+
+  $ kubectl label node node_name service.cilium.io/node=beefy
+
+Deploy the nginx backend:
+
+.. code-block:: yaml
+
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: nginx
+  spec:
+    replicas: 2
+    selector:
+      matchLabels:
+        app: nginx
+    template:
+      metadata:
+        labels:
+          app: nginx
+      spec:
+        containers:
+          - name: nginx
+            image: nginx:1.25.1
+            ports:
+              - containerPort: 80
+
+Then expose it through a ``LoadBalancer`` service which selects the DSR
+forwarding mode, the Maglev load balancing algorithm and the node exposure via
+annotations:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: nginx
+    annotations:
+      service.cilium.io/type: LoadBalancer
+      service.cilium.io/forwarding-mode: dsr
+      service.cilium.io/lb-algorithm: maglev
+      service.cilium.io/node: beefy
+  spec:
+    selector:
+      app: nginx
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+
+With this in place, the service is only installed as type ``LoadBalancer`` on
+nodes labeled with ``service.cilium.io/node=beefy``, requests are distributed to
+the nginx backends using Maglev consistent hashing, and the packets are
+dispatched to the backend node using IPIP encapsulation. The backends reply
+directly to the client without traversing the load balancing node again.
+
+.. note::
+
+    With DSR the backend node is itself part of the service handling: it
+    terminates the inbound IPIP traffic and rewrites the reply so that it is
+    sourced from the service address and returned directly to the client. This
+    requires the service to be present on the backend node. Therefore, when DSR
+    IPIP is combined with `Selective Service Node Exposure`_, the backend Pods
+    must run on nodes that are part of the exposure set (here, nodes labeled
+    ``service.cilium.io/node=beefy``); only nodes that host neither the
+    LoadBalancer frontend nor any backend may be left out.
+
+    This does not apply to SNAT forwarding, where the load balancing node fully
+    translates the traffic and the reply flows back through it. In that case the
+    backend node takes no part in the service handling and does not need the
+    service to be installed (nor the label).
+
+Note that the ``service.cilium.io/forwarding-mode`` and ``service.cilium.io/lb-algorithm``
+annotation must be set at service creation time and should not be changed during
+the lifetime of that service. Changing the value of the annotations or removing
+them while the service is installed breaks connections.
+
 .. _Hybrid mode:
 
 Hybrid DSR and SNAT Mode
@@ -850,6 +988,95 @@ Note that ``service.cilium.io/lb-algorithm`` only takes effect upon initial
 service creation and cannot be changed during the lifetime of the given
 Kubernetes service. Switching between load balancing algorithms requires
 recreation of a service.
+
+Annotation-based Load Balancing Weight
+**************************************
+
+Backend weights can be assigned on a per-``EndpointSlice`` basis through the
+``service.cilium.io/weight`` annotation.
+
+Weights are only honored for the Service referenced by that ``EndpointSlice``
+when it uses the Maglev load-balancing algorithm, whether Maglev is configured
+globally or selected per service through ``service.cilium.io/lb-algorithm``.
+Per-service algorithm selection requires ``bpf.lbAlgorithmAnnotation=true``.
+This is primarily intended for selectorless Services backed by multiple
+manually managed ``EndpointSlice`` objects, where each ``EndpointSlice`` can
+assign a different weight to the backends it contributes to the Service.
+
+For example, the following selectorless Service is explicitly marked to use
+the Maglev load-balancing algorithm and is backed by two ``EndpointSlice``
+objects with weights ``70`` and ``30``:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/lb-algorithm: maglev
+  spec:
+    ports:
+      - name: http
+        port: 8080
+        protocol: TCP
+        targetPort: 8080
+    type: ClusterIP
+  ---
+  apiVersion: discovery.k8s.io/v1
+  kind: EndpointSlice
+  metadata:
+    name: example-service-1
+    labels:
+      kubernetes.io/service-name: example-service
+    annotations:
+      service.cilium.io/weight: "70"
+  addressType: IPv4
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+  endpoints:
+    - addresses:
+        - 10.0.0.11
+    - addresses:
+        - 10.0.0.12
+  ---
+  apiVersion: discovery.k8s.io/v1
+  kind: EndpointSlice
+  metadata:
+    name: example-service-2
+    labels:
+      kubernetes.io/service-name: example-service
+    annotations:
+      service.cilium.io/weight: "30"
+  addressType: IPv4
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+  endpoints:
+    - addresses:
+        - 10.0.0.21
+    - addresses:
+        - 10.0.0.22
+
+The configured weight applies to all backends in a given ``EndpointSlice``.
+Valid values range from ``0`` to ``65535``. A weight of ``0`` marks those
+backends as being in maintenance so that existing connections can continue
+while new traffic is steered to other backends. Invalid values are ignored.
+Weights are relative and do not need to add up to ``100``.
+
+In the example above, new traffic is distributed according to the relative
+weights of the two ``EndpointSlice`` objects, that is, roughly ``70%%`` to the
+backends from ``example-service-1`` and ``30%%`` to the backends from
+``example-service-2``.
+
+If the second ``EndpointSlice`` is later changed from weight ``30`` to
+weight ``0``, all of its backends enter maintenance. Existing connections can
+continue to use them, but new traffic is steered entirely to the remaining
+non-maintenance backends from ``example-service-1``. In other words, the first
+slice now receives ``100%%`` of the new traffic share.
 
 .. _socketlb-host-netns-only:
 
@@ -1143,7 +1370,7 @@ LoadBalancer service or a service with externalIPs will be accessible through
 the IP addresses of native devices which have the default route on the host or
 have Kubernetes InternalIP or ExternalIP assigned. InternalIP is preferred over
 ExternalIP if both exist. To change the devices, set their names in the
-``devices`` Helm option, e.g. ``devices='{eth0,eth1,eth2}'``. Each
+``devices`` Helm option, e.g. ``devices='eth0,eth1,eth2'``. Each
 listed device has to be named the same on all Cilium managed nodes. Alternatively
 if the devices do not match across different nodes, the wildcard option can be
 used, e.g. ``devices=eth+``, which would match any device starting with prefix
@@ -1817,6 +2044,49 @@ unreliable until the node is restarted. If this becomes an issue, consider disab
 ``socketLB.hostNamespaceOnly=true``. See :gh-issue:`42649` and :gh-issue:`28820` for details.
 
 Replacing these maps with BPF socket storage (:gh-issue:`42658`) would resolve this issue.
+
+Connection drops during service backend termination
+***************************************************
+
+In Kubernetes environment, ``Service`` backends are represented by ``EndpointSlice`` objects that usually correspond
+to ``Pod`` objects. When a Pod is deleted (HPA scale-down, rolling update, etc.), two operations are triggered **simultaneously**:
+
+- The ``EndpointSlice`` endpoint is updated to ``Terminating``, instructing CNIs to stop sending traffic to it.
+- Kubelet sends a ``SIGTERM`` to the pod's containers.
+
+Because of that, the application may start refusing connections before Cilium can stop directing traffic
+to the Pod. This can lead to dropped connections and client errors. As of Kubernetes 1.36, Kubelet can't coordinate with
+EndpointSlice updates due to architectural limitations. At the same time, it's not ideal to implement application-side
+workarounds. For example, web application frameworks **should** immediately refuse connections when they receive
+a ``TERM`` signal, given that semantically, the application shouldn't know that it's running in a Kubernetes environment.
+
+You can mitigate this by defining ``preStop`` in your Pod spec. The following example delays delivery of the ``TERM``
+signal to application containers by 2 seconds, giving Cilium more time to react to the EndpointSlice status change:
+
+.. code-block:: yaml
+
+  lifecycle:
+    preStop: # Kubernetes 1.29+
+      sleep:
+        seconds: 2
+
+The required delay depends on the type of Service being terminated. For ``LoadBalancer`` Services, you may need a
+higher value (for example, 10 seconds) to give the external load balancer enough time to stop sending traffic to the
+node. For ``ClusterIP`` Services, a lower value (for example, 1 second) may be sufficient. Experiment with different
+values to find the best setting for your application.
+
+You can read more here:
+
+    * `Pod Termination Flow <https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination-flow>`__: Item 3 mentions the concurrency issue.
+    * `Termination process for Pods and their endpoints <https://kubernetes.io/docs/tutorials/services/pods-and-endpoint-termination-flow/>`__: Suggests using ``preStop`` for graceful termination.
+
+.. admonition:: Remember
+  :class: attention
+
+  ``preStop`` must be a lower number than ``terminationGracePeriodSeconds``, because its time is counted within this
+  very same grace period. Adjust it accordingly based on your applications needs, otherwise you may end up given too
+  little time for your applications to handle the graceful shutdown.
+
 
 .. _Limitations:
 

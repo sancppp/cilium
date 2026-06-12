@@ -40,7 +40,7 @@ func newCmdConnectivity(hooks api.Hooks) *cobra.Command {
 }
 
 var params = check.Parameters{
-	ExternalDeploymentPort: 8090,
+	ExternalDeploymentPort: 8190,
 	EchoServerHostPort:     4000,
 	Writer:                 os.Stdout,
 	SysdumpOptions: sysdump.Options{
@@ -220,6 +220,8 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().MarkHidden("exclude-code-owners")
 	cmd.Flags().StringSliceVar(&params.LogCheckLevels, "log-check-levels", defaults.LogCheckLevels, "Log levels to check for in log messages")
 	cmd.Flags().MarkHidden("log-check-levels")
+	cmd.Flags().StringSliceVar(&params.LogCheckExtraExceptions, "log-check-extra-exceptions", []string{}, "Additional log message substrings to ignore in check-log-errors")
+	cmd.Flags().MarkHidden("log-check-extra-exceptions")
 	cmd.Flags().BoolVar(&params.LogCheckOnlyTestTime, "log-check-only-test-time", false, "Whether logs should only get checked for the duration of the tests")
 
 	cmd.Flags().BoolVar(&params.FlushCT, "flush-ct", false, "Flush conntrack of Cilium on each node")
@@ -324,9 +326,14 @@ func newConnectivityTests(
 	}
 
 	connTests := make([]*check.ConnectivityTest, 0, params.TestConcurrency)
+	sharedNamespace := ""
 	for i := range params.TestConcurrency {
 		params := params
 		params.TestNamespace = fmt.Sprintf("%s-%d", params.TestNamespace, i+1)
+		if sharedNamespace == "" {
+			sharedNamespace = params.TestNamespace // use the first test ns for shared resources
+		}
+		params.SharedTestNamespace = sharedNamespace
 		params.TestNamespaceIndex = i
 		if params.ExternalTargetCANamespace == "" {
 			params.ExternalTargetCANamespace = params.TestNamespace

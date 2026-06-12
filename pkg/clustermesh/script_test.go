@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 
 	uhive "github.com/cilium/hive"
@@ -37,6 +37,7 @@ import (
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	k8sTestutils "github.com/cilium/cilium/pkg/k8s/testutils"
 	"github.com/cilium/cilium/pkg/k8s/version"
 	"github.com/cilium/cilium/pkg/kpr"
@@ -66,7 +67,7 @@ func TestScript(t *testing.T) {
 	var opts []hivetest.LogOption
 	if *debug {
 		opts = append(opts, hivetest.LogLevel(slog.LevelDebug))
-		logging.SetLogLevelToDebug()
+		logging.SetLogLevel(slog.LevelDebug)
 	}
 	log := hivetest.Logger(t, opts...)
 
@@ -86,7 +87,7 @@ func TestScript(t *testing.T) {
 			k8sClient.FakeClientCell(),
 			daemonk8s.ResourcesCell,
 			cell.Config(envoyCfg.SecretSyncConfig{}),
-			daemonk8s.TablesCell,
+			k8sTables.TablesCell,
 			lbcell.Cell,
 
 			maglev.Cell,
@@ -151,11 +152,11 @@ func TestScript(t *testing.T) {
 
 			cell.Invoke(func(client kvstore.Client) {
 				clusterConfig := []byte("endpoints:\n- in-memory\n")
-				config1 := path.Join(configDir, "cluster1")
+				config1 := filepath.Join(configDir, "cluster1")
 				require.NoError(t, os.WriteFile(config1, clusterConfig, 0644), "Failed to write config file for cluster1")
-				config2 := path.Join(configDir, "cluster2")
+				config2 := filepath.Join(configDir, "cluster2")
 				require.NoError(t, os.WriteFile(config2, clusterConfig, 0644), "Failed to write config file for cluster2")
-				config3 := path.Join(configDir, "cluster3")
+				config3 := filepath.Join(configDir, "cluster3")
 				require.NoError(t, os.WriteFile(config3, clusterConfig, 0644), "Failed to write config file for cluster3")
 
 				for i, name := range []string{"cluster1", "cluster2", "cluster3"} {

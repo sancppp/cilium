@@ -27,6 +27,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/model/ingestion"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
 const (
@@ -62,12 +63,6 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if ingress.GetDeletionTimestamp() != nil {
 		scopedLog.DebugContext(ctx, "Ingress is marked for deletion - waiting for actual deletion")
 		return controllerruntime.Success()
-	}
-
-	// Ensure that any existing EndpointSlice from a previous version gets deleted (dummy ingress endpoints are no longer required)
-	// This can be removed in v1.21
-	if err := r.ensureEndpointSliceDeleted(ctx, types.NamespacedName{Namespace: ingress.Namespace, Name: fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingress.Name)}); err != nil {
-		return controllerruntime.Fail(err)
 	}
 
 	// Ingress is no longer managed by Cilium.
@@ -132,7 +127,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 func (r *ingressReconciler) createOrUpdateDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress, scopedLog *slog.Logger) error {
-	desiredCiliumEnvoyConfig, desiredService, err := r.buildDedicatedResources(ctx, ingress, scopedLog)
+	desiredCiliumEnvoyConfig, desiredService, desiredEndpoints, err := r.buildDedicatedResources(ctx, ingress, scopedLog)
 	if err != nil {
 		return fmt.Errorf("failed to build dedicated resources: %w", err)
 	}
@@ -142,6 +137,10 @@ func (r *ingressReconciler) createOrUpdateDedicatedResources(ctx context.Context
 	}
 
 	if err := r.createOrUpdateCiliumEnvoyConfig(ctx, desiredCiliumEnvoyConfig); err != nil {
+		return err
+	}
+
+	if err := r.createOrUpdateEndpoints(ctx, desiredEndpoints); err != nil {
 		return err
 	}
 
@@ -161,7 +160,7 @@ func (r *ingressReconciler) propagateIngressAnnotationsAndLabels(ingress *networ
 
 func (r *ingressReconciler) createOrUpdateSharedResources(ctx context.Context) error {
 	// In shared loadbalancing mode, only the CiliumEnvoyConfig is managed by the Operator.
-	// The K8s Loadbalancer Service is created by the Helm Chart.
+	// Service and Endpoints are created by the Helm Chart.
 	desiredCiliumEnvoyConfig, err := r.buildSharedResources(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to build shared resources: %w", err)
@@ -176,8 +175,9 @@ func (r *ingressReconciler) createOrUpdateSharedResources(ctx context.Context) e
 
 func (r *ingressReconciler) tryCleanupDedicatedResources(ctx context.Context, ingressNamespacedName types.NamespacedName) error {
 	resources := map[client.Object]types.NamespacedName{
-		&corev1.Service{}:             {Namespace: ingressNamespacedName.Namespace, Name: fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name)},
-		&ciliumv2.CiliumEnvoyConfig{}: {Namespace: ingressNamespacedName.Namespace, Name: fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, ingressNamespacedName.Namespace, ingressNamespacedName.Name)},
+		&corev1.Service{}:             {Namespace: ingressNamespacedName.Namespace, Name: shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name))},
+		&discoveryv1.EndpointSlice{}:  {Namespace: ingressNamespacedName.Namespace, Name: shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name))},
+		&ciliumv2.CiliumEnvoyConfig{}: {Namespace: ingressNamespacedName.Namespace, Name: shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, ingressNamespacedName.Namespace, ingressNamespacedName.Name))},
 	}
 
 	for k, v := range resources {
@@ -191,7 +191,7 @@ func (r *ingressReconciler) tryCleanupDedicatedResources(ctx context.Context, in
 
 func (r *ingressReconciler) tryCleanupSharedResources(ctx context.Context) error {
 	// In shared loadbalancing mode, only the CiliumEnvoyConfig is managed by the Operator.
-	// The K8s Loadbalancer Service is created by the Helm Chart.
+	// Service and Endpoints are created by the Helm Chart.
 	desiredCiliumEnvoyConfig, err := r.buildSharedResources(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to build shared resources: %w", err)
@@ -253,20 +253,26 @@ func (r *ingressReconciler) effectiveHostNetworkPort(port uint32) uint32 {
 	return defaultHostNetworkListenerPort
 }
 
-func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress, scopedLog *slog.Logger) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, error) {
+func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress, scopedLog *slog.Logger) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *discoveryv1.EndpointSlice, error) {
 	passthroughPort, insecureHTTPPort, secureHTTPPort := r.getDedicatedListenerPorts(ingress)
 
 	m := &model.Model{}
 
 	if annotations.GetAnnotationTLSPassthroughEnabled(ingress) {
-		m.TLSPassthrough = append(m.TLSPassthrough, ingestion.IngressPassthrough(nil, *ingress, passthroughPort)...)
+		m.TLSPassthrough = append(m.TLSPassthrough, ingestion.IngressPassthrough(scopedLog, *ingress, passthroughPort)...)
 	} else {
-		m.HTTP = append(m.HTTP, ingestion.Ingress(nil, *ingress, r.defaultSecretNamespace, r.defaultSecretName, r.enforcedHTTPS, insecureHTTPPort, secureHTTPPort, r.defaultRequestTimeout)...)
+		m.HTTP = append(m.HTTP, ingestion.Ingress(scopedLog, *ingress, r.defaultSecretNamespace, r.defaultSecretName, r.enforcedHTTPS, insecureHTTPPort, secureHTTPPort, r.defaultRequestTimeout)...)
 	}
 
-	cec, svc, err := r.dedicatedTranslator.Translate(m)
+	cec, svc, eps, err := r.dedicatedTranslator.Translate(m)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to translate model into resources: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to translate model into resources: %w", err)
+	}
+	// Ingress only ever produces a single dummy EndpointSlice; unwrap from the
+	// shared Translator interface that returns a list to support gateway-api L4.
+	var ep *discoveryv1.EndpointSlice
+	if len(eps) > 0 {
+		ep = eps[0]
 	}
 
 	r.propagateIngressAnnotationsAndLabels(ingress, &svc.ObjectMeta)
@@ -288,10 +294,10 @@ func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress
 
 	// Explicitly set the controlling OwnerReference on the CiliumEnvoyConfig
 	if err := controllerutil.SetControllerReference(ingress, cec, r.client.Scheme()); err != nil {
-		return nil, nil, fmt.Errorf("failed to set controller reference on CiliumEnvoyConfig: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to set controller reference on CiliumEnvoyConfig: %w", err)
 	}
 
-	return cec, svc, err
+	return cec, svc, ep, err
 }
 
 func (r *ingressReconciler) getDedicatedListenerPorts(ingress *networkingv1.Ingress) (uint32, uint32, uint32) {
@@ -370,23 +376,23 @@ func (r *ingressReconciler) createOrUpdateService(ctx context.Context, desiredSe
 	return nil
 }
 
-func (r *ingressReconciler) ensureEndpointSliceDeleted(ctx context.Context, name types.NamespacedName) error {
-	eps := discoveryv1.EndpointSlice{}
+func (r *ingressReconciler) createOrUpdateEndpoints(ctx context.Context, desired *discoveryv1.EndpointSlice) error {
+	eps := desired.DeepCopy()
 
-	if err := r.client.Get(ctx, name, &eps); err != nil {
-		if k8serrors.IsNotFound(err) {
-			// no longer exists
-			return nil
-		}
+	result, err := controllerutil.CreateOrUpdate(ctx, r.client, eps, func() error {
+		eps.Endpoints = desired.Endpoints
+		eps.Ports = desired.Ports
+		eps.OwnerReferences = desired.OwnerReferences
+		eps.Annotations = mergeMap(eps.Annotations, desired.Annotations)
+		eps.Labels = mergeMap(eps.Labels, desired.Labels)
 
-		return fmt.Errorf("failed to get existing EndpointSlice (%s): %w", name, err)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create or update Endpoints: %w", err)
 	}
 
-	if err := r.client.Delete(ctx, &eps); err != nil {
-		return fmt.Errorf("failed to delete existing EndpointSlice (%s): %w", name, err)
-	}
-
-	r.logger.DebugContext(ctx, "Successfully deleted EndpointSlice", logfields.Name, name)
+	r.logger.DebugContext(ctx, fmt.Sprintf("Endpoints %s has been %s", client.ObjectKeyFromObject(eps), result))
 
 	return nil
 }
@@ -440,7 +446,7 @@ func (r *ingressReconciler) updateIngressLoadbalancerStatus(ctx context.Context,
 	serviceNamespacedName := types.NamespacedName{}
 	if r.isEffectiveLoadbalancerModeDedicated(ingress) {
 		serviceNamespacedName.Namespace = ingress.Namespace
-		serviceNamespacedName.Name = fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingress.Name)
+		serviceNamespacedName.Name = shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingress.Name))
 	} else {
 		serviceNamespacedName.Namespace = r.ciliumNamespace
 		serviceNamespacedName.Name = r.sharedResourcesName

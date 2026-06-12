@@ -10,7 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/cilium/api/v1/models"
-	alibabaCloudTypes "github.com/cilium/cilium/pkg/alibabacloud/eni/types"
+	alibabaCloudTypes "github.com/cilium/cilium/pkg/alibabacloud/types"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	azureTypes "github.com/cilium/cilium/pkg/azure/types"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
@@ -458,11 +458,6 @@ type NodeSpec struct {
 	//
 	// +kubebuilder:validation:Optional
 	IPAM ipamTypes.IPAMSpec `json:"ipam,omitempty"`
-
-	// NodeIdentity is the Cilium numeric identity allocated for the node, if any.
-	//
-	// +kubebuilder:validation:Optional
-	NodeIdentity uint64 `json:"nodeidentity,omitempty"`
 }
 
 // HealthAddressingSpec is the addressing information required to do

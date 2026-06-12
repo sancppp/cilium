@@ -6,7 +6,6 @@
 package ipam
 
 import (
-	"fmt"
 	"log/slog"
 
 	"github.com/cilium/hive/cell"
@@ -14,8 +13,9 @@ import (
 	"github.com/spf13/pflag"
 
 	operatorOption "github.com/cilium/cilium/operator/option"
-	"github.com/cilium/cilium/pkg/ipam/allocator/alibabacloud"
-	ipamMetrics "github.com/cilium/cilium/pkg/ipam/metrics"
+	allocatorTypes "github.com/cilium/cilium/operator/pkg/ipam/allocator"
+	"github.com/cilium/cilium/operator/pkg/ipam/allocator/alibabacloud"
+	ipamMetrics "github.com/cilium/cilium/operator/pkg/ipam/metrics"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/metrics"
@@ -58,41 +58,29 @@ type alibabaParams struct {
 	AlibabaMetrics     *alibabacloud.Metrics
 	IPAMMetrics        *ipamMetrics.Metrics
 	DaemonCfg          *option.DaemonConfig
-	NodeWatcherFactory nodeWatcherJobFactory
+	NodeWatcherFactory allocatorTypes.NodeWatcherJobFactory
 
 	Cfg        Config
 	AlibabaCfg AlibabaCloudConfig
 }
 
 func startAlibabaAllocator(p alibabaParams) {
-	if p.DaemonCfg.IPAM != ipamOption.IPAMAlibabaCloud {
-		return
-	}
-
-	allocator := &alibabacloud.AllocatorAlibabaCloud{
+	alloc := &alibabacloud.AllocatorAlibabaCloud{
 		AlibabaCloudVPCID:            p.AlibabaCfg.AlibabaCloudVPCID,
 		AlibabaCloudReleaseExcessIPs: p.AlibabaCfg.AlibabaCloudReleaseExcessIPs,
 		ParallelAllocWorkers:         p.Cfg.ParallelAllocWorkers,
 		LimitIPAMAPIBurst:            p.Cfg.LimitIPAMAPIBurst,
 		LimitIPAMAPIQPS:              p.Cfg.LimitIPAMAPIQPS,
+		AlibabaMetrics:               p.AlibabaMetrics,
 	}
 
-	p.Lifecycle.Append(
-		cell.Hook{
-			OnStart: func(ctx cell.HookContext) error {
-				if err := allocator.Init(ctx, p.Logger, p.AlibabaMetrics); err != nil {
-					return fmt.Errorf("unable to init AlibabaCloud allocator: %w", err)
-				}
-
-				nm, err := allocator.Start(ctx, &ciliumNodeUpdateImplementation{p.Clientset}, p.IPAMMetrics)
-				if err != nil {
-					return fmt.Errorf("unable to start AlibabaCloud allocator: %w", err)
-				}
-
-				p.JobGroup.Add(p.NodeWatcherFactory(nm))
-
-				return nil
-			},
-		},
-	)
+	startCloudAllocator(cloudAllocatorBootstrap{
+		Logger:             p.Logger,
+		Lifecycle:          p.Lifecycle,
+		JobGroup:           p.JobGroup,
+		Clientset:          p.Clientset,
+		IPAMMetrics:        p.IPAMMetrics,
+		DaemonCfg:          p.DaemonCfg,
+		NodeWatcherFactory: p.NodeWatcherFactory,
+	}, "AlibabaCloud", ipamOption.IPAMAlibabaCloud, alloc)
 }

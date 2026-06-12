@@ -5,8 +5,8 @@ package policycell
 
 import (
 	"context"
-	"log/slog"
 	"net/netip"
+	"sync"
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	"github.com/cilium/cilium/pkg/ipcache"
 	ipcachetypes "github.com/cilium/cilium/pkg/ipcache/types"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
@@ -22,6 +23,7 @@ import (
 	policyapi "github.com/cilium/cilium/pkg/policy/api"
 	policytypes "github.com/cilium/cilium/pkg/policy/types"
 	policyutils "github.com/cilium/cilium/pkg/policy/utils"
+	testcompute "github.com/cilium/cilium/pkg/testutils/compute"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
 )
@@ -93,17 +95,25 @@ func TestAddReplaceRemoveRule(t *testing.T) {
 		},
 	}
 
-	pi := &policyImporter{
-		log:  slog.Default(),
-		repo: policy.NewPolicyRepository(hivetest.Logger(t), ids, nil, nil, nil, testpolicy.NewPolicyMetricsNoop()),
-		epm:  epm,
-		ipc:  ipc,
+	logger := hivetest.Logger(t)
+	idmgr := identitymanager.NewIDManager(logger)
+	repo := policy.NewPolicyRepository(logger, ids, nil, nil, idmgr, testpolicy.NewPolicyMetricsNoop())
+	polComputer := testcompute.InstantiateCellForTesting(t, logger, "policy-cell", "TestAddReplaceRemoveRule", repo, idmgr)
+
+	pi := &Importer{
+		log:      logger,
+		repo:     repo,
+		computer: polComputer,
+		epm:      epm,
+		ipc:      ipc,
 
 		q: make(chan *policytypes.PolicyUpdate, 10),
 
 		prefixesByResource: map[ipcachetypes.ResourceID][]netip.Prefix{},
 	}
-	pi.repo.GetSubjectSelectorCache().UpdateIdentities(ids, nil, nil)
+	wg := &sync.WaitGroup{}
+	pi.repo.GetSubjectSelectorCache().UpdateIdentities(ids, nil, wg)
+	wg.Wait()
 	pi.repo.GetSelectorCache().SetLocalIdentityNotifier(testidentity.NewDummyIdentityNotifier())
 
 	writeRules := func(rules ...*policyapi.Rule) uint64 {

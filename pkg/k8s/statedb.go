@@ -55,6 +55,7 @@ func RegisterReflector[Obj any](jobGroup job.Group, db *statedb.DB, cfg Reflecto
 		db:              db,
 		table:           targetTable,
 		source:          source,
+		log:             slog.Default(),
 	}
 	wtxn := db.WriteTxn(targetTable)
 	r.initDone = targetTable.RegisterInitializer(wtxn, r.ReflectorConfig.Name)
@@ -688,8 +689,10 @@ func (*cacheStoreListener) Get(obj any) (item any, exists bool, err error) {
 func (*cacheStoreListener) GetByKey(key string) (item any, exists bool, err error) {
 	panic("unimplemented")
 }
-func (*cacheStoreListener) List() []any        { panic("unimplemented") }
-func (*cacheStoreListener) ListKeys() []string { panic("unimplemented") }
-func (*cacheStoreListener) Resync() error      { panic("unimplemented") }
+func (*cacheStoreListener) List() []any                          { panic("unimplemented") }
+func (*cacheStoreListener) ListKeys() []string                   { panic("unimplemented") }
+func (*cacheStoreListener) Resync() error                        { panic("unimplemented") }
+func (*cacheStoreListener) LastStoreSyncResourceVersion() string { return "" }
+func (*cacheStoreListener) Bookmark(string)                      {}
 
 var _ cache.Store = &cacheStoreListener{}

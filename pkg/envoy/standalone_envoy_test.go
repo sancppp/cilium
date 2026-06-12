@@ -5,6 +5,7 @@ package envoy
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,7 +59,7 @@ func (s *EnvoySuite) waitForProxyCompletion() error {
 
 func TestEnvoy(t *testing.T) {
 	s := setupEnvoySuite(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	s.waitGroup = completion.NewWaitGroup(ctx)
@@ -67,7 +68,7 @@ func TestEnvoy(t *testing.T) {
 		t.Skip("skipping envoy unit test; CILIUM_ENABLE_ENVOY_UNIT_TEST not set")
 	}
 
-	logging.SetLogLevelToDebug()
+	logging.SetLogLevel(slog.LevelDebug)
 	flowdebug.Enable()
 
 	testRunDir, err := os.MkdirTemp("", "envoy_go_test")
@@ -90,18 +91,16 @@ func TestEnvoy(t *testing.T) {
 	require.NotNil(t, xdsServer)
 
 	go func() {
-		err = xdsServer.start(t.Context())
+		err = xdsServer.run(ctx)
 		require.NoError(t, err)
 	}()
-	defer xdsServer.stop()
 
 	accessLogServer := newAccessLogServer(logger, &proxyAccessLoggerMock{}, testRunDir, 1337, localEndpointStore, 4096)
 	require.NotNil(t, accessLogServer)
 	go func() {
-		err = accessLogServer.start(t.Context())
+		err = accessLogServer.run(t.Context())
 		require.NoError(t, err)
 	}()
-	defer accessLogServer.stop()
 
 	// launch debug variant of the Envoy proxy
 	starter := &onDemandXdsStarter{logger: logger}
@@ -111,6 +110,10 @@ func TestEnvoy(t *testing.T) {
 		baseID:                         15,
 		connectTimeout:                 1,
 		maxActiveDownstreamConnections: 100,
+		idleTimeout:                    60,
+		maxConcurrentRetries:           128,
+		maxConnections:                 1024,
+		maxRequests:                    1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
@@ -183,7 +186,7 @@ func TestEnvoy(t *testing.T) {
 func TestEnvoyNACK(t *testing.T) {
 	s := setupEnvoySuite(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Second)
 	defer cancel()
 
 	s.waitGroup = completion.NewWaitGroup(ctx)
@@ -213,18 +216,16 @@ func TestEnvoyNACK(t *testing.T) {
 	require.NotNil(t, xdsServer)
 
 	go func() {
-		err = xdsServer.start(t.Context())
+		err = xdsServer.run(ctx)
 		require.NoError(t, err)
 	}()
-	defer xdsServer.stop()
 
 	accessLogServer := newAccessLogServer(logger, &proxyAccessLoggerMock{}, testRunDir, 1337, localEndpointStore, 4096)
 	require.NotNil(t, accessLogServer)
 	go func() {
-		err = accessLogServer.start(t.Context())
+		err = accessLogServer.run(t.Context())
 		require.NoError(t, err)
 	}()
-	defer accessLogServer.stop()
 
 	// launch debug variant of the Envoy proxy
 	starter := &onDemandXdsStarter{logger: logger}
@@ -234,6 +235,10 @@ func TestEnvoyNACK(t *testing.T) {
 		baseID:                         42,
 		connectTimeout:                 1,
 		maxActiveDownstreamConnections: 100,
+		idleTimeout:                    60,
+		maxConcurrentRetries:           128,
+		maxConnections:                 1024,
+		maxRequests:                    1024,
 	})
 	require.NotNil(t, envoyProxy)
 	require.NoError(t, err)

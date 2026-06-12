@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/netip"
+	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
@@ -20,11 +21,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2_types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/api/helpers"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	"github.com/cilium/cilium/pkg/aws/types"
-	ipPkg "github.com/cilium/cilium/pkg/ip"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -380,7 +382,7 @@ func (c *Client) describeNetworkInterfacesByInstance(ctx context.Context, instan
 
 // describeNetworkInterfacesFromInstances lists all ENIs matching filtered EC2 instances
 func (c *Client) describeNetworkInterfacesFromInstances(ctx context.Context) ([]ec2_types.NetworkInterface, error) {
-	enisFromInstances := make(map[string]struct{})
+	enisFromInstances := sets.New[string]()
 
 	instanceAttrs := &ec2.DescribeInstancesInput{}
 	if len(c.instancesFilters) > 0 {
@@ -401,16 +403,13 @@ func (c *Client) describeNetworkInterfacesFromInstances(ctx context.Context) ([]
 		for _, r := range output.Reservations {
 			for _, i := range r.Instances {
 				for _, ifs := range i.NetworkInterfaces {
-					enisFromInstances[aws.ToString(ifs.NetworkInterfaceId)] = struct{}{}
+					enisFromInstances.Insert(aws.ToString(ifs.NetworkInterfaceId))
 				}
 			}
 		}
 	}
 
-	enisListFromInstances := make([]string, 0, len(enisFromInstances))
-	for k := range enisFromInstances {
-		enisListFromInstances = append(enisListFromInstances, k)
-	}
+	enisListFromInstances := enisFromInstances.UnsortedList()
 
 retry:
 	for {
@@ -456,17 +455,24 @@ retry:
 }
 
 // parseENI parses a ec2.NetworkInterface as returned by the EC2 service API,
-// converts it into a eniTypes.ENI object
+// converts it into a eniTypes.ENI object.
+//
+// Returns an error on any malformed IP/CIDR string. AWS uses string pointers
+// for these fields, so unset values are nil and any non-nil string is expected
+// to be a valid IP or CIDR.
 func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap, usePrimary bool) (instanceID string, eni *eniTypes.ENI, err error) {
 	if iface.PrivateIpAddress == nil {
-		err = fmt.Errorf("ENI has no IP address")
-		return
+		return "", nil, fmt.Errorf("ENI has no IP address")
 	}
 
+	primaryIP, err := netip.ParseAddr(aws.ToString(iface.PrivateIpAddress))
+	if err != nil {
+		return "", nil, fmt.Errorf("unable to parse ENI primary IP %q: %w", aws.ToString(iface.PrivateIpAddress), err)
+	}
 	eni = &eniTypes.ENI{
-		IP:             aws.ToString(iface.PrivateIpAddress),
+		IP:             iputil.AddrFrom(primaryIP),
 		SecurityGroups: []string{},
-		Addresses:      []string{},
+		Addresses:      []iputil.Addr{},
 	}
 
 	if iface.MacAddress != nil {
@@ -494,7 +500,7 @@ func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMa
 
 		if subnets != nil {
 			if subnet, ok := subnets[eni.Subnet.ID]; ok && subnet.CIDR.IsValid() {
-				eni.Subnet.CIDR = subnet.CIDR.String()
+				eni.Subnet.CIDR = iputil.PrefixFrom(subnet.CIDR)
 			}
 		}
 	}
@@ -504,8 +510,12 @@ func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMa
 
 		if vpcs != nil {
 			if vpc, ok := vpcs[eni.VPC.ID]; ok {
-				eni.VPC.PrimaryCIDR = vpc.PrimaryCIDR
-				eni.VPC.CIDRs = vpc.CIDRs
+				if vpc.PrimaryCIDR.IsValid() {
+					eni.VPC.PrimaryCIDR = vpc.PrimaryCIDR
+				}
+				if len(vpc.CIDRs) > 0 {
+					eni.VPC.CIDRs = slices.Clone(vpc.CIDRs)
+				}
 			}
 		}
 	}
@@ -515,22 +525,40 @@ func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMa
 			continue
 		}
 		if ip.PrivateIpAddress != nil {
-			eni.Addresses = append(eni.Addresses, aws.ToString(ip.PrivateIpAddress))
+			a, err := netip.ParseAddr(aws.ToString(ip.PrivateIpAddress))
+			if err != nil {
+				return "", nil, fmt.Errorf("unable to parse ENI secondary IP %q: %w", aws.ToString(ip.PrivateIpAddress), err)
+			}
+			eni.Addresses = append(eni.Addresses, iputil.AddrFrom(a))
 		}
 	}
 
 	for _, prefix := range iface.Ipv4Prefixes {
-		ips, e := ipPkg.PrefixToIps(aws.ToString(prefix.Ipv4Prefix), 0)
-		if e != nil {
-			err = fmt.Errorf("unable to parse CIDR %s: %w", aws.ToString(prefix.Ipv4Prefix), e)
-			return
+		prefixStr := aws.ToString(prefix.Ipv4Prefix)
+		p, err := netip.ParsePrefix(prefixStr)
+		if err != nil {
+			return "", nil, fmt.Errorf("unable to parse ENI Ipv4 prefix %q: %w", prefixStr, err)
 		}
-		eni.Addresses = append(eni.Addresses, ips...)
-		eni.Prefixes = append(eni.Prefixes, aws.ToString(prefix.Ipv4Prefix))
+		ips, e := iputil.PrefixToIps(prefixStr, 0)
+		if e != nil {
+			return "", nil, fmt.Errorf("unable to expand ENI Ipv4 prefix %s: %w", prefixStr, e)
+		}
+		for _, ipStr := range ips {
+			a, err := netip.ParseAddr(ipStr)
+			if err != nil {
+				return "", nil, fmt.Errorf("unable to parse ENI prefix IP %q: %w", ipStr, err)
+			}
+			eni.Addresses = append(eni.Addresses, iputil.AddrFrom(a))
+		}
+		eni.Prefixes = append(eni.Prefixes, iputil.PrefixFrom(p))
 	}
 
-	if iface.Association != nil && aws.ToString(iface.Association.PublicIp) != "" {
-		eni.PublicIP = aws.ToString(iface.Association.PublicIp)
+	if iface.Association != nil && iface.Association.PublicIp != nil {
+		publicIP, err := netip.ParseAddr(aws.ToString(iface.Association.PublicIp))
+		if err != nil {
+			return "", nil, fmt.Errorf("unable to parse ENI public IP %q: %w", aws.ToString(iface.Association.PublicIp), err)
+		}
+		eni.PublicIP = iputil.AddrFrom(publicIP)
 	}
 
 	for _, g := range iface.Groups {
@@ -550,7 +578,7 @@ func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMa
 // GetInstance returns the instance including its ENIs by the given instanceID
 func (c *Client) GetInstance(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap, instanceID string) (*ipamTypes.Instance, error) {
 	instance := ipamTypes.Instance{}
-	instance.Interfaces = map[string]ipamTypes.InterfaceRevision{}
+	instance.Interfaces = map[string]ipamTypes.Interface{}
 
 	var networkInterfaces []ec2_types.NetworkInterface
 	var err error
@@ -567,9 +595,7 @@ func (c *Client) GetInstance(ctx context.Context, vpcs ipamTypes.VirtualNetworkM
 			return nil, err
 		}
 
-		instance.Interfaces[ifId] = ipamTypes.InterfaceRevision{
-			Resource: eni,
-		}
+		instance.Interfaces[ifId] = eni
 	}
 	return &instance, nil
 }
@@ -598,7 +624,7 @@ func (c *Client) GetInstances(ctx context.Context, vpcs ipamTypes.VirtualNetwork
 		}
 
 		if id != "" {
-			instances.Update(id, ipamTypes.InterfaceRevision{Resource: eni})
+			instances.Update(id, eni)
 		}
 	}
 
@@ -639,12 +665,23 @@ func (c *Client) GetVpcs(ctx context.Context, vpcID string) (ipamTypes.VirtualNe
 		vpc := &ipamTypes.VirtualNetwork{ID: aws.ToString(v.VpcId)}
 
 		if v.CidrBlock != nil {
-			vpc.PrimaryCIDR = aws.ToString(v.CidrBlock)
+			p, err := netip.ParsePrefix(aws.ToString(v.CidrBlock))
+			if err != nil {
+				return nil, fmt.Errorf("unable to parse VPC primary CIDR %q: %w", aws.ToString(v.CidrBlock), err)
+			}
+			vpc.PrimaryCIDR = iputil.PrefixFrom(p)
 		}
 
 		for _, c := range v.CidrBlockAssociationSet {
-			if cidr := aws.ToString(c.CidrBlock); cidr != vpc.PrimaryCIDR {
-				vpc.CIDRs = append(vpc.CIDRs, cidr)
+			if c.CidrBlock == nil {
+				continue
+			}
+			p, err := netip.ParsePrefix(aws.ToString(c.CidrBlock))
+			if err != nil {
+				return nil, fmt.Errorf("unable to parse VPC CIDR %q: %w", aws.ToString(c.CidrBlock), err)
+			}
+			if p != vpc.PrimaryCIDR.Prefix {
+				vpc.CIDRs = append(vpc.CIDRs, iputil.PrefixFrom(p))
 			}
 		}
 
@@ -779,7 +816,7 @@ func (c *Client) CreateNetworkInterface(ctx context.Context, toAllocate int32, s
 		Groups:      groups,
 	}
 	if allocatePrefixes {
-		prefixCount := ipPkg.PrefixCeil(int(toAllocate), ipamOption.ENIPDBlockSizeIPv4)
+		prefixCount := iputil.PrefixCeil(int(toAllocate), ipamOption.ENIPDBlockSizeIPv4)
 		input.Ipv4PrefixCount = aws.Int32(int32(prefixCount))
 		c.logger.Debug("Creating interface with prefixes",
 			logfields.PrefixCount, prefixCount,

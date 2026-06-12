@@ -64,7 +64,6 @@ endif
 HOST_OPTIONS = $(LXC_OPTIONS) \
 	-DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DENABLE_HOST_FIREWALL: \
 	-DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DENABLE_HOST_FIREWALL: \
-	-DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DENABLE_DSR: \
 	-DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DENABLE_IPSEC:-DENABLE_DSR: \
 	-DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DENABLE_NODEPORT:-DENABLE_MASQUERADE_IPV4:-DENABLE_IP_MASQ_AGENT_IPV4:-DENABLE_MASQUERADE_IPV6:-DENABLE_IP_MASQ_AGENT_IPV6: \
 	-DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DENABLE_NODEPORT:-DENABLE_MASQUERADE_IPV4:-DENABLE_MASQUERADE_IPV6:-DENABLE_EGRESS_GATEWAY: \
@@ -136,7 +135,6 @@ LXC_OPTIONS = \
 	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DENABLE_NAT_46X64:-DENABLE_NAT_46X64_GATEWAY: \
 	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DENABLE_NODEPORT:-DPOLICY_VERDICT_NOTIFY: \
 	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DENABLE_NODEPORT:-DENABLE_DSR:-DPOLICY_VERDICT_NOTIFY: \
-	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DPOLICY_VERDICT_NOTIFY:-DUSE_BPF_PROG_FOR_INGRESS_POLICY: \
 	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DENABLE_HOST_ROUTING: \
 	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DENABLE_HOST_ROUTING:-DENABLE_SCTP: \
 	 -DENABLE_IPV4:-DENABLE_IPV6:-DENCAP_IFINDEX:-DTUNNEL_MODE:-DENABLE_HOST_ROUTING:-DENABLE_SCTP:-DENABLE_VTEP: \
@@ -153,26 +151,35 @@ endif
 
 include ./Makefile.bpf
 
-.PHONY: all bpf_all build_all install clean generate gen_compile_commands
-
+.PHONY: all
 all: bpf_all
 
+.PHONY: bpf_all
 bpf_all: $(BPF) generate
 
+.PHONY: build_all
 build_all: force
 	@$(ECHO_CHECK)/*.c BUILD_PERMUTATIONS=1
 	$(QUIET) $(MAKE) $(SUBMAKEOPTS) bpf_all BUILD_PERMUTATIONS=1
 
+.PHONY: testdata
 testdata:
-	${CLANG} ${FLAGS} --target=bpf -Wall -Werror \
+	@$(ECHO_CC)
+	$(QUIET)${CLANG} ${FLAGS} --target=bpf -Wall -Werror \
 	-c ../pkg/alignchecker/testdata/bpf_foo.c \
 	-o ../pkg/alignchecker/testdata/bpf_foo.o
 
+.PHONY: generate
 generate: $(BPF)
-	$(GO) generate ../pkg/datapath/types
-	$(GO) generate ../pkg/datapath/config
-	$(GO) generate ../pkg/datapath/maps
-	BPF2GO_CC="$(CLANG)" BPF2GO_CFLAGS="$(MAX_OVERLAY_OPTIONS) $(CLANG_FLAGS)" $(GO) generate ../pkg/datapath/bpf
+	@$(ECHO_GEN)../pkg/datapath/types
+	$(QUIET)$(GO) generate ../pkg/datapath/types
+	@$(ECHO_GEN)../pkg/datapath/config
+	$(QUIET)$(GO) generate ../pkg/datapath/config
+	@$(ECHO_GEN)../pkg/datapath/maps
+	$(QUIET)$(GO) generate ../pkg/datapath/maps
+	@$(ECHO_GEN)../pkg/datapath/bpf
+	$(QUIET)BPF2GO_CC="$(CLANG)" BPF2GO_CFLAGS="$(MAX_OVERLAY_OPTIONS) $(CLANG_FLAGS)" \
+		$(GO) generate ../pkg/datapath/bpf
 
 $(BPF_SIMPLE): %.o: %.c $(LIB)
 	@$(ECHO_CC)
@@ -230,17 +237,24 @@ bpf_lxc.o:: bpf_lxc.c $(LIB)
 
 $(foreach OPTS,$(LXC_OPTIONS),$(eval $(call PERMUTATION_template,bpf_lxc.o,$(OPTS))))
 
+.PHONY: install-binary
 install-binary:
 
+.PHONY: install-bash-completion
 install-bash-completion:
 
+.PHONY: clean
 clean:
 	@$(ECHO_CLEAN)
 	$(QUIET)rm -fr *.o *.ll *.i *.s
 	$(QUIET)rm -f $(TARGET)
+	$(QUIET)rm -f $(wildcard .cache/clangd/index/*.idx)
+	$(QUIET)rm -f compile_commands.json
+	$(QUIET)$(MAKE) $(SUBMAKEOPTS) -C tests clean
 
 
 BEAR_CLI   = $(shell which bear 2> /dev/null)
+.PHONY: gen_compile_commands
 gen_compile_commands:
 ifeq (, $(BEAR_CLI))
 	@echo 'Bear cli must be in $$PATH to generate json compilation database'

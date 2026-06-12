@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path"
 	"time"
 
 	"github.com/cilium/hive/cell"
@@ -15,7 +14,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	operatorK8s "github.com/cilium/cilium/operator/k8s"
-	operatorOption "github.com/cilium/cilium/operator/option"
+	"github.com/cilium/cilium/operator/pkg/ciliumpod"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -64,6 +63,7 @@ func newGC(in struct {
 
 	Config      Config
 	ClusterInfo cmtypes.ClusterInfo
+	PodCfg      ciliumpod.Config
 
 	WQMetricsProvider workqueue.MetricsProvider
 
@@ -78,7 +78,7 @@ func newGC(in struct {
 		return nil, nil
 	}
 
-	selector, err := labels.Parse(operatorOption.Config.CiliumPodLabels)
+	selector, err := in.PodCfg.Selector()
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse cilium pod selector: %w", err)
 	}
@@ -129,7 +129,7 @@ func newGC(in struct {
 			health.OK("Primed")
 			in.StoreFactory.NewWatchStore(g.cinfo.Name, nodeStore.KeyCreator, &observer{g.queue},
 				store.RWSWithOnSyncCallback(func(context.Context) { health.OK("Synced") }),
-			).Watch(ctx, g.client, path.Join(nodeStore.NodeStorePrefix, g.cinfo.Name))
+			).Watch(ctx, g.client, kvstore.JoinKey(nodeStore.NodeStorePrefix, g.cinfo.Name))
 			return nil
 		}),
 	)
@@ -176,7 +176,7 @@ func (g *gc) run(ctx context.Context, health cell.Health) error {
 			}
 		}
 
-		key := path.Join(nodeStore.NodeStorePrefix, nodeTypes.GetKeyNodeName(g.cinfo.Name, string(nodeName)))
+		key := kvstore.JoinKey(nodeStore.NodeStorePrefix, nodeTypes.GetKeyNodeName(g.cinfo.Name, string(nodeName)))
 		if err := g.client.Delete(ctx, key); err != nil {
 			return fmt.Errorf("deleting node from kvstore: %w", err)
 		}

@@ -9,37 +9,18 @@ import (
 	"os"
 	"testing"
 
-	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
 	linuxConfig "github.com/cilium/cilium/pkg/datapath/linux/config"
-	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
-	"github.com/cilium/cilium/pkg/identity/identitymanager"
-	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/testutils"
-	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
-	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
-	fakewireguard "github.com/cilium/cilium/pkg/wireguard/fake"
 )
 
 func TestWriteInformationalComments(t *testing.T) {
-	logger := hivetest.Logger(t)
 	s := setupEndpointSuite(t)
 
 	model := newTestEndpointModel(100, StateWaitingForIdentity)
-	p := EndpointParams{
-		Logger:           logger,
-		EPBuildQueue:     &MockEndpointBuildQueue{},
-		Orchestrator:     s.orchestrator,
-		PolicyRepo:       s.repo,
-		IdentityManager:  identitymanager.NewIDManager(logger),
-		NamedPortsGetter: testipcache.NewMockIPCache(),
-		IPSecConfig:      fakeipsec.Config{},
-		WgConfig:         fakewireguard.Config{},
-		CTMapGC:          ctmap.NewFakeGCRunner(),
-		Allocator:        testidentity.NewMockIdentityAllocator(nil),
-	}
-	e, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	p := createEndpointParams(t, s.orchestrator, s.repo, s.fetcher)
+	e, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	e.Start(uint16(model.ID))
@@ -53,25 +34,13 @@ func TestWriteInformationalComments(t *testing.T) {
 type writeFunc func(io.Writer) error
 
 func BenchmarkWriteHeaderfile(b *testing.B) {
-	logger := hivetest.Logger(b)
 	testutils.IntegrationTest(b)
 
 	s := setupEndpointSuite(b)
 
 	model := newTestEndpointModel(100, StateWaitingForIdentity)
-	p := EndpointParams{
-		Logger:           logger,
-		EPBuildQueue:     &MockEndpointBuildQueue{},
-		Orchestrator:     s.orchestrator,
-		PolicyRepo:       s.repo,
-		IdentityManager:  identitymanager.NewIDManager(logger),
-		NamedPortsGetter: testipcache.NewMockIPCache(),
-		IPSecConfig:      fakeipsec.Config{},
-		WgConfig:         fakewireguard.Config{},
-		CTMapGC:          ctmap.NewFakeGCRunner(),
-		Allocator:        testidentity.NewMockIdentityAllocator(nil),
-	}
-	e, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	p := createEndpointParams(b, s.orchestrator, s.repo, s.fetcher)
+	e, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 	require.NoError(b, err)
 
 	e.Start(uint16(model.ID))
@@ -87,27 +56,48 @@ func BenchmarkWriteHeaderfile(b *testing.B) {
 	}
 
 	var buf bytes.Buffer
-	file, err := os.CreateTemp("", "cilium_ep_bench_")
+	memoryBacked := func() (io.Writer, func() error) {
+		return &buf, func() error { buf.Reset(); return nil }
+	}
+
+	f, err := os.CreateTemp("", "cilium_ep_bench_")
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer file.Close()
+	defer f.Close()
+
+	fileBacked := func() (io.Writer, func() error) {
+		return f, func() error {
+			_, err := f.Seek(0, io.SeekStart)
+			return err
+		}
+	}
 
 	benchmarks := []struct {
-		name   string
-		output io.Writer
-		write  writeFunc
+		name       string
+		outputFunc func() (io.Writer, func() error)
+		write      writeFunc
 	}{
-		{"in-memory-info", &buf, targetComments},
-		{"in-memory-cfg", &buf, targetConfig},
-		{"to-disk-info", file, targetComments},
-		{"to-disk-cfg", file, targetConfig},
+		{"in-memory-info", memoryBacked, targetComments},
+		{"in-memory-cfg", memoryBacked, targetConfig},
+		{"to-disk-info", fileBacked, targetComments},
+		{"to-disk-cfg", fileBacked, targetConfig},
 	}
 
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
+			output, reset := bm.outputFunc()
+			// Prewarn caches, buffers and the golang JSON marshaller. Since we use b.Loop() this will not be counted
+			if err := bm.write(output); err != nil {
+				b.Fatal(err)
+			}
+
 			for b.Loop() {
-				if err := bm.write(bm.output); err != nil {
+				// Reset buffer/file offset to avoid allocating unbounded amounts of memory or disk
+				if err := reset(); err != nil {
+					b.Fatal(err)
+				}
+				if err := bm.write(output); err != nil {
 					b.Fatal(err)
 				}
 			}

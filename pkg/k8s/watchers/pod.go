@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
-	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/annotation"
 	cgroup "github.com/cilium/cilium/pkg/cgroups/manager"
 	"github.com/cilium/cilium/pkg/controller"
@@ -33,6 +32,7 @@ import (
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipcache"
@@ -40,6 +40,7 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
 	k8sUtils "github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
@@ -54,7 +55,6 @@ import (
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/time"
 	ciliumTypes "github.com/cilium/cilium/pkg/types"
-	"github.com/cilium/cilium/pkg/u8proto"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
@@ -76,7 +76,8 @@ type k8sPodWatcherParams struct {
 	PolicyUpdater      *policy.Updater
 	IPCache            *ipcache.IPCache
 	DB                 *statedb.DB
-	Pods               statedb.Table[agentK8s.LocalPod]
+	Pods               statedb.Table[k8sTables.LocalPod]
+	Namespaces         statedb.Table[k8sTables.Namespace]
 	NodeAddrs          statedb.Table[datapathTables.NodeAddress]
 	CGroupManager      cgroup.CGroupManager
 	LBConfig           loadbalancer.Config
@@ -99,6 +100,7 @@ func newK8sPodWatcher(params k8sPodWatcherParams) *K8sPodWatcher {
 		cgroupManager:      params.CGroupManager,
 		db:                 params.DB,
 		pods:               params.Pods,
+		namespaces:         params.Namespaces,
 		nodeAddrs:          params.NodeAddrs,
 		lbConfig:           params.LBConfig,
 		wgConfig:           params.WgConfig,
@@ -128,7 +130,8 @@ type K8sPodWatcher struct {
 	ipcache            ipcacheManager
 	cgroupManager      cgroupManager
 	db                 *statedb.DB
-	pods               statedb.Table[agentK8s.LocalPod]
+	pods               statedb.Table[k8sTables.LocalPod]
+	namespaces         statedb.Table[k8sTables.Namespace]
 	nodeAddrs          statedb.Table[datapathTables.NodeAddress]
 	lbConfig           loadbalancer.Config
 	wgConfig           wgTypes.Config
@@ -335,7 +338,8 @@ func (k *K8sPodWatcher) updateK8sPodV1(ctx context.Context, oldK8sPod, newK8sPod
 	annoChangedNoTrack := !k8s.AnnotationsEqual([]string{annotation.NoTrack, annotation.NoTrackAlias}, oldAnno, newAnno)
 	annoChangedFIBTableID := option.Config.EnableFibTableIDAnnotation &&
 		!k8s.AnnotationsEqual([]string{annotation.FIBTableID}, oldAnno, newAnno)
-	annotationsChanged := annoChangedBandwidth || annoChangedPriority || annoChangedNoTrack || annoChangedFIBTableID
+	annoChangedDisableSIP := !k8s.AnnotationsEqual([]string{annotation.DisableSourceIPVerification}, oldAnno, newAnno)
+	annotationsChanged := annoChangedBandwidth || annoChangedPriority || annoChangedNoTrack || annoChangedFIBTableID || annoChangedDisableSIP
 
 	// Check label updates too.
 	oldK8sPodLabels, _ := labelsfilter.Filter(labels.Map2Labels(oldK8sPod.ObjectMeta.Labels, labels.LabelSourceK8s))
@@ -408,18 +412,19 @@ func (k *K8sPodWatcher) updateK8sPodV1(ctx context.Context, oldK8sPod, newK8sPod
 					return value
 				}())
 			}
+
 			if annoChangedFIBTableID {
 				if tid, ok := newK8sPod.Annotations[annotation.FIBTableID]; ok {
 					if tidInt, err := strconv.ParseUint(tid, 10, 32); err == nil {
-						podEP.SetFibTableID(uint32(tidInt))
+						podEP.SetRTInfo(uint32(tidInt), endpointtypes.RTInfoFIB)
 					} else {
 						scopedLog.Warn("Unable to parse fib-table-id annotation as uint32, pod will use default routing table.",
 							logfields.Annotation, annotation.FIBTableID,
 							logfields.Error, err,
 						)
 					}
-				} else {
-					podEP.SetFibTableID(0)
+				} else if _, enc := podEP.GetRTInfo(); enc == endpointtypes.RTInfoFIB {
+					podEP.ClearRTInfo()
 				}
 				regenMetadata := &regeneration.ExternalRegenerationMetadata{
 					Reason:            "fib-table-id annotation updated",
@@ -428,7 +433,28 @@ func (k *K8sPodWatcher) updateK8sPodV1(ctx context.Context, oldK8sPod, newK8sPod
 				if regen, _ := podEP.SetRegenerateStateIfAlive(regenMetadata); regen {
 					podEP.Regenerate(regenMetadata)
 				}
-			} else {
+			}
+
+			// Handle source IP verification annotation.
+			if annoChangedDisableSIP {
+				// Get namespace annotations for permission check
+				nsAnno := k.getNamespaceAnnotations(newK8sPod.Namespace)
+				// ApplySourceIPVerificationFromAnnotation returns true only if the value actually changed
+				sipValueChanged := podEP.ApplySourceIPVerificationFromAnnotation(newAnno, nsAnno)
+				if sipValueChanged {
+					scopedLog.Warn(
+						"Source IP verification security control modified via annotation",
+						logfields.Value, newAnno[annotation.DisableSourceIPVerification],
+						logfields.K8sUID, newK8sPod.UID)
+					regenMetadata := &regeneration.ExternalRegenerationMetadata{
+						Reason:            "source IP verification annotation updated",
+						RegenerationLevel: regeneration.RegenerateWithDatapath,
+					}
+					if regen, _ := podEP.SetRegenerateStateIfAlive(regenMetadata); regen {
+						podEP.Regenerate(regenMetadata)
+					}
+				}
+			} else if !annoChangedFIBTableID {
 				realizePodAnnotationUpdate(podEP)
 			}
 		}
@@ -450,6 +476,19 @@ func realizePodAnnotationUpdate(podEP *endpoint.Endpoint) {
 	if regen {
 		podEP.Regenerate(regenMetadata)
 	}
+}
+
+// getNamespaceAnnotations retrieves the annotations for a given namespace.
+// Returns nil if the namespace is not found or if namespaces table is not available.
+func (k *K8sPodWatcher) getNamespaceAnnotations(namespace string) map[string]string {
+	if k.namespaces == nil {
+		return nil
+	}
+	ns, _, found := k.namespaces.Get(k.db.ReadTxn(), k8sTables.NamespaceByName(namespace))
+	if !found {
+		return nil
+	}
+	return ns.Annotations
 }
 
 // updateCiliumEndpointLabels runs a controller associated with the endpoint that updates
@@ -626,16 +665,11 @@ func (k *K8sPodWatcher) updatePodHostData(ctx context.Context, oldPod, newPod *s
 			if port.Name == "" {
 				continue
 			}
-			p, err := u8proto.ParseProtocol(string(port.Protocol))
-			if err != nil {
-				return fmt.Errorf("ContainerPort: invalid protocol: %s", port.Protocol)
-			}
 			if k8sMeta.NamedPorts == nil {
 				k8sMeta.NamedPorts = make(ciliumTypes.NamedPortMap)
 			}
-			k8sMeta.NamedPorts[port.Name] = ciliumTypes.PortProto{
-				Port:  uint16(port.ContainerPort),
-				Proto: p,
+			if err := k8sMeta.NamedPorts.AddPort(port.Name, int(port.ContainerPort), string(port.Protocol)); err != nil {
+				return fmt.Errorf("ContainerPort: invalid named port: %w", err)
 			}
 		}
 	}
@@ -728,7 +762,7 @@ func (k *K8sPodWatcher) GetCachedPod(namespace, name string) (*slim_corev1.Pod, 
 	<-k.controllersStarted
 	k.k8sResourceSynced.WaitForCacheSync(resources.K8sAPIGroupPodV1Core)
 
-	pod, _, found := k.pods.Get(k.db.ReadTxn(), agentK8s.PodByName(namespace, name))
+	pod, _, found := k.pods.Get(k.db.ReadTxn(), k8sTables.PodByName(namespace, name))
 	if !found {
 		return nil, k8sErrors.NewNotFound(schema.GroupResource{
 			Group:    "core",

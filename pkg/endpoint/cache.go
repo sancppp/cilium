@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 
+	endpoint "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/option"
@@ -44,7 +45,7 @@ type epInfoCache struct {
 	ifIndex                int
 	parentIfIndex          int
 	netNsCookie            uint64
-	fibTableID             uint32
+	rtInfo                 uint32
 	properties             map[string]any
 
 	// endpoint is used to get the endpoint's logger.
@@ -58,9 +59,9 @@ type epInfoCache struct {
 
 // Must be called when endpoint is still locked.
 func (e *Endpoint) createEpInfoCache(epdir string) *epInfoCache {
-	if e.isProperty(PropertyAtHostNS) {
+	if e.isProperty(endpoint.PropertyAtHostNS) {
 		return &epInfoCache{
-			revision: e.nextPolicyRevision,
+			revision: e.desiredPolicyRevision,
 
 			id:         e.GetID(),
 			identity:   e.getIdentity(),
@@ -75,7 +76,7 @@ func (e *Endpoint) createEpInfoCache(epdir string) *epInfoCache {
 		}
 	}
 	return &epInfoCache{
-		revision: e.nextPolicyRevision,
+		revision: e.desiredPolicyRevision,
 
 		epdir:                  epdir,
 		id:                     e.GetID(),
@@ -94,15 +95,16 @@ func (e *Endpoint) createEpInfoCache(epdir string) *epInfoCache {
 		ifIndex:                e.ifIndex,
 		parentIfIndex:          e.parentIfIndex,
 		netNsCookie:            e.NetNsCookie,
-		fibTableID:             e.fibTableID,
+		rtInfo:                 e.rtInfo,
 		properties:             maps.Clone(e.properties),
 
 		endpoint: e,
 	}
 }
 
-func (ep *epInfoCache) GetFibTableID() uint32 {
-	return ep.fibTableID
+func (ep *epInfoCache) GetRTInfo() (uint32, endpoint.RTInfoEncoding) {
+	enc, _ := ep.properties[endpoint.PropertyRTInfo].(string)
+	return ep.rtInfo, endpoint.RTInfoEncoding(enc)
 }
 
 func (ep *epInfoCache) GetIfIndex() int {
@@ -202,11 +204,11 @@ func (ep *epInfoCache) IsAtHostNS() bool {
 }
 
 func (ep *epInfoCache) SkipMasqueradeV4() bool {
-	return ep.isProperty(PropertySkipMasqueradeV4)
+	return ep.isProperty(endpoint.PropertySkipMasqueradeV4)
 }
 
 func (ep *epInfoCache) SkipMasqueradeV6() bool {
-	return ep.isProperty(PropertySkipMasqueradeV6)
+	return ep.isProperty(endpoint.PropertySkipMasqueradeV6)
 }
 
 // isProperty checks if the value of the properties map is set, it's a boolean

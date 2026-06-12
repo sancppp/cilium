@@ -13,6 +13,7 @@ import (
 
 	apimock "github.com/cilium/cilium/pkg/azure/api/mock"
 	"github.com/cilium/cilium/pkg/azure/types"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 )
 
@@ -62,11 +63,6 @@ var (
 			},
 		},
 	}
-
-	vnets = []*ipamTypes.VirtualNetwork{
-		{ID: "vpc-0"},
-		{ID: "vpc-1"},
-	}
 )
 
 func iteration1(t *testing.T, api *apimock.API, mngr *InstancesManager) {
@@ -74,35 +70,31 @@ func iteration1(t *testing.T, api *apimock.API, mngr *InstancesManager) {
 
 	resource := &types.AzureInterface{
 		SecurityGroup: "sg1",
+		Subnet:        types.AzureSubnet{ID: "subnet-1"},
 		Addresses: []types.AzureAddress{
 			{
-				IP:     "1.1.1.1",
-				Subnet: "subnet-1",
-				State:  types.StateSucceeded,
+				IP:    iputil.AddrFrom(netip.MustParseAddr("1.1.1.1")),
+				State: types.StateSucceeded,
 			},
 		},
 		State: types.StateSucceeded,
 	}
 	resource.SetID("intf-1")
-	instances.Update("i-1", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	instances.Update("i-1", resource.DeepCopy())
 
 	resource = &types.AzureInterface{
 		SecurityGroup: "sg3",
+		Subnet:        types.AzureSubnet{ID: "subnet-1"},
 		Addresses: []types.AzureAddress{
 			{
-				IP:     "1.1.3.3",
-				Subnet: "subnet-1",
-				State:  types.StateSucceeded,
+				IP:    iputil.AddrFrom(netip.MustParseAddr("1.1.3.3")),
+				State: types.StateSucceeded,
 			},
 		},
 		State: types.StateSucceeded,
 	}
 	resource.SetID("intf-3")
-	instances.Update("i-2", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	instances.Update("i-2", resource.DeepCopy())
 
 	api.UpdateInstances(instances)
 	_, err := mngr.Resync(t.Context())
@@ -116,51 +108,45 @@ func iteration2(t *testing.T, api *apimock.API, mngr *InstancesManager) {
 
 	resource := &types.AzureInterface{
 		SecurityGroup: "sg1",
+		Subnet:        types.AzureSubnet{ID: "subnet-1"},
 		Addresses: []types.AzureAddress{
 			{
-				IP:     "1.1.1.1",
-				Subnet: "subnet-1",
-				State:  types.StateSucceeded,
+				IP:    iputil.AddrFrom(netip.MustParseAddr("1.1.1.1")),
+				State: types.StateSucceeded,
 			},
 		},
 		State: types.StateSucceeded,
 	}
 	resource.SetID("intf-1")
-	instances.Update("i-1", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	instances.Update("i-1", resource.DeepCopy())
 
 	resource = &types.AzureInterface{
 		SecurityGroup: "sg2",
+		Subnet:        types.AzureSubnet{ID: "subnet-3"},
 		Addresses: []types.AzureAddress{
 			{
-				IP:     "3.3.3.3",
-				Subnet: "subnet-3",
-				State:  types.StateSucceeded,
+				IP:    iputil.AddrFrom(netip.MustParseAddr("3.3.3.3")),
+				State: types.StateSucceeded,
 			},
 		},
 		State: types.StateSucceeded,
 	}
 	resource.SetID("intf-2")
-	instances.Update("i-1", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	instances.Update("i-1", resource.DeepCopy())
 
 	resource = &types.AzureInterface{
 		SecurityGroup: "sg3",
+		Subnet:        types.AzureSubnet{ID: "subnet-1"},
 		Addresses: []types.AzureAddress{
 			{
-				IP:     "1.1.3.3",
-				Subnet: "subnet-1",
-				State:  types.StateSucceeded,
+				IP:    iputil.AddrFrom(netip.MustParseAddr("1.1.3.3")),
+				State: types.StateSucceeded,
 			},
 		},
 		State: types.StateSucceeded,
 	}
 	resource.SetID("intf-3")
-	instances.Update("i-2", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	instances.Update("i-2", resource.DeepCopy())
 
 	api.UpdateInstances(instances)
 	_, err := mngr.Resync(t.Context())
@@ -168,10 +154,10 @@ func iteration2(t *testing.T, api *apimock.API, mngr *InstancesManager) {
 }
 
 func TestSubnetDiscovery(t *testing.T) {
-	api := apimock.NewAPI(subnets, vnets)
+	api := apimock.NewAPI(subnets)
 	require.NotNil(t, api)
 
-	mngr := NewInstancesManager(hivetest.Logger(t), api)
+	mngr := NewInstancesManager(hivetest.Logger(t), api, false)
 	require.NotNil(t, mngr)
 
 	require.Nil(t, mngr.subnets["subnet-1"])
@@ -194,11 +180,76 @@ func TestSubnetDiscovery(t *testing.T) {
 	require.NotNil(t, mngr.subnets["subnet-3"])
 }
 
-func TestExtractSubnetIDs(t *testing.T) {
-	api := apimock.NewAPI(subnets, vnets)
+// TestResyncInstancePreservesOtherNodesSubnets ensures that a per-instance
+// resync does not evict subnets that are owned by other instances from the
+// cluster-wide subnet cache. The targeted-subnet optimization in
+// resyncInstance only fetches the subnets referenced by a single instance's
+// interfaces; if that narrow set wholesale-replaces the global map, every
+// other node's subnets disappear and PrepareIPAllocation falls through to
+// the wrong subnet, which Azure rejects with
+// VMScaleSetIpConfigurationsOnSameNicCannotUseDifferentSubnets.
+func TestResyncInstancePreservesOtherNodesSubnets(t *testing.T) {
+	api := apimock.NewAPI(subnets2)
 	require.NotNil(t, api)
 
-	mngr := NewInstancesManager(hivetest.Logger(t), api)
+	mngr := NewInstancesManager(hivetest.Logger(t), api, false)
+	require.NotNil(t, mngr)
+
+	// Two instances using DIFFERENT subnets:
+	//   vm-1 → subnet-1
+	//   vm-2 → subnet-3
+	instances := ipamTypes.NewInstanceMap()
+
+	iface1 := &types.AzureInterface{
+		SecurityGroup: "sg1",
+		Subnet:        types.AzureSubnet{ID: "subnet-1"},
+		Addresses: []types.AzureAddress{
+			{
+				IP:    iputil.AddrFrom(netip.MustParseAddr("1.1.1.1")),
+				State: types.StateSucceeded,
+			},
+		},
+		State: types.StateSucceeded,
+	}
+	iface1.SetID("intf-vm-1")
+	instances.Update("vm-1", iface1.DeepCopy())
+
+	iface2 := &types.AzureInterface{
+		SecurityGroup: "sg2",
+		Subnet:        types.AzureSubnet{ID: "subnet-3"},
+		Addresses: []types.AzureAddress{
+			{
+				IP:    iputil.AddrFrom(netip.MustParseAddr("3.3.3.3")),
+				State: types.StateSucceeded,
+			},
+		},
+		State: types.StateSucceeded,
+	}
+	iface2.SetID("intf-vm-2")
+	instances.Update("vm-2", iface2.DeepCopy())
+
+	api.UpdateInstances(instances)
+
+	// Initial full resync populates m.subnets with both subnets.
+	_, err := mngr.Resync(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, mngr.subnets["subnet-1"])
+	require.NotNil(t, mngr.subnets["subnet-3"])
+
+	// Per-instance resync for vm-1 only references subnet-1. It must not
+	// evict subnet-3 (owned by vm-2) from the cluster-wide map.
+	_, err = mngr.InstanceSync(t.Context(), "vm-1")
+	require.NoError(t, err)
+
+	require.NotNil(t, mngr.subnets["subnet-1"], "vm-1's subnet should still be present after its own per-instance resync")
+	require.NotNil(t, mngr.subnets["subnet-3"], "vm-2's subnet must not be evicted by a per-instance resync of vm-1")
+}
+
+func TestExtractSubnetIDs(t *testing.T) {
+	api := apimock.NewAPI(subnets)
+	require.NotNil(t, api)
+
+	mngr := NewInstancesManager(hivetest.Logger(t), api, false)
 	require.NotNil(t, mngr)
 
 	// Create 100 instances across only 2 different subnets to test deduplication
@@ -219,19 +270,17 @@ func TestExtractSubnetIDs(t *testing.T) {
 		resource := &types.AzureInterface{
 			Name:          "eth0",
 			SecurityGroup: "sg1",
+			Subnet:        types.AzureSubnet{ID: subnetID},
 			Addresses: []types.AzureAddress{
 				{
-					IP:     fmt.Sprintf("10.0.%d.%d", (i%254)+1, (i%254)+10),
-					Subnet: subnetID,
-					State:  types.StateSucceeded,
+					IP:    iputil.AddrFrom(netip.MustParseAddr(fmt.Sprintf("10.0.%d.%d", (i%254)+1, (i%254)+10))),
+					State: types.StateSucceeded,
 				},
 			},
 		}
 		resource.SetID(interfaceID)
 
-		instances.Update(instanceID, ipamTypes.InterfaceRevision{
-			Resource: resource.DeepCopy(),
-		})
+		instances.Update(instanceID, resource.DeepCopy())
 	}
 
 	// Extract subnet IDs and verify deduplication

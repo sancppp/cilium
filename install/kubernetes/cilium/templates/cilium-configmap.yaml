@@ -285,6 +285,8 @@ data:
   ingress-lb-annotation-prefixes: {{ .Values.ingressController.ingressLBAnnotationPrefixes | join " " | quote }}
   ingress-default-lb-mode: {{ .Values.ingressController.loadbalancerMode }}
   ingress-shared-lb-service-name: {{ .Values.ingressController.service.name }}
+  ingress-default-xff-num-trusted-hops: {{ .Values.ingressController.xffNumTrustedHops | quote }}
+  ingress-use-remote-address: {{ .Values.ingressController.useRemoteAddress | quote }}
   {{- if and .Values.ingressController.defaultSecretNamespace .Values.ingressController.defaultSecretName }}
   ingress-default-secret-namespace: {{ .Values.ingressController.defaultSecretNamespace | quote }}
   ingress-default-secret-name: {{ .Values.ingressController.defaultSecretName | quote }}
@@ -304,6 +306,7 @@ data:
   enable-gateway-api-app-protocol: {{ or .Values.gatewayAPI.enableAppProtocol .Values.gatewayAPI.enableAlpn | quote }}
   enable-gateway-api-alpn: {{ .Values.gatewayAPI.enableAlpn | quote }}
   gateway-api-xff-num-trusted-hops: {{ .Values.gatewayAPI.xffNumTrustedHops | quote }}
+  gateway-api-use-remote-address: {{ .Values.gatewayAPI.useRemoteAddress | quote }}
   gateway-api-service-externaltrafficpolicy: {{ .Values.gatewayAPI.externalTrafficPolicy | quote }}
   gateway-api-secrets-namespace: {{ .Values.gatewayAPI.secretsNamespace.name | quote }}
   gateway-api-hostnetwork-enabled: {{ .Values.gatewayAPI.hostNetwork.enabled | quote }}
@@ -334,6 +337,10 @@ data:
   # Enable IPv6 addressing. If enabled, all endpoints are allocated an IPv6
   # address.
   enable-ipv6: {{ .Values.ipv6.enabled | quote }}
+
+{{- if eq .Values.preferIpv6 true }}
+  prefer-ipv6: "true"
+{{- end }}
 
 {{- if .Values.cleanState }}
   # If a serious issue occurs during Cilium startup, this
@@ -486,8 +493,16 @@ data:
 {{- if hasKey .Values.bpf "lbSourceRangeAllTypes" }}
   bpf-lb-source-range-all-types: {{ .Values.bpf.lbSourceRangeAllTypes | quote }}
 {{- end }}
-{{- if hasKey .Values.bpf "lbAlgorithmAnnotation" }}
+{{- if or (hasKey .Values.bpf "lbAlgorithmAnnotation") .Values.gatewayAPI.enabled }}
+# When Gateway API is enabled this is forced to "true" so per-backend weights
+# on TCPRoute/UDPRoute take effect (Maglev honors the LB algorithm annotation only
+# when enabled). Paired with `bpf-lb-sock-hostns-only`, which is forced "true"
+# for the same reason.
+{{- if .Values.gatewayAPI.enabled }}
+  bpf-lb-algorithm-annotation: "true"
+{{- else }}
   bpf-lb-algorithm-annotation: {{ .Values.bpf.lbAlgorithmAnnotation | quote }}
+{{- end }}
 {{- end }}
 {{- if hasKey .Values.bpf "lbModeAnnotation" }}
   bpf-lb-mode-annotation: {{ .Values.bpf.lbModeAnnotation | quote }}
@@ -747,7 +762,6 @@ data:
     {{- if .Values.encryption.ipsec.keyRotationDuration }}
   ipsec-key-rotation-duration: {{ include "validateDuration" .Values.encryption.ipsec.keyRotationDuration | quote }}
     {{- end }}
-  enable-ipsec-encrypted-overlay: {{ .Values.encryption.ipsec.encryptedOverlay | quote }}
   {{- else if eq .Values.encryption.type "wireguard" }}
   enable-wireguard: {{ .Values.encryption.enabled | quote }}
     {{- if .Values.encryption.wireguard.persistentKeepalive }}
@@ -755,17 +769,11 @@ data:
     {{- end }}
   {{- else if eq .Values.encryption.type "ztunnel" }}
   enable-ztunnel: {{ .Values.encryption.enabled | quote }}
+  ztunnel-ca-type: {{ .Values.encryption.ztunnel.ca.type | quote }}
   {{- end }}
   {{- if .Values.encryption.nodeEncryption }}
   encrypt-node: {{ .Values.encryption.nodeEncryption | quote }}
   {{- end }}
-{{- end }}
-
-{{- if .Values.encryption.strictMode.enabled }}
-  # --- DEPRECATED: Please use encryption.strictMode.egress.enabled instead
-  enable-encryption-strict-mode-egress: {{ .Values.encryption.strictMode.enabled | quote }}
-  encryption-strict-egress-cidr: {{ .Values.encryption.strictMode.cidr | quote }}
-  encryption-strict-egress-allow-remote-node-identities: {{ .Values.encryption.strictMode.allowRemoteNodeIdentities | quote }}
 {{- end }}
 
 {{- if .Values.encryption.strictMode.ingress.enabled }}
@@ -830,9 +838,7 @@ data:
   enable-nat46x64-gateway: {{ .Values.nat46x64Gateway.enabled | quote }}
 {{- end }}
 
-{{- if and .Values.hostFirewall .Values.hostFirewall.enabled }}
   enable-host-firewall: {{ .Values.hostFirewall.enabled | quote }}
-{{- end}}
 
 {{- if hasKey .Values "devices" }}
   # List of devices used to attach bpf_host.o (implements BPF NodePort,
@@ -858,8 +864,16 @@ data:
 {{- if hasKey $socketLB "enabled" }}
   bpf-lb-sock: {{ $socketLB.enabled | quote }}
 {{- end }}
-{{- if hasKey $socketLB "hostNamespaceOnly" }}
+{{- if or (hasKey $socketLB "hostNamespaceOnly") .Values.gatewayAPI.enabled }}
+# When Gateway API is enabled this is forced to "true" so per-backend weights
+# on TCPRoute/UDPRoute take effect (socket LB stays in the host namespace,
+# letting the Maglev LB mode apply). Paired with `bpf-lb-mode-annotation`,
+# which is forced "true" for the same reason.
+{{- if .Values.gatewayAPI.enabled }}
+  bpf-lb-sock-hostns-only: "true"
+{{- else }}
   bpf-lb-sock-hostns-only: {{ $socketLB.hostNamespaceOnly | quote }}
+{{- end }}
 {{- end }}
 {{- if hasKey $socketLB "terminatePodConnections" }}
   bpf-lb-sock-terminate-pod-connections: {{ $socketLB.terminatePodConnections | quote }}
@@ -894,9 +908,6 @@ data:
   enable-auto-protect-node-port-range: {{ .Values.nodePort.autoProtectPortRange | quote }}
 {{- end }}
 {{- if hasKey .Values "loadBalancer" }}
-{{- if .Values.loadBalancer.standalone }}
-  bpf-lb-only: {{ .Values.loadBalancer.standalone | quote }}
-{{- end }}
 {{- if hasKey .Values.loadBalancer "mode" }}
   bpf-lb-mode: {{ .Values.loadBalancer.mode | quote }}
 {{- end }}
@@ -911,6 +922,9 @@ data:
 {{- end }}
 {{- if hasKey .Values.loadBalancer "serviceTopology" }}
   enable-service-topology: {{ .Values.loadBalancer.serviceTopology | quote }}
+{{- end }}
+{{- if hasKey .Values.loadBalancer "reflectorWaitTime" }}
+  lb-reflector-wait-time: {{ .Values.loadBalancer.reflectorWaitTime | quote }}
 {{- end }}
 {{- end }}
 
@@ -959,7 +973,7 @@ data:
 {{- if hasKey .Values.k8s "requireIPv6PodCIDR" }}
   k8s-require-ipv6-pod-cidr: {{ .Values.k8s.requireIPv6PodCIDR | quote }}
 {{- end }}
-{{- if hasKey .Values.k8s "apiServerURLs" }}
+{{- if (not (kindIs "invalid" .Values.k8s.apiServerURLs)) }}
   k8s-api-server-urls: {{ .Values.k8s.apiServerURLs | quote }}
 {{- end }}
 {{- if and .Values.endpointRoutes .Values.endpointRoutes.enabled }}
@@ -1154,7 +1168,7 @@ data:
   hubble-drop-events-interval: {{ .Values.hubble.dropEventEmitter.interval | quote }}
   hubble-drop-events-reasons: {{ .Values.hubble.dropEventEmitter.reasons | join " " | quote }}
 {{- end }}
-{{- if or (eq .Values.hubble.preferIpv6 true) (eq .Values.ipv4.enabled false) }}
+{{- if or (eq .Values.hubble.preferIpv6 true) (eq .Values.preferIpv6 true) (eq .Values.ipv4.enabled false) }}
   hubble-prefer-ipv6: "true"
 {{- end }}
 {{- if (not (kindIs "invalid" .Values.hubble.skipUnknownCGroupIDs)) }}
@@ -1217,6 +1231,12 @@ data:
     {{- if hasKey $spec "ipv6" }}
     {{- $attrs = append $attrs (printf "ipv6-cidrs:%s" (join "," $spec.ipv6.cidrs)) }}
     {{- $attrs = append $attrs (printf "ipv6-mask-size:%s" (toString $spec.ipv6.maskSize)) }}
+    {{- end }}
+    {{- if hasKey $spec "allowFirstIP" }}
+    {{- $attrs = append $attrs (printf "allow-first-ip:%s" (toString $spec.allowFirstIP)) }}
+    {{- end }}
+    {{- if hasKey $spec "allowLastIP" }}
+    {{- $attrs = append $attrs (printf "allow-last-ip:%s" (toString $spec.allowLastIP)) }}
     {{- end }}
     {{- $pools = append $pools (printf "%s=%s" $pool (join ";" $attrs)) }}
   {{- end }}
@@ -1293,8 +1313,6 @@ data:
   enable-l2-pod-announcements: {{ .Values.l2podAnnouncements.enabled | quote }}
   {{- if .Values.l2podAnnouncements.interfacePattern }}
   l2-pod-announcements-interface-pattern: {{ .Values.l2podAnnouncements.interfacePattern | quote }}
-  {{- else }}
-  l2-pod-announcements-interface: {{ .Values.l2podAnnouncements.interface | quote }}
   {{- end }}
 {{- end }}
 
@@ -1473,6 +1491,7 @@ data:
   proxy-max-concurrent-retries: {{ .Values.envoy.maxConcurrentRetries | quote }}
   proxy-use-original-source-address: {{ .Values.envoy.useOriginalSourceAddress | quote }}
   proxy-cluster-max-connections: {{ .Values.envoy.clusterMaxConnections | quote }}
+  proxy-cluster-max-pending-requests: {{ .Values.envoy.clusterMaxPendingRequests | quote }}
   proxy-cluster-max-requests: {{ .Values.envoy.clusterMaxRequests | quote }}
   http-retry-count: {{ .Values.envoy.httpRetryCount | quote }}
   http-stream-idle-timeout: {{ .Values.envoy.streamIdleTimeoutDurationSeconds | quote }}
@@ -1531,6 +1550,9 @@ data:
   ignore-flags-drift-checker: {{ join "," .Values.configDriftDetection.ignoredKeys | quote }}
   {{- end }}
 {{- end }}
+
+  enable-datapath-plugins: {{ .Values.datapathPlugins.enabled | quote }}
+  datapath-plugins-state-dir: {{ .Values.datapathPlugins.stateDir | quote }}
 
 # Extra config allows adding arbitrary properties to the cilium config.
 # By putting it at the end of the ConfigMap, it's also possible to override existing properties.

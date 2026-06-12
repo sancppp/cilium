@@ -8,23 +8,17 @@ import (
 	"fmt"
 	"log/slog"
 
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/cilium/cilium/operator/pkg/gateway-api/indexers"
+	"github.com/cilium/cilium/operator/pkg/gateway-api/predicates"
+	watchhandlers "github.com/cilium/cilium/operator/pkg/gateway-api/watch-handlers"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
-	"github.com/cilium/cilium/pkg/logging/logfields"
-)
-
-const (
-	gatewayClassConfigMapIndexName = ".spec.parametersRef"
 )
 
 // gatewayClassReconciler reconciles a GatewayClass object
@@ -32,21 +26,23 @@ type gatewayClassReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	logger *slog.Logger
+	logger         *slog.Logger
+	controllerName string
 }
 
-func newGatewayClassReconciler(mgr ctrl.Manager, logger *slog.Logger) *gatewayClassReconciler {
+func newGatewayClassReconciler(mgr ctrl.Manager, logger *slog.Logger, controllerName string) *gatewayClassReconciler {
 	return &gatewayClassReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		logger: logger,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		logger:         logger,
+		controllerName: controllerName,
 	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *gatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	for indexName, indexerFunc := range map[string]client.IndexerFunc{
-		gatewayClassConfigMapIndexName: referencedConfig,
+		indexers.GatewayClassCiliumGatewayClassConfigsIndex: r.referencedConfig,
 	} {
 		if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.GatewayClass{}, indexName, indexerFunc); err != nil {
 			return fmt.Errorf("failed to setup field indexer %q: %w", indexName, err)
@@ -55,37 +51,9 @@ func (r *gatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.GatewayClass{},
-			builder.WithPredicates(predicate.NewPredicateFuncs(matchesControllerName(controllerName)))).
-		Watches(&v2alpha1.CiliumGatewayClassConfig{}, r.enqueueRequestForCiliumGatewayClassConfig()).
+			builder.WithPredicates(predicates.GatewayClassOwnedByController(r.controllerName))).
+		Watches(&v2alpha1.CiliumGatewayClassConfig{}, watchhandlers.EnqueueRequestForCiliumGatewayClassConfig(r.Client, r.logger)).
 		Complete(r)
-}
-
-func (r *gatewayClassReconciler) enqueueRequestForCiliumGatewayClassConfig() handler.EventHandler {
-	return handler.EnqueueRequestsFromMapFunc(r.enqueueFromIndex(gatewayClassConfigMapIndexName))
-}
-
-func (r *gatewayClassReconciler) enqueueFromIndex(index string) handler.MapFunc {
-	return func(ctx context.Context, o client.Object) []reconcile.Request {
-		scopedLog := r.logger.With(
-			logfields.Resource, client.ObjectKeyFromObject(o),
-		)
-		list := &gatewayv1.GatewayClassList{}
-
-		if err := r.Client.List(ctx, list, &client.ListOptions{
-			FieldSelector: fields.OneTermEqualSelector(index, client.ObjectKeyFromObject(o).String()),
-		}); err != nil {
-			scopedLog.ErrorContext(ctx, "Failed to list related GatewayClass", logfields.Error, err)
-			return []reconcile.Request{}
-		}
-
-		requests := make([]reconcile.Request, 0, len(list.Items))
-		for _, item := range list.Items {
-			c := client.ObjectKeyFromObject(&item)
-			requests = append(requests, reconcile.Request{NamespacedName: c})
-			scopedLog.InfoContext(ctx, "Enqueued GatewayClass for resource", gatewayClass, c)
-		}
-		return requests
-	}
 }
 
 func matchesControllerName(controllerName string) func(object client.Object) bool {
@@ -99,9 +67,13 @@ func matchesControllerName(controllerName string) func(object client.Object) boo
 }
 
 // referencedConfig returns a list of CiliumGatewayClassConfig names referenced by the GatewayClass.
-func referencedConfig(rawObj client.Object) []string {
+func (r *gatewayClassReconciler) referencedConfig(rawObj client.Object) []string {
 	gwc, ok := rawObj.(*gatewayv1.GatewayClass)
 	if !ok {
+		return nil
+	}
+
+	if string(gwc.Spec.ControllerName) != r.controllerName {
 		return nil
 	}
 

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net"
+	"net/netip"
 	"slices"
 	"sort"
 	"strconv"
@@ -16,9 +16,12 @@ import (
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
+	"github.com/cilium/cilium/pkg/defaults"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipam/types"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2"
@@ -35,22 +38,21 @@ const (
 	// be fulfilled
 	pendingAllocationTTL = 5 * time.Minute
 
-	// refreshPoolsInterval defines the run interval of the ipam-sync-multi-pool controller
+	// refreshPoolInterval defines the run interval of the ipam-sync-multi-pool controller
 	refreshPoolInterval = 1 * time.Minute
 )
 
 type ErrPoolNotReadyYet struct {
 	poolName Pool
 	family   Family
-	ip       net.IP
+	addr     netip.Addr
 }
 
 func (e *ErrPoolNotReadyYet) Error() string {
-	if e.ip == nil {
+	if !e.addr.IsValid() {
 		return fmt.Sprintf("unable to allocate from pool %q (family %s): pool not (yet) available", e.poolName, e.family)
-	} else {
-		return fmt.Sprintf("unable to reserve IP %s from pool %q (family %s): pool not (yet) available", e.ip, e.poolName, e.family)
 	}
+	return fmt.Sprintf("unable to reserve IP %s from pool %q (family %s): pool not (yet) available", e.addr, e.poolName, e.family)
 }
 
 func (e *ErrPoolNotReadyYet) Is(err error) bool {
@@ -59,8 +61,10 @@ func (e *ErrPoolNotReadyYet) Is(err error) bool {
 }
 
 type poolPair struct {
-	v4 *cidrPool
-	v6 *cidrPool
+	v4           *cidrPool
+	v6           *cidrPool
+	allowFirstIP bool
+	allowLastIP  bool
 }
 
 type preAllocatePerPool map[Pool]int
@@ -236,6 +240,12 @@ type MultiPoolManagerParams struct {
 	PoolsFromResource ciliumv2.PoolsFromResourceFunc
 
 	SkipMasqueradeForPool SkipMasqueradeForPoolFn
+
+	// LinearPreAlloc uses a simple inUse + preAlloc formula for demand
+	// computation instead of the multi-pool's neededIPCeil rounding. This
+	// matches the CRD allocator's calculateNeededIPs behavior and allows
+	// the operator to recover exact usage from the demand signal.
+	LinearPreAlloc bool
 }
 
 type multiPoolManager struct {
@@ -264,6 +274,8 @@ type multiPoolManager struct {
 
 	poolsFromResource     ciliumv2.PoolsFromResourceFunc
 	skipMasqueradeForPool SkipMasqueradeForPoolFn
+
+	linearPreAlloc bool
 }
 
 func newMultiPoolManager(p MultiPoolManagerParams) *multiPoolManager {
@@ -285,6 +297,7 @@ func newMultiPoolManager(p MultiPoolManagerParams) *multiPoolManager {
 			close(localNodeUpdated)
 		}),
 		poolsFromResource: p.PoolsFromResource,
+		linearPreAlloc:    p.LinearPreAlloc,
 		skipMasqueradeForPool: func(Pool) (bool, error) {
 			return false, nil
 		},
@@ -390,9 +403,15 @@ func (m *multiPoolManager) ciliumNodeUpdated(newNode *ciliumv2.CiliumNode) {
 	m.poolsMutex.Lock()
 	defer m.poolsMutex.Unlock()
 
-	pools := m.poolsFromResource(newNode)
-	for _, pool := range pools.Allocated {
-		m.upsertPoolLocked(Pool(pool.Pool), pool.CIDRs)
+	for _, pool := range m.poolsFromResource(newNode).Allocated {
+		m.upsertPoolLocked(Pool(pool.Pool), pool.CIDRs, pool.AllowFirstIP, pool.AllowLastIP)
+	}
+
+	// Sync pre-allocate value from the CiliumNode spec. For cloud IPAM modes,
+	// the agent writes it during node discovery and the operator may adjust
+	// it. For standard multi-pool mode this field is unset (0).
+	if newNode.Spec.IPAM.PreAllocate > 0 {
+		m.preallocatedIPsPerPool[Pool(defaults.IPAMDefaultIPPool)] = newNode.Spec.IPAM.PreAllocate
 	}
 
 	// node will only be nil the first time this callback is invoked
@@ -475,12 +494,27 @@ func (m *multiPoolManager) computeNeededIPsPerPoolLocked() map[Pool]types.IPAMPo
 	// + preAllocIPs
 	for poolName, preAlloc := range m.preallocatedIPsPerPool {
 		ipv4Addrs := demand[poolName].IPv4Addrs
-		if m.ipv4Enabled {
-			ipv4Addrs = neededIPCeil(ipv4Addrs, preAlloc)
-		}
 		ipv6Addrs := demand[poolName].IPv6Addrs
-		if m.ipv6Enabled {
-			ipv6Addrs = neededIPCeil(ipv6Addrs, preAlloc)
+
+		if m.linearPreAlloc {
+			// Linear pre-allocation: inUse + preAlloc. This matches the
+			// CRD allocator's calculateNeededIPs formula and allows the
+			// operator to recover exact usage as requested - preAllocate.
+			if m.ipv4Enabled {
+				ipv4Addrs += preAlloc
+			}
+			if m.ipv6Enabled {
+				ipv6Addrs += preAlloc
+			}
+		} else {
+			// Standard multi-pool rounding: rounds up to ensure at least
+			// one full preAlloc buffer above usage.
+			if m.ipv4Enabled {
+				ipv4Addrs = neededIPCeil(ipv4Addrs, preAlloc)
+			}
+			if m.ipv6Enabled {
+				ipv6Addrs = neededIPCeil(ipv6Addrs, preAlloc)
+			}
 		}
 
 		demand[poolName] = types.IPAMPoolDemand{
@@ -494,8 +528,19 @@ func (m *multiPoolManager) computeNeededIPsPerPoolLocked() map[Pool]types.IPAMPo
 
 func (m *multiPoolManager) restoreFinished(family Family) {
 	m.poolsMutex.Lock()
+	defer m.poolsMutex.Unlock()
+
 	m.finishedRestore[family] = true
-	m.poolsMutex.Unlock()
+
+	// Trigger update to k8s to recalculate and synchronize requested addresses in CiliumNode
+	// .Spec.IPAM.Pools.Requested with the actual need after restore is finished.
+	if m.ipv4Enabled && !m.finishedRestore[IPv4] {
+		return
+	}
+	if m.ipv6Enabled && !m.finishedRestore[IPv6] {
+		return
+	}
+	m.k8sUpdater.Trigger()
 }
 
 func (m *multiPoolManager) isRestoreFinishedLocked(family Family) bool {
@@ -532,7 +577,7 @@ func (m *multiPoolManager) updateLocalNode(ctx context.Context) error {
 	for poolName, pool := range m.pools {
 		neededIPs := neededIPsPerPool[poolName]
 
-		cidrs := []types.IPAMCIDR{}
+		cidrs := []iputil.Prefix{}
 		if v4Pool := pool.v4; v4Pool != nil {
 			if m.isRestoreFinishedLocked(IPv4) {
 				// releaseExcessCIDRsMultiPool interprets neededIPs as how many
@@ -543,7 +588,7 @@ func (m *multiPoolManager) updateLocalNode(ctx context.Context) error {
 			}
 			v4CIDRs := v4Pool.inUseCIDRs()
 
-			slices.Sort(v4CIDRs)
+			slices.SortFunc(v4CIDRs, func(a, b iputil.Prefix) int { return a.Prefix.Compare(b.Prefix) })
 			cidrs = append(cidrs, v4CIDRs...)
 		}
 		if v6Pool := pool.v6; v6Pool != nil {
@@ -553,7 +598,7 @@ func (m *multiPoolManager) updateLocalNode(ctx context.Context) error {
 			}
 			v6CIDRs := v6Pool.inUseCIDRs()
 
-			slices.Sort(v6CIDRs)
+			slices.SortFunc(v6CIDRs, func(a, b iputil.Prefix) int { return a.Prefix.Compare(b.Prefix) })
 			cidrs = append(cidrs, v6CIDRs...)
 		}
 
@@ -564,12 +609,12 @@ func (m *multiPoolManager) updateLocalNode(ctx context.Context) error {
 		}
 
 		allocated = append(allocated, types.IPAMPoolAllocation{
-			Pool:  poolName.String(),
-			CIDRs: cidrs,
+			Pool:         poolName.String(),
+			AllowFirstIP: pool.allowFirstIP,
+			AllowLastIP:  pool.allowLastIP,
+			CIDRs:        cidrs,
 		})
 	}
-
-	newPools := m.poolsFromResource(newNode)
 
 	sort.Slice(requested, func(i, j int) bool {
 		return requested[i].Pool < requested[j].Pool
@@ -577,17 +622,54 @@ func (m *multiPoolManager) updateLocalNode(ctx context.Context) error {
 	sort.Slice(allocated, func(i, j int) bool {
 		return allocated[i].Pool < allocated[j].Pool
 	})
-	newPools.Requested = requested
-	newPools.Allocated = allocated
+	newNode.Spec.IPAM.Pools.Requested = requested
+	// Only write Allocated once local pools have been populated. Before
+	// that, the agent has no CIDRs of its own and writing an empty
+	// Allocated would clear CIDRs that may still be in use from a
+	// previous agent run. Once the agent has observed at least one CIDR
+	// (from Status.ENI.ENIs in ENI mode, or from Pools.Allocated in
+	// standard multi-pool mode), it writes Allocated to communicate
+	// in-use CIDRs back to the operator.
+	if len(m.pools) > 0 {
+		newNode.Spec.IPAM.Pools.Allocated = allocated
+	}
 
 	m.poolsMutex.Unlock()
 
-	pools := m.poolsFromResource(curNode)
-
-	if !newPools.DeepEqual(pools) {
-		_, err := m.cnClient.Update(ctx, newNode, metav1.UpdateOptions{})
-		if err != nil {
+	if !newNode.Spec.IPAM.Pools.DeepEqual(&curNode.Spec.IPAM.Pools) {
+		updatedNode, err := m.cnClient.Update(ctx, newNode, metav1.UpdateOptions{})
+		switch {
+		case k8sErrors.IsConflict(err):
+			m.logger.Info(
+				"Conflict when updating local CiliumNode resource, will retry",
+				logfields.Error, err,
+			)
+			return nil
+		case err != nil:
 			return fmt.Errorf("failed to update node spec: %w", err)
+		}
+		newNode = updatedNode
+	}
+
+	// Clear stale Status.IPAM.Used left by the previous CRD allocator.
+	// This is needed so the operator detects the agent as multi-pool
+	// (the detection heuristic checks len(Status.IPAM.Used) == 0).
+	//
+	// This only happens when an agent starts on a node that was previously
+	// running a 1.19 agent.
+	// TODO: Remove with 1.21.
+	if len(newNode.Status.IPAM.Used) > 0 {
+		newNode.Status.IPAM.Used = nil
+		_, err := m.cnClient.UpdateStatus(ctx, newNode, metav1.UpdateOptions{})
+		switch {
+		case k8sErrors.IsConflict(err):
+			m.logger.Info(
+				"Conflict when updating local CiliumNode Status subresource, will retry",
+				logfields.Error, err,
+			)
+			return nil
+		case err != nil:
+			return fmt.Errorf("failed to clear stale Status.IPAM.Used: %w", err)
 		}
 	}
 
@@ -596,34 +678,68 @@ func (m *multiPoolManager) updateLocalNode(ctx context.Context) error {
 	return nil
 }
 
-func (m *multiPoolManager) upsertPoolLocked(poolName Pool, cidrs []types.IPAMCIDR) {
+func (m *multiPoolManager) upsertPoolLocked(poolName Pool, cidrs []iputil.Prefix, allowFirstIP, allowLastIP bool) {
 	pool, ok := m.pools[poolName]
 	if !ok {
-		pool = &poolPair{}
+		pool = &poolPair{
+			allowFirstIP: allowFirstIP,
+			allowLastIP:  allowLastIP,
+		}
 		if m.ipv4Enabled {
-			pool.v4 = newCIDRPool(m.logger, false)
+			pool.v4 = newCIDRPool(m.logger, allowFirstIP, allowLastIP)
 		}
 		if m.ipv6Enabled {
-			pool.v6 = newCIDRPool(m.logger, false)
+			pool.v6 = newCIDRPool(m.logger, allowFirstIP, allowLastIP)
 		}
+	} else if pool.allowFirstIP != allowFirstIP || pool.allowLastIP != allowLastIP {
+		if pool.v4 != nil {
+			if pool.v4.inUseIPCount() == 0 {
+				pool.v4 = newCIDRPool(m.logger, allowFirstIP, allowLastIP)
+			} else {
+				m.logger.Warn(
+					"ignoring changed first/last IP settings for pool with in-use IPs",
+					logfields.PoolName, poolName,
+					logfields.Family, IPv4,
+				)
+			}
+		}
+		if pool.v6 != nil {
+			if pool.v6.inUseIPCount() == 0 {
+				pool.v6 = newCIDRPool(m.logger, allowFirstIP, allowLastIP)
+			} else {
+				m.logger.Warn(
+					"ignoring changed first/last IP settings for pool with in-use IPs",
+					logfields.PoolName, poolName,
+					logfields.Family, IPv6,
+				)
+			}
+		}
+		pool.allowFirstIP = allowFirstIP
+		pool.allowLastIP = allowLastIP
 	}
 
-	var ipv4CIDRs, ipv6CIDRs []string
-	for _, ipamCIDR := range cidrs {
-		cidr := string(ipamCIDR)
-		switch cidrFamily(cidr) {
-		case IPv4:
-			ipv4CIDRs = append(ipv4CIDRs, cidr)
-		case IPv6:
-			ipv6CIDRs = append(ipv6CIDRs, cidr)
+	var ipv4Prefixes, ipv6Prefixes []netip.Prefix
+	for _, c := range cidrs {
+		if !c.IsValid() {
+			m.logger.Error(
+				"ignoring invalid CIDR",
+				logfields.CIDR, c,
+			)
+			continue
+		}
+		prefix := c.Prefix.Masked()
+		if prefix.Addr().Is6() {
+			ipv6Prefixes = append(ipv6Prefixes, prefix)
+		} else {
+			ipv4Prefixes = append(ipv4Prefixes, prefix)
 		}
 	}
 
 	if pool.v4 != nil {
-		pool.v4.updatePool(ipv4CIDRs)
+		pool.v4.updatePool(ipv4Prefixes)
 	}
 	if pool.v6 != nil {
-		pool.v6.updatePool(ipv6CIDRs)
+		pool.v6.updatePool(ipv6Prefixes)
 	}
 
 	m.pools[poolName] = pool
@@ -709,17 +825,17 @@ func (m *multiPoolManager) allocateNext(owner string, poolName Pool, family Fami
 		return nil, err
 	}
 
-	ip, err := pool.allocateNext()
+	addr, err := pool.allocateNext()
 	if err != nil {
 		m.pendingIPsPerPool.upsertPendingAllocation(poolName, owner, family)
 		return nil, err
 	}
 
 	m.pendingIPsPerPool.markAsAllocated(poolName, owner, family)
-	return &AllocationResult{IP: ip, IPPoolName: poolName, SkipMasquerade: skipMasq}, nil
+	return &AllocationResult{IP: addr, IPPoolName: poolName, SkipMasquerade: skipMasq}, nil
 }
 
-func (m *multiPoolManager) allocateIP(ip net.IP, owner string, poolName Pool, family Family, syncUpstream bool) (*AllocationResult, error) {
+func (m *multiPoolManager) allocateIP(addr netip.Addr, owner string, poolName Pool, family Family, syncUpstream bool) (*AllocationResult, error) {
 	m.poolsMutex.Lock()
 	defer m.poolsMutex.Unlock()
 
@@ -732,29 +848,29 @@ func (m *multiPoolManager) allocateIP(ip net.IP, owner string, poolName Pool, fa
 	pool := m.poolByFamilyLocked(poolName, family)
 	if pool == nil {
 		m.pendingIPsPerPool.upsertPendingAllocation(poolName, owner, family)
-		return nil, &ErrPoolNotReadyYet{poolName: poolName, family: family, ip: ip}
+		return nil, &ErrPoolNotReadyYet{poolName: poolName, family: family, addr: addr}
 	}
 
-	err := pool.allocate(ip)
+	err := pool.allocate(addr)
 	if err != nil {
 		m.pendingIPsPerPool.upsertPendingAllocation(poolName, owner, family)
 		return nil, err
 	}
 
 	m.pendingIPsPerPool.markAsAllocated(poolName, owner, family)
-	return &AllocationResult{IP: ip, IPPoolName: poolName}, nil
+	return &AllocationResult{IP: addr, IPPoolName: poolName}, nil
 }
 
-func (m *multiPoolManager) releaseIP(ip net.IP, poolName Pool, family Family, upstreamSync bool) error {
+func (m *multiPoolManager) releaseIP(addr netip.Addr, poolName Pool, family Family, upstreamSync bool) error {
 	m.poolsMutex.Lock()
 	defer m.poolsMutex.Unlock()
 
 	pool := m.poolByFamilyLocked(poolName, family)
 	if pool == nil {
-		return fmt.Errorf("unable to release IP %s of unknown pool %q (family %s)", ip, poolName, family)
+		return fmt.Errorf("unable to release IP %s of unknown pool %q (family %s)", addr, poolName, family)
 	}
 
-	pool.release(ip)
+	pool.release(addr)
 	if upstreamSync {
 		m.k8sUpdater.Trigger()
 	}

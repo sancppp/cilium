@@ -5,9 +5,9 @@ package policy
 
 import (
 	"fmt"
-	"iter"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -25,6 +25,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/policy/types"
+	pkgTypes "github.com/cilium/cilium/pkg/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
@@ -181,7 +182,7 @@ type DummyOwner struct {
 func (d DummyOwner) CreateRedirects(*L4Filter) {
 }
 
-func (d DummyOwner) GetNamedPort(ingress bool, name string, proto u8proto.U8proto, destIdentities iter.Seq[identity.NumericIdentity]) uint16 {
+func (d DummyOwner) GetIngressNamedPort(name string, proto u8proto.U8proto) uint16 {
 	return 80
 }
 
@@ -236,7 +237,7 @@ func BenchmarkResolveCIDRPolicyRules(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		ip, _ := td.repo.resolvePolicyLocked(fooIdentity)
-		ip.detach(true, 0)
+		ip.Detach()
 	}
 }
 
@@ -247,7 +248,7 @@ func BenchmarkResolveNoMatchingRules(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		ip, _ := td.repo.resolvePolicyLocked(fooIdentity)
-		ip.detach(true, 0)
+		ip.Detach()
 	}
 }
 
@@ -263,7 +264,7 @@ func BenchmarkRegenerateCIDRPolicyRules(b *testing.B) {
 		owner.previousMap = epPolicy.GetMapState()
 		epPolicy.Ready()
 	}
-	ip.detach(true, 0)
+	ip.Detach()
 	assert.Equal(b, 44596, owner.previousMap.Len())
 }
 
@@ -274,7 +275,7 @@ func BenchmarkResolveL3IngressPolicyRules(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		ip, _ := td.repo.resolvePolicyLocked(fooIdentity)
-		ip.detach(true, 0)
+		ip.Detach()
 	}
 }
 
@@ -286,7 +287,7 @@ func BenchmarkRegenerateL3IngressPolicyRules(b *testing.B) {
 		ip, _ := td.repo.resolvePolicyLocked(fooIdentity)
 		policy := ip.DistillPolicy(hivetest.Logger(b), DummyOwner{logger: hivetest.Logger(b)}, nil)
 		policy.Ready()
-		ip.detach(true, 0)
+		ip.Detach()
 	}
 }
 
@@ -298,7 +299,7 @@ func BenchmarkRegenerateL3EgressPolicyRules(b *testing.B) {
 		ip, _ := td.repo.resolvePolicyLocked(fooIdentity)
 		policy := ip.DistillPolicy(hivetest.Logger(b), DummyOwner{logger: hivetest.Logger(b)}, nil)
 		policy.Ready()
-		ip.detach(true, 0)
+		ip.Detach()
 	}
 }
 
@@ -374,7 +375,56 @@ func TestEgressCIDRTCPPort(t *testing.T) {
 	mdl := repo.GetRulesList()
 	require.Contains(t, mdl.Policy, "10.1.1.1")
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
+}
+
+type testNamedPortsGetter struct {
+	npm pkgTypes.NamedPortMultiMap
+}
+
+func (g testNamedPortsGetter) GetNamedPorts() pkgTypes.NamedPortMultiMap {
+	return g.npm
+}
+
+func TestGetEgressNamedPorts(t *testing.T) {
+	namedPorts := pkgTypes.NewNamedPortMultiMap()
+	nid1 := identity.NumericIdentity(101)
+	nid2 := identity.NumericIdentity(102)
+	require.True(t, namedPorts.Update(nid1, nil, pkgTypes.NamedPortMap{
+		"http": pkgTypes.PortProto{Port: 8080, Proto: u8proto.TCP},
+	}))
+	require.True(t, namedPorts.Update(nid1, nil, pkgTypes.NamedPortMap{
+		"http": pkgTypes.PortProto{Port: 9090, Proto: u8proto.TCP},
+	}))
+	require.True(t, namedPorts.Update(nid2, nil, pkgTypes.NamedPortMap{
+		"http": pkgTypes.PortProto{Port: 9090, Proto: u8proto.TCP},
+	}))
+
+	sp := newSelectorPolicy(testNewSelectorCache(t, hivetest.Logger(t), nil))
+	sp.namedPortsGetter = testNamedPortsGetter{npm: namedPorts}
+
+	portsByNID := map[identity.NumericIdentity]uint16{}
+	for destID, port := range sp.GetEgressNamedPorts("http", u8proto.TCP, slices.Values([]identity.NumericIdentity{nid1, nid2, 103})) {
+		require.NotContains(t, portsByNID, destID)
+		portsByNID[destID] = port
+	}
+	require.Equal(t, map[identity.NumericIdentity]uint16{
+		nid2: 9090,
+	}, portsByNID)
+
+	portsByNID = map[identity.NumericIdentity]uint16{}
+	for destID, port := range sp.GetEgressNamedPorts("http", u8proto.UDP, slices.Values([]identity.NumericIdentity{nid1, nid2})) {
+		require.NotContains(t, portsByNID, destID)
+		portsByNID[destID] = port
+	}
+	require.Empty(t, portsByNID)
+
+	portsByNID = map[identity.NumericIdentity]uint16{}
+	for destID, port := range sp.GetEgressNamedPorts("http", u8proto.TCP, slices.Values([]identity.NumericIdentity{103})) {
+		require.NotContains(t, portsByNID, destID)
+		portsByNID[destID] = port
+	}
+	require.Empty(t, portsByNID)
 }
 
 func TestEgressWildcardCIDRMatchesWorld(t *testing.T) {
@@ -446,7 +496,7 @@ func TestEgressWildcardCIDRMatchesWorld(t *testing.T) {
 		EgressPolicyEnabled:  true,
 	}
 
-	require.EqualExportedValues(t, expectedPolicy, selPolicy)
+	td.assertEqualPolicies(t, expectedPolicy, selPolicy)
 
 	policy := selPolicy.DistillPolicy(logger, DummyOwner{logger: logger}, testRedirects)
 	policy.Ready()
@@ -540,7 +590,7 @@ func TestL7WithIngressWildcard(t *testing.T) {
 		PolicyOwner: DummyOwner{logger: logger},
 	}
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestL7WithLocalHostWildcard(t *testing.T) {
@@ -638,7 +688,7 @@ func TestL7WithLocalHostWildcard(t *testing.T) {
 		PolicyOwner: DummyOwner{logger: logger},
 	}
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestMapStateWithIngressWildcard(t *testing.T) {
@@ -731,7 +781,7 @@ func TestMapStateWithIngressWildcard(t *testing.T) {
 	// policyMapState cannot be compared via DeepEqual
 	require.Truef(t, policy.policyMapState.Equal(&expectedEndpointPolicy.policyMapState), policy.policyMapState.diff(&expectedEndpointPolicy.policyMapState))
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestMapStateWithIngress(t *testing.T) {
@@ -883,7 +933,7 @@ func TestMapStateWithIngress(t *testing.T) {
 
 	// Verify that cached selector is not found after Detach().
 	// Note that this depends on the other tests NOT using the same selector concurrently!
-	policy.SelectorPolicy.detach(true, 0)
+	policy.SelectorPolicy.Detach()
 	cachedSelectorTest = td.sc.findCachedIdentitySelector(api.NewESFromLabels(lblTest))
 	require.Nil(t, cachedSelectorTest)
 
@@ -902,7 +952,7 @@ func TestMapStateWithIngress(t *testing.T) {
 	// policyMapState cannot be compared via DeepEqual
 	require.Truef(t, policy.policyMapState.Equal(&expectedEndpointPolicy.policyMapState), policy.policyMapState.diff(&expectedEndpointPolicy.policyMapState))
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 // allowsIdentity returns whether the specified policy allows

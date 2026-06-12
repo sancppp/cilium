@@ -16,9 +16,9 @@ import (
 	"github.com/cilium/statedb/reconciler"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	daemonk8s "github.com/cilium/cilium/daemon/k8s"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	k8sUtils "github.com/cilium/cilium/pkg/k8s/utils"
 	ciliumLabels "github.com/cilium/cilium/pkg/labels"
 	lb "github.com/cilium/cilium/pkg/loadbalancer"
@@ -58,7 +58,7 @@ type lrpControllerParams struct {
 	Log                *slog.Logger
 	DB                 *statedb.DB
 	LRPs               statedb.Table[*LocalRedirectPolicy]
-	Pods               statedb.Table[daemonk8s.LocalPod]
+	Pods               statedb.Table[k8sTables.LocalPod]
 	DesiredSkipLB      statedb.RWTable[*desiredSkipLB]
 	Writer             *writer.Writer
 	NetNSCookieSupport reflectors.HaveNetNSCookieSupport
@@ -268,7 +268,7 @@ func (c *lrpController) processRedirectPolicy(wtxn writer.WriteTxn, lrpID lb.Ser
 	// For each matching pod create a backend and associate it with the LocalRedirect
 	// service we just created above. We find pods by doing a prefix search with the
 	// namespace (more efficient than having a separate namespace index for pods).
-	podsSameNamespace, watch := c.p.Pods.PrefixWatch(wtxn, daemonk8s.PodByName(lrpID.Namespace(), ""))
+	podsSameNamespace, watch := c.p.Pods.PrefixWatch(wtxn, k8sTables.PodByName(lrpID.Namespace(), ""))
 	ws.Add(watch)
 
 	var matchingPods []podInfo
@@ -320,12 +320,15 @@ func (c *lrpController) updateRedirects(wtxn writer.WriteTxn, ws *statedb.WatchS
 		// In address-based mode there is no existing service/frontend to match against and
 		// instead the frontend is created here.
 		for _, feM := range lrp.FrontendMappings {
+			fe, _, found := c.p.Writer.Frontends().Get(wtxn, lb.FrontendByAddress(feM.feAddr))
 			if len(pods) == 0 {
-				// No pods exist to redirect the traffic to. Remove the frontend to let the traffic
-				// be handled normally.
-				c.p.Writer.DeleteFrontend(wtxn, feM.feAddr)
+				// No pods exist to redirect the traffic to. If we previously installed a
+				// LocalRedirect frontend for this LRP, remove it so traffic falls back to
+				// the original service. Never touch a frontend owned by another service.
+				if found && fe.Type == lb.SVCTypeLocalRedirect && fe.ServiceName.Equal(lrpServiceName) {
+					c.p.Writer.DeleteFrontend(wtxn, feM.feAddr)
+				}
 			} else {
-				fe, _, found := c.p.Writer.Frontends().Get(wtxn, lb.FrontendByAddress(feM.feAddr))
 				if found {
 					if fe.Type != lb.SVCTypeLocalRedirect {
 						c.p.Log.Error("LocalRedirectPolicy matches an address owned by an existing service => refusing to override",
@@ -651,7 +654,7 @@ type podInfo struct {
 	labels         map[string]string
 }
 
-func getPodInfo(pod daemonk8s.LocalPod) podInfo {
+func getPodInfo(pod k8sTables.LocalPod) podInfo {
 	return podInfo{
 		namespace:      pod.Namespace,
 		namespacedName: pod.Namespace + "/" + pod.Name,

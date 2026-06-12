@@ -21,14 +21,10 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
-const (
-	// controllerName is the gateway controller name used in cilium.
-	controllerName = "io.cilium/gateway-controller"
-)
-
 type BackendTLSPolicyInput struct {
 	Client           client.Client
 	BackendTLSPolicy *gatewayv1.BackendTLSPolicy
+	ControllerName   string
 }
 
 func (b *BackendTLSPolicyInput) SetAncestorCondition(parentRef gatewayv1.ParentReference, condition metav1.Condition) {
@@ -51,7 +47,7 @@ func (b *BackendTLSPolicyInput) SetAncestorCondition(parentRef gatewayv1.ParentR
 
 	b.BackendTLSPolicy.Status.Ancestors = append(b.BackendTLSPolicy.Status.Ancestors, gatewayv1.PolicyAncestorStatus{
 		AncestorRef:    parentRef,
-		ControllerName: gatewayv1.GatewayController(controllerName),
+		ControllerName: gatewayv1.GatewayController(b.ControllerName),
 		Conditions: []metav1.Condition{
 			condition,
 		},
@@ -100,6 +96,13 @@ func (b *BackendTLSPolicyInput) ValidateSpec(ctx context.Context, scopedLog *slo
 
 		if _, ok := caCert.Data["ca.crt"]; !ok {
 			b.setRejectedConditions(ancestorRef, "CA Certificate ConfigMap does not contain a `ca.crt` key",
+				string(gatewayv1.BackendTLSPolicyReasonNoValidCACertificate), string(gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef))
+			return false, nil
+		}
+
+		caCertBytes := []byte(caCert.Data["ca.crt"])
+		if !helpers.IsValidPemFormat(caCertBytes) {
+			b.setRejectedConditions(ancestorRef, "CA Certificate ConfigMap does not contain at least one valid PEM-encoded certificate",
 				string(gatewayv1.BackendTLSPolicyReasonNoValidCACertificate), string(gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef))
 			return false, nil
 		}

@@ -164,6 +164,16 @@ type EgressGWPolicyEntry6 struct {
 	Reserved2     uint32
 }
 
+// EgressGWPolicyEntryV2 is generated from the BPF C type egress_gw_policy_entry_v2.
+type EgressGWPolicyEntryV2 struct {
+	_             structs.HostLayout
+	EgressIP      uint32
+	GatewayIP     uint32
+	Reserved      [3]uint32
+	EgressIfIndex uint32
+	Reserved2     uint32
+}
+
 // EgressGWPolicyKey is generated from the BPF C type egress_gw_policy_key.
 type EgressGWPolicyKey struct {
 	_      structs.HostLayout
@@ -207,7 +217,7 @@ type EndpointInfo struct {
 	Unused        uint16
 	LXCID         uint16
 	Flags         uint32
-	_             [4]byte
+	RtInfo        uint32
 	MAC           uint64
 	NodeMAC       uint64
 	SecID         uint32

@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	DeviceIDIndex = statedb.Index[*Device, int]{
+	deviceIndexIndex = statedb.Index[*Device, int]{
 		Name: "id",
 		FromObject: func(d *Device) index.KeySet {
 			return index.NewKeySet(index.Int(d.Index))
@@ -26,16 +26,21 @@ var (
 		Unique:     true,
 	}
 
-	DeviceNameIndex = statedb.Index[*Device, string]{
+	deviceNameIndex = statedb.Index[*Device, string]{
 		Name: "name",
 		FromObject: func(d *Device) index.KeySet {
-			return index.NewKeySet(index.String(d.Name))
+			keys := make([]index.Key, 0, 1+len(d.AltNames))
+			keys = append(keys, index.String(d.Name))
+			for _, altName := range d.AltNames {
+				keys = append(keys, index.String(altName))
+			}
+			return index.NewKeySet(keys...)
 		},
 		FromKey:    index.String,
 		FromString: index.FromString,
 	}
 
-	DeviceSelectedIndex = statedb.Index[*Device, bool]{
+	deviceSelectedIndex = statedb.Index[*Device, bool]{
 		Name: "selected",
 		FromObject: func(d *Device) index.KeySet {
 			return index.NewKeySet(index.Bool(d.Selected))
@@ -43,15 +48,24 @@ var (
 		FromKey:    index.Bool,
 		FromString: index.BoolString,
 	}
+
+	// DeviceByIndex queries the devices table by device index.
+	DeviceByIndex = deviceIndexIndex.Query
+
+	// DeviceByName queries the devices table by device name.
+	DeviceByName = deviceNameIndex.Query
+
+	// DevicesBySelected queries the selected devices from devices table.
+	DevicesBySelected = deviceSelectedIndex.Query
 )
 
 func NewDeviceTable(db *statedb.DB) (statedb.RWTable[*Device], error) {
 	return statedb.NewTable(
 		db,
 		"devices",
-		DeviceIDIndex,
-		DeviceNameIndex,
-		DeviceSelectedIndex,
+		deviceIndexIndex,
+		deviceNameIndex,
+		deviceSelectedIndex,
 	)
 }
 
@@ -92,6 +106,7 @@ type Device struct {
 	Index        int             // positive integer that starts at one, zero is never used
 	MTU          int             // maximum transmission unit
 	Name         string          // e.g., "en0", "lo0", "eth0.100"
+	AltNames     []string        // alternative names
 	HardwareAddr HardwareAddr    // IEEE MAC-48, EUI-48 and EUI-64 form
 	Flags        net.Flags       // e.g. net.FlagUp, net.eFlagLoopback, net.FlagMulticast
 	Addrs        []DeviceAddress // Addresses assigned to the device
@@ -106,6 +121,7 @@ type Device struct {
 
 func (d *Device) DeepCopy() *Device {
 	copy := *d
+	copy.AltNames = slices.Clone(d.AltNames)
 	copy.Addrs = slices.Clone(d.Addrs)
 	return &copy
 }
@@ -138,8 +154,12 @@ func (d *Device) TableRow() []string {
 	for _, addr := range d.Addrs {
 		addrs = append(addrs, addr.Addr.String())
 	}
+	name := d.Name
+	if len(d.AltNames) > 0 {
+		name += " (" + strings.Join(d.AltNames, ", ") + ")"
+	}
 	return []string{
-		d.Name,
+		name,
 		fmt.Sprintf("%d", d.Index),
 		fmt.Sprintf("%v", d.Selected),
 		d.Type,
@@ -174,7 +194,7 @@ func (d *DeviceAddress) DeepEqual(other *DeviceAddress) bool {
 // The invalidated channel is closed when devices have changed and
 // should be requeried with a new transaction.
 func SelectedDevices(tbl statedb.Table[*Device], txn statedb.ReadTxn) ([]*Device, <-chan struct{}) {
-	iter, invalidated := tbl.ListWatch(txn, DeviceSelectedIndex.Query(true))
+	iter, invalidated := tbl.ListWatch(txn, deviceSelectedIndex.Query(true))
 	return statedb.Collect(iter), invalidated
 }
 

@@ -10,6 +10,7 @@ metadata:
   {{- end }}
   labels:
     app.kubernetes.io/part-of: cilium
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -105,6 +106,7 @@ rules:
 {{- if or .Values.ingressController.enabled .Values.gatewayAPI.enabled .Values.bgpControlPlane.enabled $secretSyncEnabled }}
   - secrets
 {{- end }}
+  - serviceaccounts
   verbs:
   - get
   - list
@@ -148,16 +150,18 @@ rules:
   - create
 {{- end }}
 - apiGroups:
+  # Watch CNP / CCNPs for validation and external groups.
   - cilium.io
   resources:
   - ciliumnetworkpolicies
   - ciliumclusterwidenetworkpolicies
   verbs:
-  # Create auto-generated CNPs and CCNPs from Policies that have 'toGroups'
+  # Create auto-generated CNPs and CCNPs from Policies that have 'toGroups'.
+  # This was removed in v1.20, but we must keep the permissions until v1.21 for
+  # upgrade phasing.
   - create
   - update
   - deletecollection
-  # To update the status of the CNPs and CCNPs
   - patch
   - get
   - list
@@ -168,7 +172,7 @@ rules:
   - ciliumnetworkpolicies/status
   - ciliumclusterwidenetworkpolicies/status
   verbs:
-  # Update the auto-generated CNPs and CCNPs status.
+  # Set validity status on CNP / CCNP.
   - patch
   - update
 - apiGroups:
@@ -219,6 +223,7 @@ rules:
   - ciliumbgppeerconfigs
   - ciliumbgpadvertisements
   - ciliumbgpnodeconfigs
+  - ciliumcidrgroups
   verbs:
   - create
   - update
@@ -275,6 +280,7 @@ rules:
   - serviceimports.multicluster.x-k8s.io
   - serviceexports.multicluster.x-k8s.io
 {{- end }}
+  - ciliumdatapathplugins.cilium.io
 - apiGroups:
   - cilium.io
   resources:
@@ -283,6 +289,7 @@ rules:
   - ciliumbgpclusterconfigs
   - ciliumbgpnodeconfigoverrides
   - ciliumbgppeerconfigs
+  - ciliumdatapathplugins
   verbs:
   - get
   - list
@@ -340,6 +347,8 @@ rules:
   resources:
   - gatewayclasses
   - gateways
+  - tcproutes
+  - udproutes
   - tlsroutes
   - httproutes
   - grpcroutes
@@ -365,6 +374,8 @@ rules:
   - grpcroutes/status
   - tlsroutes/status
   - backendtlspolicies/status
+  - tcproutes/status
+  - udproutes/status
   verbs:
   - update
   - patch

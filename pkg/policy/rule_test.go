@@ -215,6 +215,54 @@ func TestMergePortProtoRejectsDifferentTiers(t *testing.T) {
 	require.ErrorContains(t, err, "cannot merge filters with different tiers")
 }
 
+func TestMergePortProtoIdenticalPolicyDifferentPriority(t *testing.T) {
+	td := newTestData(t, hivetest.Logger(t))
+	cs := td.cachedSelectorA
+
+	existingOrigin := OriginForTest(map[CachedSelector]labels.LabelArrayList{
+		cs: {labels.LabelArray{labels.ParseLabel("existing")}},
+	})
+	newOrigin := OriginForTest(map[CachedSelector]labels.LabelArrayList{
+		cs: {labels.LabelArray{labels.ParseLabel("new")}},
+	})
+	expectedOrigin := newOrigin[cs]
+
+	existingFilter := &L4Filter{
+		Tier:     0,
+		Port:     80,
+		Protocol: api.ProtoTCP,
+		U8Proto:  u8proto.TCP,
+		Ingress:  true,
+		PerSelectorPolicies: L7DataMap{
+			cs: &PerSelectorPolicy{
+				Verdict:  types.Allow,
+				Priority: 50,
+			},
+		},
+		RuleOrigin: existingOrigin,
+	}
+	filterToMerge := &L4Filter{
+		Tier:     0,
+		Port:     80,
+		Protocol: api.ProtoTCP,
+		U8Proto:  u8proto.TCP,
+		Ingress:  true,
+		PerSelectorPolicies: L7DataMap{
+			cs: &PerSelectorPolicy{
+				Verdict:  types.Allow,
+				Priority: 10,
+			},
+		},
+		RuleOrigin: newOrigin,
+	}
+
+	err := existingFilter.mergePortProto(td.testPolicyContext, filterToMerge)
+	require.NoError(t, err)
+
+	require.Equal(t, types.Priority(10), existingFilter.PerSelectorPolicies[cs].GetPriority())
+	require.Equal(t, expectedOrigin, existingFilter.RuleOrigin[cs])
+}
+
 func TestMergeL4PolicyIngress(t *testing.T) {
 	td := newTestData(t, hivetest.Logger(t))
 
@@ -1603,7 +1651,7 @@ func TestIngressL4AllowAll(t *testing.T) {
 
 	pol, err := repo.resolvePolicyLocked(idC)
 	require.NoError(t, err)
-	defer pol.detach(true, 0)
+	defer pol.Detach()
 
 	filter := pol.L4Policy.Ingress.PortRules[0].ExactLookupPortNum(80, 0, u8proto.TCP)
 	require.NotNil(t, filter)
@@ -1635,7 +1683,7 @@ func TestIngressL4AllowAllNamedPort(t *testing.T) {
 
 	pol, err := repo.resolvePolicyLocked(idC)
 	require.NoError(t, err)
-	defer pol.detach(true, 0)
+	defer pol.Detach()
 
 	require.Len(t, pol.L4Policy.Ingress.PortRules, 1)
 	filter := pol.L4Policy.Ingress.PortRules[0].ExactLookupPortName("port-80", u8proto.TCP)
@@ -1694,7 +1742,7 @@ func TestEgressL4AllowAll(t *testing.T) {
 
 	pol, err := repo.resolvePolicyLocked(idA)
 	require.NoError(t, err)
-	defer pol.detach(true, 0)
+	defer pol.Detach()
 
 	t.Log(pol.L4Policy.Egress.PortRules)
 	require.Len(t, pol.L4Policy.Egress.PortRules, 1)
@@ -1732,7 +1780,7 @@ func TestEgressL4AllowWorld(t *testing.T) {
 
 	pol, err := repo.resolvePolicyLocked(idA)
 	require.NoError(t, err)
-	defer pol.detach(true, 0)
+	defer pol.Detach()
 
 	require.Len(t, pol.L4Policy.Egress.PortRules, 1)
 	filter := pol.L4Policy.Egress.PortRules[0].ExactLookupPortNum(80, 0, u8proto.TCP)
@@ -1768,7 +1816,7 @@ func TestEgressL4AllowAllEntity(t *testing.T) {
 
 	pol, err := repo.resolvePolicyLocked(idA)
 	require.NoError(t, err)
-	defer pol.detach(true, 0)
+	defer pol.Detach()
 
 	require.Len(t, pol.L4Policy.Egress.PortRules, 1)
 	filter := pol.L4Policy.Egress.PortRules[0].ExactLookupPortNum(80, 0, u8proto.TCP)

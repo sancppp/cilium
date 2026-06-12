@@ -65,6 +65,9 @@ const (
 	client3DeploymentName = "client3"
 	clientCPDeployment    = "client-cp"
 
+	ccnpTestNamespace1 = "cilium-test-ccnp1"
+	ccnpTestNamespace2 = "cilium-test-ccnp2"
+
 	DNSTestServerContainerName = "dns-test-server"
 
 	echoSameNodeDeploymentName                 = "echo-same-node"
@@ -692,51 +695,57 @@ func (ct *ConnectivityTest) maybeNodeToNodeEncryptionAffinity() *corev1.NodeAffi
 	}
 }
 
-// deployNamespace sets up the test namespace.
-func (ct *ConnectivityTest) deployNamespace(ctx context.Context) error {
+// forceDeploy cleans up connectivity test artifacts before deployment.
+// Note: deploy() and deployPerf() currently ignore its returned error.
+func (ct *ConnectivityTest) forceDeploy(ctx context.Context) error {
 	for _, client := range ct.Clients() {
-		if ct.params.ForceDeploy {
-			if err := ct.deleteDeployments(ctx, client); err != nil {
-				return err
-			}
-			if err := ct.DeleteConnDisruptTestDeployment(ctx, client); err != nil {
-				return err
-			}
-			if err := ct.DeleteCCNPTestEnv(ctx, client); err != nil {
-				return err
-			}
-		}
 
-		namespace, err := client.GetNamespace(ctx, ct.params.TestNamespace, metav1.GetOptions{})
+		if err := ct.deleteDeployments(ctx, client); err != nil {
+			return err
+		}
+		if err := ct.DeleteConnDisruptTestDeployment(ctx, client); err != nil {
+			return err
+		}
+		if err := ct.DeleteCCNPTestEnv(ctx, client); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// deployNamespace sets up the specified test namespace.
+func (ct *ConnectivityTest) deployNamespace(ctx context.Context, client *k8s.Client, namespaceName string) error {
+
+	namespace, err := client.GetNamespace(ctx, namespaceName, metav1.GetOptions{})
+	if err != nil {
+		ct.Logf("✨ [%s] Creating namespace %s for connectivity check...", client.ClusterName(), namespaceName)
+		namespace = &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        namespaceName,
+				Annotations: ct.params.NamespaceAnnotations,
+				Labels:      labels.Merge(ct.params.NamespaceLabels, appLabels),
+			},
+		}
+	}
+	if !ct.Features[features.DefaultGlobalNamespace].Enabled {
+		// Mark the namespace as global to ensure resources under this
+		// namespace are treated as global. This is required for
+		// multi-cluster tests.
+		if namespace.Annotations == nil {
+			namespace.Annotations = make(map[string]string)
+		}
+		namespace.Annotations[annotation.GlobalNamespace] = "true"
+	}
+	if err == nil { // Namespace already exists.
+		_, err = client.UpdateNamespace(ctx, namespace, metav1.UpdateOptions{})
 		if err != nil {
-			ct.Logf("✨ [%s] Creating namespace %s for connectivity check...", client.ClusterName(), ct.params.TestNamespace)
-			namespace = &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        ct.params.TestNamespace,
-					Annotations: ct.params.NamespaceAnnotations,
-					Labels:      labels.Merge(ct.params.NamespaceLabels, appLabels),
-				},
-			}
+			return fmt.Errorf("unable to update namespace %s: %w", namespaceName, err)
 		}
-		if !ct.Features[features.DefaultGlobalNamespace].Enabled {
-			// Mark the namespace as global to ensure resources under this
-			// namespace are treated as global. This is required for
-			// multi-cluster tests.
-			if namespace.Annotations == nil {
-				namespace.Annotations = make(map[string]string)
-			}
-			namespace.Annotations[annotation.GlobalNamespace] = "true"
-		}
-		if err == nil { // Namespace already exists.
-			_, err = client.UpdateNamespace(ctx, namespace, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("unable to update namespace %s: %w", ct.params.TestNamespace, err)
-			}
-		} else {
-			_, err = client.CreateNamespace(ctx, namespace, metav1.CreateOptions{})
-			if err != nil {
-				return fmt.Errorf("unable to create namespace %s: %w", ct.params.TestNamespace, err)
-			}
+	} else {
+		_, err = client.CreateNamespace(ctx, namespace, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create namespace %s: %w", namespaceName, err)
 		}
 	}
 	return nil
@@ -946,42 +955,17 @@ func DeployZtunnelTestEnv(ctx context.Context, t *Test, ct *ConnectivityTest) er
 }
 
 func (ct *ConnectivityTest) deployCCNPTestEnv(ctx context.Context) error {
-	namespaceConfigs := []struct {
-		name string
-		obj  *corev1.Namespace
-	}{
-		{
-			name: "cilium-test-ccnp1",
-			obj: &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "cilium-test-ccnp1",
-				},
-			},
-		},
-		{
-			name: "cilium-test-ccnp2",
-			obj: &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "cilium-test-ccnp2",
-				},
-			},
-		},
-	}
 
-	for _, nsConfig := range namespaceConfigs {
+	for _, namespaceName := range []string{ccnpTestNamespace1, ccnpTestNamespace2} {
 
 		clientccnp := ct.clients.src
 		var err error
 
-		_, err = clientccnp.GetNamespace(ctx, nsConfig.name, metav1.GetOptions{})
-		if err != nil {
-			_, err = clientccnp.CreateNamespace(ctx, nsConfig.obj, metav1.CreateOptions{})
-			if err != nil {
-				return fmt.Errorf("unable to create namespace %s: %w", nsConfig.name, err)
-			}
+		if err := ct.deployNamespace(ctx, clientccnp, namespaceName); err != nil {
+			return err
 		}
 
-		_, err = clientccnp.GetDeployment(ctx, nsConfig.name, ccnpDeploymentName, metav1.GetOptions{})
+		_, err = clientccnp.GetDeployment(ctx, namespaceName, ccnpDeploymentName, metav1.GetOptions{})
 		if err != nil {
 			clientDeployment := newDeployment(deploymentParameters{
 				Name:         ccnpDeploymentName,
@@ -992,13 +976,13 @@ func (ct *ConnectivityTest) deployCCNPTestEnv(ctx context.Context) error {
 				Affinity:     &corev1.Affinity{NodeAffinity: ct.maybeNodeToNodeEncryptionAffinity()},
 				NodeSelector: ct.params.NodeSelector,
 			})
-			_, err = clientccnp.CreateServiceAccount(ctx, nsConfig.name, k8s.NewServiceAccount(ccnpDeploymentName), metav1.CreateOptions{})
+			_, err = clientccnp.CreateServiceAccount(ctx, namespaceName, k8s.NewServiceAccount(ccnpDeploymentName), metav1.CreateOptions{})
 			if err != nil {
-				return fmt.Errorf("unable to create service account %s in namespace %s: %w", ccnpDeploymentName, nsConfig.name, err)
+				return fmt.Errorf("unable to create service account %s in namespace %s: %w", ccnpDeploymentName, namespaceName, err)
 			}
-			_, err = clientccnp.CreateDeployment(ctx, nsConfig.name, clientDeployment, metav1.CreateOptions{})
+			_, err = clientccnp.CreateDeployment(ctx, namespaceName, clientDeployment, metav1.CreateOptions{})
 			if err != nil {
-				return fmt.Errorf("unable to create deployment %s in namespace %s: %w", ccnpDeploymentName, nsConfig.name, err)
+				return fmt.Errorf("unable to create deployment %s in namespace %s: %w", ccnpDeploymentName, namespaceName, err)
 			}
 		}
 
@@ -1009,22 +993,30 @@ func (ct *ConnectivityTest) deployCCNPTestEnv(ctx context.Context) error {
 
 // deploy ensures the test Namespace, Services and Deployments are running on the cluster.
 func (ct *ConnectivityTest) deploy(ctx context.Context) error {
-	if err := ct.deployNamespace(ctx); err != nil {
-		return err
+	if ct.params.ForceDeploy {
+		ct.forceDeploy(ctx)
+	}
+
+	for _, client := range ct.Clients() {
+		if err := ct.deployNamespace(ctx, client, ct.params.TestNamespace); err != nil {
+			return err
+		}
 	}
 
 	// Deploy test-conn-disrupt actors (only in the first
 	// test namespace in case of tests concurrent run)
 	if ct.params.ConnDisruptTestSetup && ct.params.TestNamespaceIndex == 0 {
-		if err := ct.createTestConnDisruptServerDeployAndSvc(ctx, testConnDisruptServerDeploymentName, KindTestConnDisrupt, 3,
-			testConnDisruptServiceName, "test-conn-disrupt-server", false, newConnDisruptCNP, ""); err != nil {
-			return err
-		}
+		if ct.params.IncludeConnDisruptTest {
+			if err := ct.createTestConnDisruptServerDeployAndSvc(ctx, testConnDisruptServerDeploymentName, KindTestConnDisrupt, 3,
+				testConnDisruptServiceName, "test-conn-disrupt-server", false, newConnDisruptCNP, ""); err != nil {
+				return err
+			}
 
-		if err := ct.createTestConnDisruptClientDeployment(ctx, testConnDisruptClientDeploymentName, KindTestConnDisrupt,
-			"test-conn-disrupt-client", fmt.Sprintf("test-conn-disrupt.%s.svc.cluster.local.:8000", ct.params.TestNamespace),
-			5, false, nil, ""); err != nil {
-			return err
+			if err := ct.createTestConnDisruptClientDeployment(ctx, testConnDisruptClientDeploymentName, KindTestConnDisrupt,
+				"test-conn-disrupt-client", fmt.Sprintf("test-conn-disrupt.%s.svc.cluster.local.:8000", ct.params.TestNamespace),
+				5, false, nil, ""); err != nil {
+				return err
+			}
 		}
 
 		if ct.ShouldRunConnDisruptNSTraffic() {
@@ -1645,8 +1637,11 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 		}
 	}
 
-	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled {
-		_, err = ct.clients.src.GetDaemonSet(ctx, ct.params.TestNamespace, frrDaemonSetNameName, metav1.GetOptions{})
+	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled &&
+		ct.params.TestNamespace == ct.params.SharedTestNamespace {
+		// NOTE: FRR daemonset should be deployed only once per node as it is running in the host network namespace,
+		// and multiple deployments could cause issues with binding to the same ports - so deploy it in the SharedTestNamespace.
+		_, err = ct.clients.src.GetDaemonSet(ctx, ct.params.SharedTestNamespace, frrDaemonSetNameName, metav1.GetOptions{})
 		if err != nil {
 			ct.Logf("✨ [%s] Deploying %s daemonset...", ct.clients.src.ClusterName(), frrDaemonSetNameName)
 			ds := NewFRRDaemonSet(ct.params)
@@ -1777,7 +1772,8 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 }
 
 func (ct *ConnectivityTest) DeleteCCNPTestEnv(ctx context.Context, client *k8s.Client) error {
-	namespaces := []string{"cilium-test-ccnp1", "cilium-test-ccnp2"}
+
+	namespaces := []string{ccnpTestNamespace1, ccnpTestNamespace2}
 
 	for _, ns := range namespaces {
 		_, err := client.GetDeployment(ctx, ns, ccnpDeploymentName, metav1.GetOptions{})
@@ -2286,8 +2282,14 @@ func (ct *ConnectivityTest) createProfilingPerfDeployment(ctx context.Context, n
 }
 
 func (ct *ConnectivityTest) deployPerf(ctx context.Context) error {
-	if err := ct.deployNamespace(ctx); err != nil {
-		return err
+	if ct.params.ForceDeploy {
+		ct.forceDeploy(ctx)
+	}
+
+	for _, client := range ct.Clients() {
+		if err := ct.deployNamespace(ctx, client, ct.params.TestNamespace); err != nil {
+			return err
+		}
 	}
 
 	nodeSelectorServer := labels.SelectorFromSet(ct.params.PerfParameters.NodeSelectorServer).String()
@@ -2490,15 +2492,17 @@ func (ct *ConnectivityTest) deploymentList() (srcList []string, dstList []string
 		srcList = append(srcList, client3DeploymentName)
 	}
 
-	if ct.params.IncludeConnDisruptTest && ct.params.TestNamespaceIndex == 0 {
-		// We append the server and client deployment names to two different
-		// lists. This matters when running in multi-cluster mode, because
-		// the server is deployed in the local cluster (targeted by the "src"
-		// client), while the client in the remote one (targeted by the "dst"
-		// client). When running against a single cluster, instead, this does
-		// not matter much, because the two clients are identical.
-		srcList = append(srcList, testConnDisruptServerDeploymentName)
-		dstList = append(dstList, testConnDisruptClientDeploymentName)
+	if ct.params.TestNamespaceIndex == 0 {
+		if ct.params.IncludeConnDisruptTest {
+			// We append the server and client deployment names to two different
+			// lists. This matters when running in multi-cluster mode, because
+			// the server is deployed in the local cluster (targeted by the "src"
+			// client), while the client in the remote one (targeted by the "dst"
+			// client). When running against a single cluster, instead, this does
+			// not matter much, because the two clients are identical.
+			srcList = append(srcList, testConnDisruptServerDeploymentName)
+			dstList = append(dstList, testConnDisruptClientDeploymentName)
+		}
 		if ct.ShouldRunConnDisruptNSTraffic() {
 			srcList = append(srcList, testConnDisruptServerNSTrafficDeploymentName)
 			dstList = append(dstList, ct.testConnDisruptClientNSTrafficDeploymentNames...)
@@ -2745,7 +2749,7 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 
 	if ct.Features[features.CCNP].Enabled {
 
-		namespaces := []string{"cilium-test-ccnp1", "cilium-test-ccnp2"}
+		namespaces := []string{ccnpTestNamespace1, ccnpTestNamespace2}
 		for _, ns := range namespaces {
 			if err := WaitForDeployment(ctx, ct, ct.clients.src, ns, ccnpDeploymentName); err != nil {
 				return err
@@ -2847,10 +2851,10 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 	}
 
 	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled {
-		if err := WaitForDaemonSet(ctx, ct, ct.clients.src, ct.Params().TestNamespace, frrDaemonSetNameName); err != nil {
+		if err := WaitForDaemonSet(ctx, ct, ct.clients.src, ct.params.SharedTestNamespace, frrDaemonSetNameName); err != nil {
 			return err
 		}
-		frrPods, err := ct.clients.dst.ListPods(ctx, ct.params.TestNamespace, metav1.ListOptions{LabelSelector: "name=" + frrDaemonSetNameName})
+		frrPods, err := ct.clients.dst.ListPods(ctx, ct.params.SharedTestNamespace, metav1.ListOptions{LabelSelector: "name=" + frrDaemonSetNameName})
 		if err != nil {
 			return fmt.Errorf("unable to list FRR pods: %w", err)
 		}

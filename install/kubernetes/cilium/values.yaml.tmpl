@@ -433,6 +433,10 @@ securityContext:
       # If available, SYS_ADMIN can be removed.
       #- PERFMON
       #- BPF
+# -- Minimum number of seconds for which a newly created agent pod should be ready
+# before it is considered available. Defaults to 0 (pod is considered available as soon as it is ready).
+# ref: https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/
+minReadySeconds: 0
 # -- Cilium agent update strategy
 updateStrategy:
   type: RollingUpdate
@@ -508,10 +512,8 @@ l2announcements:
 l2podAnnouncements:
   # -- Enable L2 pod announcements
   enabled: false
-  # -- Interface used for sending Gratuitous ARP pod announcements
-  interface: "eth0"
   # -- A regular expression matching interfaces used for sending Gratuitous ARP pod announcements
-  # interfacePattern: ""
+  interfacePattern: ""
 # -- This feature set enables virtual BGP routers to be created via BGP CRDs.
 bgpControlPlane:
   # -- Enables the BGP control plane.
@@ -871,6 +873,12 @@ conntrackGCMaxInterval: ""
 # -- (string) Configure timeout in which Cilium will exit if CRDs are not available
 # @default -- `"5m"`
 crdWaitTimeout: ""
+# -- Plugins to inject custom BPF into the datapath.
+datapathPlugins:
+  # -- Enable datapath plugins.
+  enabled: false
+  # -- Parent directory for per-plugin state directories.
+  stateDir: /var/run/cilium/plugins
 daemon:
   # -- Configure where Cilium runtime state should be stored.
   runPath: "/var/run/cilium"
@@ -920,12 +928,18 @@ tmpVolume: {}
   #   sizeLimit: "100Mi"
   #   medium: "Memory"
 
+# @schema
+# type: [null, string, array]
+# @schema
 # -- Specify which network interfaces can run the eBPF datapath. This means
 # that a packet sent from a pod to a destination outside the cluster will be
 # masqueraded (to an output device IPv4 address), if the output device runs the
 # program. When not specified, probing will automatically detect devices that have
-# a non-local route. This should be used only when autodetection is not suitable.
-# devices: ""
+# a non-local route. This should be used only when auto-detection is not suitable.
+# The devices are a comma-separated list and support '+' as a wildcard, e.g.
+# "net0,eth+" matches "net0" and any device starting with "eth". A device can be
+# excluded with "!", e.g. "net0,eth+,!eth0".
+devices: ""
 
 # -- Forces the auto-detection of devices, even if specific devices are explicitly listed
 forceDeviceDetection: false
@@ -993,6 +1007,14 @@ ingressController:
   enforceHttps: true
   # -- Enable proxy protocol for all Ingress listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.
   enableProxyProtocol: false
+  # @schema
+  # type: [null, boolean]
+  # @schema
+  # -- Configure whether to use the remote address of the client when determining the source IP.
+  # When enabled, the source IP is determined from the remote address instead of the proxy protocol header.
+  useRemoteAddress: true
+  # -- The number of additional Ingress proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.
+  xffNumTrustedHops: 0
   # -- IngressLBAnnotations are the annotation and label prefixes, which are used to filter annotations and/or labels to propagate from Ingress to the Load Balancer service
   ingressLBAnnotationPrefixes: ['lbipam.cilium.io', 'nodeipam.cilium.io', 'service.beta.kubernetes.io', 'service.kubernetes.io', 'cloud.google.com']
   # @schema
@@ -1084,6 +1106,12 @@ gatewayAPI:
   enabled: false
   # -- Enable proxy protocol for all GatewayAPI listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.
   enableProxyProtocol: false
+  # @schema
+  # type: [null, boolean]
+  # @schema
+  # -- Configure whether to use the remote address of the client when determining the source IP.
+  # When enabled, the source IP is determined from the remote address instead of the proxy protocol header.
+  useRemoteAddress: true
   # -- Enable Backend Protocol selection support (GEP-1911) for Gateway API via appProtocol.
   enableAppProtocol: false
   # -- Enable ALPN for all listeners configured with Gateway API. ALPN will attempt HTTP/2, then HTTP 1.1.
@@ -1097,6 +1125,9 @@ gatewayAPI:
   externalTrafficPolicy: Cluster
 
   gatewayClass:
+    # @schema
+    # type: [boolean, string]
+    # @schema
     # -- Enable creation of GatewayClass resource
     # The default value is 'auto' which decides according to presence of gateway.networking.k8s.io/v1/GatewayClass in the cluster.
     # Other possible values are 'true' and 'false', which will either always or never create the GatewayClass, respectively.
@@ -1139,13 +1170,6 @@ encryption:
   nodeEncryption: false
   # -- Configure the Encryption Pod2Pod strict mode.
   strictMode:
-    # -- Enable Encryption Pod2Pod strict mode. (deprecated: please use encryption.strictMode.egress.enabled)
-    enabled: false
-    # -- CIDR for the Encryption Pod2Pod strict mode. (deprecated: please use encryption.strictMode.egress.cidr)
-    cidr: ""
-    # -- Allow dynamic lookup of remote node identities. (deprecated: please use encryption.strictMode.egress.allowRemoteNodeIdentities)
-    # This is required when tunneling is used or direct routing is used and the node CIDR and pod CIDR overlap.
-    allowRemoteNodeIdentities: false
     egress:
       # -- Enable strict egress encryption.
       enabled: false
@@ -1174,8 +1198,6 @@ encryption:
     # -- Maximum duration of the IPsec key rotation. The previous key will be
     # removed after that delay.
     keyRotationDuration: "5m"
-    # -- Enable IPsec encrypted overlay
-    encryptedOverlay: false
   wireguard:
     # -- Controls WireGuard PersistentKeepalive option. Set 0s to disable.
     persistentKeepalive: 0s
@@ -1183,6 +1205,15 @@ encryption:
   # ztunnel is Istio's purpose-built, per-node proxy for handling L4 traffic in ambient mesh mode.
   # These settings only apply when encryption.type is set to "ztunnel".
   ztunnel:
+    # -- CA backend used by ztunnel to issue workload identities.
+    ca:
+      # @schema
+      # enum: [spire, internal]
+      # @schema
+      # -- Type of CA. "spire" uses an external SPIRE server (the operator
+      # then manages SPIRE entries for enrolled namespaces). "internal" uses
+      # Cilium's built-in CA and skips the SPIRE enrollment reconciler.
+      type: internal
     # -- ztunnel container image.
     image:
       # @schema
@@ -1203,6 +1234,9 @@ encryption:
       requests:
         cpu: 200m
         memory: 512Mi
+    # -- Minimum number of seconds for which a newly created ztunnel pod should be ready
+    # before it is considered available.
+    minReadySeconds: 0
     # -- ztunnel update strategy.
     updateStrategy:
       type: RollingUpdate
@@ -1342,6 +1376,9 @@ eni:
 gke:
   # -- Enable Google Kubernetes Engine integration
   enabled: false
+# -- Prefer IPv6 addresses over IPv4 when both are available for health probes
+# and Hubble peer communication.
+preferIpv6: false
 # -- Enable connectivity health checking.
 healthChecking: true
 # -- TCP port for the agent health API. This is not the port for cilium-health.
@@ -1371,6 +1408,14 @@ socketLB:
 certgen:
   # -- When set to true the certificate authority secret is created.
   generateCA: true
+
+  # -- When set to true, certgen enforces that the certification authority chain
+  # remains valid for the entire duration of the leaf certificates to be generated,
+  # and fails with a hard error if that is not the case. This allows to flag early
+  # situations in which the CA certificates need to be manually regenerated, before
+  # they actually expire.
+  enforceCAValidityThroughoutLeavesDuration: true
+
   image:
     # @schema
     # type: [null, string]
@@ -1636,6 +1681,7 @@ hubble:
   # Hubble is listening on port 4244.
   listenAddress: ":4244"
   # -- Whether Hubble should prefer to announce IPv6 or IPv4 addresses if both are available.
+  # Deprecated: use top-level preferIpv6 instead.
   preferIpv6: false
   # @schema
   # type: [null, boolean]
@@ -1695,6 +1741,21 @@ hubble:
       #   name: ca-issuer
       # -- certmanager issuer used when hubble.tls.auto.method=certmanager.
       certManagerIssuerRef: {}
+      # [Example]
+      # subject:
+      #   countries:
+      #     - US
+      #   provinces:
+      #     - California
+      # -- X509Subject Full X509 name specification used when hubble.tls.auto.method=certmanager.
+      # https://cert-manager.io/docs/reference/api-docs/#cert-manager.io/v1.X509Subject
+      subject: {}
+      # [Example]
+      # privateKey:
+      #   algorithm: ECDSA
+      # -- Private key options. These include the key algorithm and size, the used encoding and the rotation policy used when hubble.tls.auto.method=certmanager.
+      # https://cert-manager.io/docs/reference/api-docs/#cert-manager.io/v1.CertificatePrivateKey
+      privateKey: {}
     # -- The Hubble server certificate and private key
     server:
       # -- Name of the Secret containing the certificate and key for the Hubble server.
@@ -2281,6 +2342,8 @@ ipam:
     #       cidrs:
     #         - 10.10.0.0/8
     #       maskSize: 24
+    #     allowFirstIP: true
+    #     allowLastIP: true
     #   other:
     #     ipv6:
     #       cidrs:
@@ -2360,9 +2423,12 @@ k8s:
   # -- requireIPv6PodCIDR enables waiting for Kubernetes to provide the PodCIDR
   # range via the Kubernetes node resource
   requireIPv6PodCIDR: false
+  # @schema
+  # type: [null, string]
+  # @schema
   # -- A space separated list of Kubernetes API server URLs to use with the client.
   # For example "https://192.168.0.1:6443 https://192.168.0.2:6443"
-  # apiServerURLs: ""
+  apiServerURLs: ~
 
 # -- Keep the deprecated selector labels when deploying Cilium DaemonSet.
 keepDeprecatedLabels: false
@@ -2506,10 +2572,6 @@ monitor:
   enabled: false
 # -- Configure service load balancing
 loadBalancer:
-  # -- standalone enables the standalone L4LB which does not connect to
-  # kube-apiserver.
-  # standalone: false
-
   # -- algorithm is the name of the load balancing algorithm for backend
   # selection e.g. random or maglev
   # algorithm: random
@@ -2531,6 +2593,14 @@ loadBalancer:
   # -- serviceTopology enables K8s Topology Aware Hints -based service
   # endpoints filtering
   serviceTopology: false
+
+  # -- reflectorWaitTime is the maximum amount of time the K8s reflector waits
+  # to fill its events buffer. A higher wait time will reduce processing of
+  # transient states and increases throughput as it gives bigger batches
+  # downstream for processing. Batching also helps to combine related objects,
+  # e.g. a Service may have multiple associated EndpointSlices and preferably
+  # these would be processed together.
+  # reflectorWaitTime: "500ms"
 
   # -- L7 LoadBalancer
   l7:
@@ -2733,6 +2803,8 @@ envoy:
   maxConcurrentRetries: 128
   # -- Maximum number of connections on Envoy clusters
   clusterMaxConnections: 1024
+  # -- Maximum number of pending requests on Envoy clusters
+  clusterMaxPendingRequests: 1024
   # -- Maximum number of requests on Envoy clusters
   clusterMaxRequests: 1024
   # -- Maximum number of global downstream connections
@@ -2799,6 +2871,9 @@ envoy:
   terminationGracePeriodSeconds: 1
   # -- TCP port for the health API.
   healthPort: 9878
+  # -- Minimum number of seconds for which a newly created envoy pod should be ready
+  # before it is considered available.
+  minReadySeconds: 0
   # -- cilium-envoy update strategy
   # ref: https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/#updating-a-daemonset
   updateStrategy:
@@ -2895,7 +2970,7 @@ envoy:
       # Even though granted to the container, the cilium-envoy-starter wrapper drops
       # all capabilities after forking the actual Envoy process.
       # `NET_BIND_SERVICE` is the only capability that can be passed to the Envoy process by
-      # setting `envoy.securityContext.capabilities.keepNetBindService=true` (in addition to granting the
+      # setting `envoy.securityContext.capabilities.keepCapNetBindService=true` (in addition to granting the
       # capability to the container).
       # Note: In case of embedded envoy, the capability must  be granted to the cilium-agent container.
       envoy:
@@ -3429,6 +3504,9 @@ nodeinit:
     pullPolicy: "${PULL_POLICY}"
   # -- The priority class to use for the nodeinit pod.
   priorityClassName: ""
+  # -- Minimum number of seconds for which a newly created node-init pod should be ready
+  # before it is considered available.
+  minReadySeconds: 0
   # -- node-init update strategy
   updateStrategy:
     type: RollingUpdate
@@ -3611,8 +3689,6 @@ preflight:
     allowPrivilegeEscalation: false
   #   runAsUser: 0
 
-  # -- Path to write the `--tofqdns-pre-cache` file to.
-  tofqdnsPreCache: ""
   # -- Configure termination grace period for preflight Deployment and DaemonSet.
   terminationGracePeriodSeconds: 1
   # -- By default we should always validate the installed CNPs before upgrading
@@ -3648,30 +3724,30 @@ clustermesh:
   # the remote endpoints of appropriately-annotated global services through ClusterMesh
   enableEndpointSliceSynchronization: false
   # -- Default behavior of namespaces in Clustermesh.
-  # 
+  #
   # A "global" namespace means its resources (CiliumEndpoints, CiliumIdentities,
   # and Services) are exported and shared across all connected clusters in the mesh.
   # This enables:
   # - Cross-cluster pod-to-pod connectivity
   # - Cross-cluster network policy enforcement (policies can match labels on pods in remote clusters)
   # - Global services and Multi-Cluster Services (MCS-API)
-  # 
+  #
   # A "local" namespace means its resources stay within the cluster and are NOT
   # exported to other clusters. Cross-cluster communication and network policies
   # will not work for pods in local namespaces.
-  # 
+  #
   # If set to true, all namespaces are considered global by default unless
   # explicitly annotated with clustermesh.cilium.io/global=false.
   # If set to false, all namespaces are considered local by default unless
   # explicitly annotated with clustermesh.cilium.io/global=true.
-  # 
+  #
   # Note: For cross-cluster communication to work, BOTH the source and destination
   # namespaces must be global. Additionally, for a service to be a Global Service,
   # it must both reside in a global namespace AND be annotated with
   # service.cilium.io/global=true.
   # This setting improves scalability by limiting the amount of state synchronized
   # across clusters.
-  # 
+  #
   # Defaults to true (preserves existing behavior where all namespaces are global).
   defaultGlobalNamespace: true
   # -- Control whether policy rules assume by default the local cluster if not explicitly selected
@@ -4071,15 +4147,6 @@ clustermesh:
       #               if provided manually. Cluster mode is meaningful only when the same
       #               CA is shared across all clusters part of the mesh.
       authMode: migration
-      # -- (deprecated) Allow users to provide their own certificates
-      # Users may need to provide their certificates using
-      # a mechanism that requires they provide their own secrets.
-      # This setting does not apply to any of the auto-generated
-      # mechanisms below, it only restricts the creation of secrets
-      # via the `tls-provided` templates.
-      # This option is deprecated as secrets are expected to be created
-      # externally when 'auto' is not enabled.
-      enableSecrets: true
       # -- Configure automatic TLS certificates generation.
       # A Kubernetes CronJob is used the generate any
       # certificates not provided by the user at installation
@@ -4104,7 +4171,7 @@ clustermesh:
         # - certmanager:  This method use cert-manager to generate & rotate certificates.
         method: helm
         # -- Generated certificates validity duration in days.
-        certValidityDuration: 1095
+        certValidityDuration: 365
         # -- Schedule for certificates regeneration (regardless of their expiration date).
         # Only used if method is "cronJob". If nil, then no recurring job will be created.
         # Instead, only the one-shot job is deployed to generate the certificates at
@@ -4114,10 +4181,9 @@ clustermesh:
         # CA is (re)regenerated only if it is not provided as a helm value and the k8s
         # secret is manually deleted.
         #
-        # Defaults to none. Commented syntax gives midnight of the first day of every
-        # fourth month. For syntax, see
+        # Defaults to midnight of the first day of every fourth month. For syntax, see
         # https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#schedule-syntax
-        # schedule: "0 0 1 */4 *"
+        schedule: "0 0 1 */4 *"
 
         # [Example]
         # certManagerIssuerRef:
@@ -4125,33 +4191,32 @@ clustermesh:
         #   kind: ClusterIssuer
         #   name: ca-issuer
         # -- certmanager issuer used when clustermesh.apiserver.tls.auto.method=certmanager.
-        certManagerIssuerRef: {}
 
-      # -- base64 encoded PEM values for the clustermesh-apiserver server certificate and private key.
-      # Used if 'auto' is not enabled.
-      server:
-        # -- Deprecated, as secrets will always need to be created externally if `auto` is disabled.
-        cert: ""
-        # -- Deprecated, as secrets will always need to be created externally if `auto` is disabled.
-        key: ""
-        # -- Extra DNS names added to certificate when it's auto generated
-        extraDnsNames: []
-        # -- Extra IP addresses added to certificate when it's auto generated
-        extraIpAddresses: []
-      # -- base64 encoded PEM values for the clustermesh-apiserver admin certificate and private key.
-      # Used if 'auto' is not enabled.
-      admin:
-        # -- Deprecated, as secrets will always need to be created externally if `auto` is disabled.
-        cert: ""
-        # -- Deprecated, as secrets will always need to be created externally if `auto` is disabled.
-        key: ""
-      # -- base64 encoded PEM values for the clustermesh-apiserver remote cluster certificate and private key.
-      # Used if 'auto' is not enabled.
-      remote:
-        # -- Deprecated, as secrets will always need to be created externally if `auto` is disabled.
-        cert: ""
-        # -- Deprecated, as secrets will always need to be created externally if `auto` is disabled.
-        key: ""
+        certManagerIssuerRef: {}
+        # [Example]
+        # subject:
+        #   countries:
+        #     - US
+        #   provinces:
+        #     - California
+        # -- X509Subject Full X509 name specification used when clustermesh.apiserver.tls.auto.method=certmanager.
+        # https://cert-manager.io/docs/reference/api-docs/#cert-manager.io/v1.X509Subject
+        subject: {}
+
+        # [Example]
+        # privateKey:
+        #   algorithm: ECDSA
+        # -- Private key options. These include the key algorithm and size, the used encoding and the rotation policy used when clustermesh.apiserver.tls.auto.method=certmanager.
+        # https://cert-manager.io/docs/reference/api-docs/#cert-manager.io/v1.CertificatePrivateKey
+        privateKey: {}
+
+        # Extra configurations for the auto generated server certificate.
+        server:
+          # -- Extra DNS names added to certificate when it's auto generated
+          extraDnsNames: []
+          # -- Extra IP addresses added to certificate when it's auto generated
+          extraIpAddresses: []
+
     # clustermesh-apiserver Prometheus metrics configuration
     metrics:
       # -- Enables exporting apiserver metrics in OpenMetrics format.
@@ -4283,7 +4348,7 @@ dnsProxy:
   # overwrites the TTL with this value. Setting this value to zero means that
   # Cilium will honor the TTLs returned by the upstream DNS server.
   minTtl: 0
-  # -- DNS cache data at this path is preloaded on agent startup.
+  # -- DNS cache data at this path is preloaded on agent startup. (deprecated: will be removed in v1.21)
   preCache: ""
   # -- Global port on which the in-agent DNS proxy should listen. Default 0 is a OS-assigned port.
   proxyPort: 0
@@ -4519,6 +4584,9 @@ standaloneDnsProxy:
   tolerations: []
   # -- Standalone DNS proxy auto mount service account token
   automountServiceAccountToken: false
+  # -- Minimum number of seconds for which a newly created standalone DNS proxy pod should be ready
+  # before it is considered available.
+  minReadySeconds: 5
   # -- Standalone DNS proxy update strategy
   updateStrategy:
     type: RollingUpdate

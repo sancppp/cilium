@@ -52,6 +52,7 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/hostfirewallbypass"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
 	kpr "github.com/cilium/cilium/pkg/kpr/initializer"
@@ -74,9 +75,17 @@ import (
 	"github.com/cilium/cilium/pkg/node/neighbordiscovery"
 	nodesync "github.com/cilium/cilium/pkg/node/sync"
 	"github.com/cilium/cilium/pkg/nodediscovery"
+
+	// Side-effect import: registers the EC2 IMDS-based AWS metadata fetcher
+	// with pkg/nodediscovery so ENI IPAM works at runtime in the agent.
+	// Kept out of cilium-operator-generic (which does not import the daemon
+	// package) to avoid pulling the AWS SDK into non-AWS operator builds.
+	hiveHealth "github.com/cilium/cilium/pkg/hive/health"
+	_ "github.com/cilium/cilium/pkg/nodediscovery/eni"
 	"github.com/cilium/cilium/pkg/nodeipamconfig"
 	"github.com/cilium/cilium/pkg/option"
 	policy "github.com/cilium/cilium/pkg/policy/cell"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	policyDirectory "github.com/cilium/cilium/pkg/policy/directory"
 	policyK8s "github.com/cilium/cilium/pkg/policy/k8s"
 	"github.com/cilium/cilium/pkg/pprof"
@@ -111,6 +120,13 @@ var (
 
 		// Runs the gops agent, a tool to diagnose Go processes.
 		gops.Cell(defaults.EnableGops, defaults.GopsPortAgent),
+
+		// Provides the 'health/history' command. The health history logs are stored
+		// in the state directory.
+		hiveHealth.HistoryCell,
+		cell.ProvidePrivate(func(cfg *option.DaemonConfig) hiveHealth.HistoryDir {
+			return hiveHealth.HistoryDir(cfg.StateDir)
+		}),
 
 		// Provides Clientset, API for accessing Kubernetes objects.
 		k8sClient.Cell,
@@ -202,7 +218,7 @@ var (
 		agentK8s.ResourcesCell,
 
 		// StateDB tables for Kubernetes objects.
-		agentK8s.TablesCell,
+		k8sTables.TablesCell,
 
 		// Shared synchronization structures for waiting on K8s resources to
 		// be synced
@@ -294,6 +310,9 @@ var (
 
 		// Provides PolicyRepository (List of policy rules)
 		policy.Cell,
+
+		// Provides PolicyRecomputer (policy computation).
+		compute.Cell,
 
 		// K8s policy resource watcher cell. It depends on the half-initialized daemon which is
 		// resolved by newDaemonPromise()

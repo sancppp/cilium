@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/statedb/reconciler"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -27,8 +28,10 @@ import (
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/node"
+	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type testParams struct {
@@ -37,9 +40,13 @@ type testParams struct {
 	DB     *statedb.DB
 	Writer *Writer
 
-	ServiceTable  statedb.Table[*loadbalancer.Service]
-	FrontendTable statedb.Table[*loadbalancer.Frontend]
-	BackendTable  statedb.Table[*loadbalancer.Backend]
+	LocalNodeStore *node.LocalNodeStore
+
+	NodeAddressTable statedb.RWTable[tables.NodeAddress]
+	ServiceTable     statedb.Table[*loadbalancer.Service]
+	FrontendTable    statedb.Table[*loadbalancer.Frontend]
+	BackendTable     statedb.Table[*loadbalancer.Backend]
+	Nodes            statedb.Table[*node.LocalNode]
 }
 
 func fixture(t testing.TB) (p testParams) {
@@ -406,6 +413,81 @@ func TestWriter_Initializers(t *testing.T) {
 	require.NotEmpty(t, p.ServiceTable.PendingInitializers(firstTxn), "expected services to be uninitialized")
 }
 
+func TestWriter_WildcardAddressReconciler(t *testing.T) {
+	p := fixture(t)
+
+	wildcardName := loadbalancer.NewServiceName("test", "wildcard")
+	otherName := loadbalancer.NewServiceName("test", "other")
+	wildcardAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(200), 2000, loadbalancer.ScopeExternal)
+	otherAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(201), 2001, loadbalancer.ScopeInternal)
+
+	// Add one wildcard-candidate frontend and one non-candidate frontend.
+	wtxn := p.Writer.WriteTxn()
+	require.NoError(t, p.Writer.UpsertServiceAndFrontends(
+		wtxn,
+		&loadbalancer.Service{Name: wildcardName, Source: source.Kubernetes},
+		loadbalancer.FrontendParams{
+			ServiceName: wildcardName,
+			Address:     wildcardAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: wildcardAddr.Port(),
+		},
+	))
+	require.NoError(t, p.Writer.UpsertServiceAndFrontends(
+		wtxn,
+		&loadbalancer.Service{Name: otherName, Source: source.Kubernetes},
+		loadbalancer.FrontendParams{
+			ServiceName: otherName,
+			Address:     otherAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: otherAddr.Port(),
+		},
+	))
+	wtxn.Commit()
+
+	// Mark both frontends as done so the reconciler has to push them back to pending.
+	wtxn = p.Writer.WriteTxn()
+	frontendTable, ok := any(p.FrontendTable).(statedb.RWTable[*loadbalancer.Frontend])
+	require.True(t, ok)
+	wildcardFE, _, found := p.FrontendTable.Get(wtxn, loadbalancer.FrontendByAddress(wildcardAddr))
+	require.True(t, found)
+	otherFE, _, found := p.FrontendTable.Get(wtxn, loadbalancer.FrontendByAddress(otherAddr))
+	require.True(t, found)
+
+	wildcardFE = wildcardFE.Clone()
+	wildcardFE.Status = reconciler.StatusDone()
+	_, _, err := frontendTable.Insert(wtxn, wildcardFE)
+	require.NoError(t, err)
+
+	otherFE = otherFE.Clone()
+	otherFE.Status = reconciler.StatusDone()
+	_, _, err = frontendTable.Insert(wtxn, otherFE)
+	require.NoError(t, err)
+	wtxn.Commit()
+
+	// Change the node-address set to trigger the wildcard address reconciler.
+	ntxn := p.DB.WriteTxn(p.NodeAddressTable)
+	_, _, err = p.NodeAddressTable.Insert(ntxn, tables.NodeAddress{
+		Addr:       intToAddr(250).Addr(),
+		Primary:    true,
+		DeviceName: "eth0",
+	})
+	require.NoError(t, err)
+	ntxn.Commit()
+
+	// Verify that only the wildcard candidate gets requeued to pending.
+	require.Eventually(t, func() bool {
+		txn := p.DB.ReadTxn()
+		wildcardFE, _, found := p.FrontendTable.Get(txn, loadbalancer.FrontendByAddress(wildcardAddr))
+		if !found || wildcardFE.Status.Kind != reconciler.StatusKindPending {
+			return false
+		}
+
+		otherFE, _, found := p.FrontendTable.Get(txn, loadbalancer.FrontendByAddress(otherAddr))
+		return found && otherFE.Status.Kind == reconciler.StatusKindDone
+	}, 5*time.Second, 100*time.Millisecond)
+}
+
 func TestWriter_SetBackends(t *testing.T) {
 	p := fixture(t)
 
@@ -770,4 +852,256 @@ func TestWriter_SetSelectBackends(t *testing.T) {
 	bes := slices.Collect(statedb.ToSeq(iter.Seq2[*loadbalancer.Backend, statedb.Revision](fe.Backends)))
 	require.Len(t, bes, 1)
 	require.Equal(t, beAddr.String(), bes[0].Address.String())
+}
+
+func TestWriter_SelectBackends_PreferCloseFallsBackFromUnhealthySameZone(t *testing.T) {
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+	p.Writer.SetIsServiceHealthCheckedFunc(func(*loadbalancer.Service) bool { return true })
+	p.LocalNodeStore.Update(func(n *node.LocalNode) {
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[corev1.LabelTopologyZone] = "zone-a"
+	})
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	localAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	remoteAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+	now := time.Now()
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferClose,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address:            localAddr,
+				State:              loadbalancer.BackendStateActive,
+				Unhealthy:          true,
+				UnhealthyUpdatedAt: &now,
+				Zone:               &loadbalancer.BackendZone{Zone: "zone-a", ForZones: []string{"zone-a"}},
+			},
+			{
+				Address:            remoteAddr,
+				State:              loadbalancer.BackendStateActive,
+				UnhealthyUpdatedAt: &now,
+				Zone:               &loadbalancer.BackendZone{Zone: "zone-b", ForZones: []string{"zone-b"}},
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+	require.Len(t, selected, 2)
+	addresses := []loadbalancer.L3n4Addr{selected[0].Address, selected[1].Address}
+	assert.Contains(t, addresses, localAddr)
+	assert.Contains(t, addresses, remoteAddr)
+}
+
+// TestWriter_SelectBackends_PreferCloseIgnoresTerminatingForMissingHints verifies
+// that backends in BackendStateTerminating / BackendStateTerminatingNotServing are
+// excluded from the missing-hints safeguard. The EndpointSlice controller does not
+// compute zone hints for non-Ready endpoints, so without this exclusion a single
+// terminating Pod would disable topology-aware routing for the entire Service.
+func TestWriter_SelectBackends_PreferCloseIgnoresTerminatingForMissingHints(t *testing.T) {
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+	p.LocalNodeStore.Update(func(n *node.LocalNode) {
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[corev1.LabelTopologyZone] = "zone-a"
+	})
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	activeLocalAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	activeRemoteAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+	terminatingAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(4), 8080, loadbalancer.ScopeExternal)
+	terminatingNoZoneAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(5), 8080, loadbalancer.ScopeExternal)
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferClose,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address: activeLocalAddr,
+				State:   loadbalancer.BackendStateActive,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-a", ForZones: []string{"zone-a"}},
+			},
+			{
+				Address: activeRemoteAddr,
+				State:   loadbalancer.BackendStateActive,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-b", ForZones: []string{"zone-b"}},
+			},
+			{
+				// Terminating Pod whose endpoint kept its zone label but has no
+				// ForZones hint. Pre-fix this would have set missingHints=true and
+				// disabled topology routing for the whole Service.
+				Address: terminatingAddr,
+				State:   loadbalancer.BackendStateTerminating,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-c"},
+			},
+			{
+				// Terminating Pod on a node without a zone label. Pre-fix the
+				// emit loop would have nil-dereferenced be.Zone.ForZones.
+				Address: terminatingNoZoneAddr,
+				State:   loadbalancer.BackendStateTerminatingNotServing,
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+
+	// Topology safeguard must remain engaged: only the zone-a Active backend
+	// should be selected. Terminating backends are filtered from primary traffic
+	// because their (possibly empty / nil) ForZones cannot match the local zone.
+	require.Len(t, selected, 1)
+	assert.Equal(t, activeLocalAddr.String(), selected[0].Address.String())
+}
+
+// TestWriter_SelectBackends_PreferCloseFallsBackWhenOnlyTerminating verifies that
+// when every backend is terminating, the safeguard reports no candidates and we
+// fall back to the default behaviour (yield all backends), preserving graceful
+// drain semantics. The nil-Zone backend must not panic.
+func TestWriter_SelectBackends_PreferCloseFallsBackWhenOnlyTerminating(t *testing.T) {
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+	p.LocalNodeStore.Update(func(n *node.LocalNode) {
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[corev1.LabelTopologyZone] = "zone-a"
+	})
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	terminatingAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	terminatingNoZoneAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferClose,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address: terminatingAddr,
+				State:   loadbalancer.BackendStateTerminating,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-a"},
+			},
+			{
+				Address: terminatingNoZoneAddr,
+				State:   loadbalancer.BackendStateTerminating,
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+	require.Len(t, selected, 2)
+	addresses := []loadbalancer.L3n4Addr{selected[0].Address, selected[1].Address}
+	assert.Contains(t, addresses, terminatingAddr)
+	assert.Contains(t, addresses, terminatingNoZoneAddr)
+}
+
+func TestWriter_SelectBackends_PreferSameNodeIgnoresTerminating(t *testing.T) {
+	oldName := nodeTypes.GetName()
+	nodeTypes.SetName("node-a")
+	t.Cleanup(func() {
+		nodeTypes.SetName(oldName)
+	})
+
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	activeLocalAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	terminatingLocalAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferSameNode,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address:  activeLocalAddr,
+				State:    loadbalancer.BackendStateActive,
+				NodeName: "node-a",
+			},
+			{
+				Address:  terminatingLocalAddr,
+				State:    loadbalancer.BackendStateTerminating,
+				NodeName: "node-a",
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+
+	// Only the active local backend should be selected.
+	// Terminating local backend must be filtered out.
+	require.Len(t, selected, 1)
+	assert.Equal(t, activeLocalAddr.String(), selected[0].Address.String())
 }

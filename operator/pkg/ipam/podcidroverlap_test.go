@@ -6,7 +6,7 @@ package ipam
 import (
 	"context"
 	"fmt"
-	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -18,8 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	operatorK8s "github.com/cilium/cilium/operator/k8s"
-	"github.com/cilium/cilium/pkg/ipam/allocator/clusterpool/cidralloc"
-	"github.com/cilium/cilium/pkg/ipam/allocator/podcidr"
+	"github.com/cilium/cilium/operator/pkg/ipam/allocator/clusterpool/cidralloc"
+	"github.com/cilium/cilium/operator/pkg/ipam/allocator/podcidr"
 	"github.com/cilium/cilium/pkg/ipam/cidrset"
 	"github.com/cilium/cilium/pkg/ipam/types"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -47,7 +47,7 @@ func podCIDRAllocatorOverlapTestRun(t *testing.T) {
 
 	// Create a new CIDR allocator
 
-	_, cidr, err := net.ParseCIDR("10.129.0.0/16")
+	cidr, err := netip.ParsePrefix("10.129.0.0/16")
 	require.NoError(t, err)
 
 	set, err := cidrset.NewCIDRSet(cidr, 24)

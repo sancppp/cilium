@@ -4,7 +4,6 @@
 package model
 
 import (
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +17,17 @@ import (
 type Model struct {
 	HTTP           []HTTPListener           `json:"http,omitempty"`
 	TLSPassthrough []TLSPassthroughListener `json:"tls_passthrough,omitempty"`
+	L4             []L4Listener             `json:"l4,omitempty"`
+	HTTPOptions    *HTTPOptions             `json:"http_options,omitempty"`
+}
+
+type HTTPOptions struct {
+	GRPCWebTranslation *GRPCWebTranslationConfig `json:"grpc_web_translation,omitempty"`
+}
+
+type GRPCWebTranslationConfig struct {
+	Enabled bool         `json:"enabled"`
+	L4      []L4Listener `json:"l4,omitempty"`
 }
 
 func (m *Model) GetListeners() []Listener {
@@ -31,7 +41,18 @@ func (m *Model) GetListeners() []Listener {
 		listeners = append(listeners, &m.TLSPassthrough[i])
 	}
 
+	for i := range m.L4 {
+		listeners = append(listeners, &m.L4[i])
+	}
+
 	return listeners
+}
+
+func (m *Model) GRPCWebTranslationEnabled() bool {
+	return m == nil ||
+		m.HTTPOptions == nil ||
+		m.HTTPOptions.GRPCWebTranslation == nil ||
+		m.HTTPOptions.GRPCWebTranslation.Enabled
 }
 
 type Listener interface {
@@ -40,6 +61,7 @@ type Listener interface {
 	GetAnnotations() map[string]string
 	GetLabels() map[string]string
 	GetService() *Service
+	GetProtocol() L4Protocol
 }
 
 // HTTPListener holds configuration for any listener that terminates and proxies HTTP
@@ -111,6 +133,10 @@ func (l HTTPListener) GetService() *Service {
 	return l.Service
 }
 
+func (l HTTPListener) GetProtocol() L4Protocol {
+	return L4ProtocolTCP
+}
+
 // TLSPassthroughListener holds configuration for any listener that proxies TLS
 // based on the SNI value.
 // Each holds the configuration info for one distinct TLS listener, by
@@ -165,6 +191,74 @@ func (l TLSPassthroughListener) GetPort() uint32 {
 
 func (l TLSPassthroughListener) GetService() *Service {
 	return l.Service
+}
+
+func (l TLSPassthroughListener) GetProtocol() L4Protocol {
+	return L4ProtocolTCP
+}
+
+type L4Protocol string
+
+const (
+	L4ProtocolTCP L4Protocol = "TCP"
+	L4ProtocolUDP L4Protocol = "UDP"
+)
+
+// L4Listener holds configuration for TCP or UDP listeners.
+type L4Listener struct {
+	// Name of the listener
+	Name string `json:"name,omitempty"`
+	// Sources is a slice of fully qualified resources this listener is sourced from.
+	Sources []FullyQualifiedResource `json:"sources,omitempty"`
+	// IPAddress that the listener should listen on.
+	Address string `json:"address,omitempty"`
+	// Port on which the service can be expected to be accessed by clients.
+	Port uint32 `json:"port,omitempty"`
+	// Protocol of the listener (TCP or UDP).
+	Protocol L4Protocol `json:"protocol,omitempty"`
+	// Routes associated with traffic to the service.
+	Routes []L4Route `json:"routes,omitempty"`
+	// Service configuration
+	Service *Service `json:"service,omitempty"`
+	// Infrastructure configuration
+	Infrastructure *Infrastructure `json:"infrastructure,omitempty"`
+}
+
+func (l L4Listener) GetAnnotations() map[string]string {
+	if l.Infrastructure != nil {
+		return l.Infrastructure.Annotations
+	}
+	return nil
+}
+
+func (l L4Listener) GetLabels() map[string]string {
+	if l.Infrastructure != nil {
+		return l.Infrastructure.Labels
+	}
+	return nil
+}
+
+func (l L4Listener) GetSources() []FullyQualifiedResource {
+	return l.Sources
+}
+
+func (l L4Listener) GetPort() uint32 {
+	return l.Port
+}
+
+func (l L4Listener) GetService() *Service {
+	return l.Service
+}
+
+func (l L4Listener) GetProtocol() L4Protocol {
+	return l.Protocol
+}
+
+// L4Route holds the details needed to route TCP/UDP traffic to backends.
+type L4Route struct {
+	Name string `json:"name,omitempty"`
+	// Backends handling the requests.
+	Backends []Backend `json:"backends,omitempty"`
 }
 
 // Service holds the configuration for desired Service details
@@ -281,6 +375,60 @@ type HTTPRequestMirror struct {
 	Denominator int32 `json:"denominator,omitempty"`
 }
 
+// ExternalAuthProtocol is the protocol used to communicate with an ext_authz backend.
+type ExternalAuthProtocol string
+
+const (
+	ExternalAuthProtocolGRPC ExternalAuthProtocol = "GRPC"
+	ExternalAuthProtocolHTTP ExternalAuthProtocol = "HTTP"
+)
+
+// HTTPExternalAuthFilter defines configuration for an external authorization filter.
+type HTTPExternalAuthFilter struct {
+	// Backend is the authorization service backend.
+	Backend Backend `json:"backend"`
+	// Protocol is the protocol used to communicate with the auth backend.
+	Protocol ExternalAuthProtocol `json:"protocol"`
+	// PathPrefix is prepended to the request path when forwarding to HTTP auth backends.
+	PathPrefix string `json:"path_prefix,omitempty"`
+	// AllowedRequestHeaders are additional headers forwarded to the auth service (HTTP protocol).
+	AllowedRequestHeaders []string `json:"allowed_request_headers,omitempty"`
+	// AllowedResponseHeaders are headers from the auth response to forward to the upstream (HTTP protocol).
+	AllowedResponseHeaders []string `json:"allowed_response_headers,omitempty"`
+	// ForwardBody configures buffering and forwarding of the client request body to the auth service.
+	// If nil or MaxSize is 0, the body is not forwarded.
+	ForwardBody *ForwardBodyConfig `json:"forward_body,omitempty"`
+}
+
+// ForwardBodyConfig controls if and how the client request body is forwarded to the auth service.
+type ForwardBodyConfig struct {
+	// MaxSize is the maximum number of bytes to buffer and forward. If the body exceeds this,
+	// the body is truncated to MaxSize before being sent to the auth service.
+	MaxSize uint32 `json:"max_size"`
+}
+
+// HTTPCORSFilter defines configuration for the CORS filter.
+type HTTPCORSFilter struct {
+	// AllowOrigins indicates whether the response can be shared with
+	// requested resource from the given `Origin`.
+	AllowOrigins []string `json:"allowOrigins,omitempty"`
+	// AllowCredentials indicates whether the actual cross-origin request
+	// allows to include credentials.
+	AllowCredentials bool `json:"allowCredentials,omitempty"`
+	// AllowMethods indicates which HTTP methods are supported
+	// for accessing the requested resource.
+	AllowMethods []string `json:"allowMethods,omitempty"`
+	// AllowHeaders indicates which HTTP request headers are supported
+	// for accessing the requested resource.
+	AllowHeaders []string `json:"allowHeaders,omitempty"`
+	// ExposeHeaders indicates which HTTP response headers can be exposed
+	// to client-side scripts in response to a cross-origin request.
+	ExposeHeaders []string `json:"exposeHeaders,omitempty"`
+	// MaxAge indicates the duration (in seconds) for the client to cache
+	// the results of a "preflight" request.
+	MaxAge int32 `json:"maxAge,omitempty"`
+}
+
 // HTTPRoute holds all the details needed to route HTTP traffic to a backend.
 type HTTPRoute struct {
 	Name string `json:"name,omitempty"`
@@ -319,6 +467,9 @@ type HTTPRoute struct {
 	// Unlike other filter, multiple request mirrors are supported
 	RequestMirrors []*HTTPRequestMirror `json:"request_mirrors,omitempty"`
 
+	// ExternalAuth configures external authorization for this route.
+	ExternalAuth *HTTPExternalAuthFilter `json:"external_auth,omitempty"`
+
 	// IsGRPC is an indicator if this route is related to GRPC
 	IsGRPC bool `json:"is_grpc,omitempty"`
 
@@ -327,6 +478,9 @@ type HTTPRoute struct {
 
 	// Retry holds the retry configuration for a route.
 	Retry *HTTPRetry `json:"retry,omitempty"`
+
+	// CORS holds cross-origin resource sharing filters for a route.
+	CORS *HTTPCORSFilter `json:"cors,omitempty"`
 }
 
 type BackendHTTPFilter struct {
@@ -380,6 +534,26 @@ func (r *HTTPRoute) GetMatchKey() string {
 	for _, qm := range r.QueryParamsMatch {
 		sb.WriteString("query:")
 		sb.WriteString(qm.String())
+		sb.WriteString("|")
+	}
+
+	if r.RequestRedirect != nil && r.RequestRedirect.Scheme != nil {
+		sb.WriteString("redirect:")
+		sb.WriteString("true")
+		sb.WriteString("|")
+	}
+
+	if r.ExternalAuth != nil {
+		sb.WriteString("auth:")
+		sb.WriteString(string(r.ExternalAuth.Protocol))
+		sb.WriteString(":")
+		sb.WriteString(r.ExternalAuth.Backend.Namespace)
+		sb.WriteString(":")
+		sb.WriteString(r.ExternalAuth.Backend.Name)
+		if r.ExternalAuth.Backend.Port != nil {
+			sb.WriteString(":")
+			sb.WriteString(r.ExternalAuth.Backend.Port.GetPort())
+		}
 		sb.WriteString("|")
 	}
 
@@ -513,9 +687,9 @@ type HTTPRetry struct {
 	Backoff *time.Duration `json:"backoff,omitempty"`
 }
 
-// IsEmpty returns true if the model has no HTTP or TLS Passthrough listeners.
+// IsEmpty returns true if the model has no HTTP, TLS Passthrough or L4 listeners.
 func (m *Model) IsEmpty() bool {
-	return len(m.HTTP) == 0 && len(m.TLSPassthrough) == 0
+	return len(m.HTTP) == 0 && len(m.TLSPassthrough) == 0 && len(m.L4) == 0
 }
 
 // IsHTTPListenerConfigured returns true if the model has any HTTP listeners.
@@ -533,9 +707,136 @@ func (m *Model) IsHTTPSListenerConfigured() bool {
 	return false
 }
 
+// IsL4ListenerConfigured returns true if the model has any L4 listeners.
+func (m *Model) IsL4ListenerConfigured() bool {
+	return len(m.L4) > 0
+}
+
+// IsHTTPSPortConfigured returns true if the model contains an HTTPS listener
+// on the given port number.
+func (m *Model) IsHTTPSPortConfigured(port uint32) bool {
+	for _, l := range m.HTTP {
+		if len(l.TLS) > 0 && l.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+// HTTPSPortsSorted returns sorted, unique ports for all HTTPS listeners.
+func (m *Model) HTTPSPortsSorted() []uint32 {
+	var ports []uint32
+	for _, l := range m.HTTP {
+		if len(l.TLS) > 0 {
+			ports = append(ports, l.Port)
+		}
+	}
+	return slices.SortedUnique(ports)
+}
+
+// NeedsPerPortHTTPSListeners returns true if the model has more than one distinct HTTPS port.
+func (m *Model) NeedsPerPortHTTPSListeners() bool {
+	return len(m.HTTPSPortsSorted()) > 1
+}
+
+// NeedsPerPortTLSPassthroughListeners returns true if the model has more than one distinct TLS passthrough port.
+func (m *Model) NeedsPerPortTLSPassthroughListeners() bool {
+	return len(m.TLSPassthroughPorts()) > 1
+}
+
+// NeedsPerPortListeners returns true if any protocol has enough distinct ports
+// to require per-port Envoy Listener resources, or if cross-protocol SNI overlap
+// would make a combined listener lose the Gateway listener port boundary.
+func (m *Model) NeedsPerPortListeners() bool {
+	return m.NeedsPerPortHTTPSListeners() || m.NeedsPerPortTLSPassthroughListeners() || m.NeedsCrossProtocolSplit()
+}
+
+// NeedsCrossProtocolSplit returns true when HTTPS and TLS passthrough filter
+// chains on different Gateway listener ports cannot safely share a combined
+// Envoy listener.
+//
+// Filter chains from different Gateway listener ports must not share any SNI
+// match because a combined Envoy listener would otherwise erase the original
+// Gateway listener port boundary and route traffic for one listener to another.
+// Same-port HTTPS and TLS passthrough conflicts cannot be fixed by per-port
+// listeners and need to be rejected before translation.
+func (m *Model) NeedsCrossProtocolSplit() bool {
+	for _, httpsMatch := range m.httpsFilterChainMatches() {
+		for _, tlsMatch := range m.tlsPassthroughFilterChainMatches() {
+			if httpsMatch.port == tlsMatch.port {
+				continue
+			}
+			if sniHostnamesIntersect(httpsMatch.hostname, tlsMatch.hostname) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type filterChainMatch struct {
+	hostname string
+	port     uint32
+}
+
+// httpsFilterChainMatches returns the normalized hostnames and ports that HTTPS
+// filter chains will use for SNI matching. Each HTTPS filter chain's ServerNames
+// derive from the listener-level hostname.
+func (m *Model) httpsFilterChainMatches() []filterChainMatch {
+	var matches []filterChainMatch
+	seen := map[filterChainMatch]struct{}{}
+	for _, l := range m.HTTP {
+		if len(l.TLS) == 0 {
+			continue
+		}
+		match := filterChainMatch{hostname: normalizeHostname(l.Hostname), port: l.Port}
+		if _, ok := seen[match]; ok {
+			continue
+		}
+		seen[match] = struct{}{}
+		matches = append(matches, match)
+	}
+	return matches
+}
+
+// tlsPassthroughFilterChainMatches returns the normalized hostnames and ports
+// that TLS passthrough filter chains will use for SNI matching. These derive
+// from route hostnames because each TLS passthrough route generates its own
+// filter chain.
+func (m *Model) tlsPassthroughFilterChainMatches() []filterChainMatch {
+	var matches []filterChainMatch
+	seen := map[filterChainMatch]struct{}{}
+	for _, l := range m.TLSPassthrough {
+		for _, r := range l.Routes {
+			if len(r.Hostnames) == 0 {
+				match := filterChainMatch{hostname: allHosts, port: l.Port}
+				if _, ok := seen[match]; !ok {
+					seen[match] = struct{}{}
+					matches = append(matches, match)
+				}
+				continue
+			}
+			for _, h := range r.Hostnames {
+				match := filterChainMatch{hostname: normalizeHostname(h), port: l.Port}
+				if _, ok := seen[match]; ok {
+					continue
+				}
+				seen[match] = struct{}{}
+				matches = append(matches, match)
+			}
+		}
+	}
+	return matches
+}
+
 // IsTLSPassthroughListenerConfigured returns true if the model has any TLS Passthrough listeners.
 func (m *Model) IsTLSPassthroughListenerConfigured() bool {
-	return len(m.TLSPassthrough) > 0
+	for _, l := range m.TLSPassthrough {
+		if len(l.Routes) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // HTTPPorts returns a list of unique ports for all HTTP listeners.
@@ -547,11 +848,26 @@ func (m *Model) HTTPPorts() []uint32 {
 	return slices.SortedUnique(ports)
 }
 
+// IsCORSFilterConfigured returns true if any HTTP route has a configured CORS filter.
+func (m *Model) IsCORSFilterConfigured() bool {
+	for _, h := range m.HTTP {
+		for _, r := range h.Routes {
+			if r.CORS != nil {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // TLSPassthroughPorts returns a list of unique ports for all TLS Passthrough listeners.
 func (m *Model) TLSPassthroughPorts() []uint32 {
 	var ports []uint32
 	for _, l := range m.TLSPassthrough {
-		ports = append(ports, l.Port)
+		if len(l.Routes) > 0 {
+			ports = append(ports, l.Port)
+		}
 	}
 	return slices.SortedUnique(ports)
 }
@@ -564,37 +880,6 @@ func (m *Model) AllPorts() []uint32 {
 	return slices.SortedUnique(ports)
 }
 
-type TLSBackendDetails struct {
-	BackendKey string
-	Hostnames  []string
-}
-
-// TLSBackends returns a slice of TLSBackendDetails.
-// This is only used for TLS Passthrough listeners.
-//
-// The slice keeps the ordering of the model Listeners,
-// as the model Listeners are correctly sorted by hostname,
-// in decreasing order of specificity.
-//
-// This ensures that the rules that end up generated in the translation
-// process are in the correct most-specific to least-specific order.
-func (m *Model) TLSBackends() []TLSBackendDetails {
-	res := []TLSBackendDetails{}
-
-	for _, h := range m.TLSPassthrough {
-		for _, route := range h.Routes {
-			for _, backend := range route.Backends {
-				key := fmt.Sprintf("%s:%s:%s", backend.Namespace, backend.Name, backend.Port.GetPort())
-				res = append(res, TLSBackendDetails{
-					BackendKey: key,
-					Hostnames:  route.Hostnames,
-				})
-			}
-		}
-	}
-	return res
-}
-
 // TLSSecretsToHostnames returns a map of TLS secrets to hostnames.
 // This is only for HTTP listeners.
 func (m *Model) TLSSecretsToHostnames() map[TLSSecret][]string {
@@ -602,6 +887,24 @@ func (m *Model) TLSSecretsToHostnames() map[TLSSecret][]string {
 	for _, h := range m.HTTP {
 		for _, s := range h.TLS {
 			res[s] = append(res[s], h.Hostname)
+		}
+	}
+	return res
+}
+
+// TLSListenerRef records a (hostname, port) pair for an HTTPS listener.
+type TLSListenerRef struct {
+	Hostname string
+	Port     uint32
+}
+
+// TLSSecretsToListeners returns, for each TLS secret, the set of
+// (hostname, port) pairs of all HTTPS listeners that reference it.
+func (m *Model) TLSSecretsToListeners() map[TLSSecret][]TLSListenerRef {
+	res := make(map[TLSSecret][]TLSListenerRef)
+	for _, l := range m.HTTP {
+		for _, s := range l.TLS {
+			res[s] = append(res[s], TLSListenerRef{Hostname: l.Hostname, Port: l.Port})
 		}
 	}
 	return res

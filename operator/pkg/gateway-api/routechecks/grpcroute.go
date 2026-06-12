@@ -25,11 +25,12 @@ var _ Input = (*GRPCRouteInput)(nil)
 
 // GRPCRouteInput is used to implement the Input interface for GRPCRoute
 type GRPCRouteInput struct {
-	Ctx       context.Context
-	Logger    *slog.Logger
-	Client    client.Client
-	Grants    *gatewayv1beta1.ReferenceGrantList
-	GRPCRoute *gatewayv1.GRPCRoute
+	Ctx            context.Context
+	Logger         *slog.Logger
+	Client         client.Client
+	Grants         *gatewayv1.ReferenceGrantList
+	GRPCRoute      *gatewayv1.GRPCRoute
+	ControllerName string
 
 	gateways      map[gatewayv1.ParentReference]*gatewayv1.Gateway
 	gammaServices map[gatewayv1.ParentReference]*corev1.Service
@@ -84,7 +85,7 @@ func (g *GRPCRouteInput) GetGVK() schema.GroupVersionKind {
 	return gatewayv1.SchemeGroupVersion.WithKind("GRPCRoute")
 }
 
-func (g *GRPCRouteInput) GetGrants() []gatewayv1beta1.ReferenceGrant {
+func (g *GRPCRouteInput) GetGrants() []gatewayv1.ReferenceGrant {
 	return g.Grants.Items
 }
 
@@ -188,7 +189,7 @@ func (g *GRPCRouteInput) mergeStatusConditions(parentRef gatewayv1.ParentReferen
 	}
 	g.GRPCRoute.Status.RouteStatus.Parents = append(g.GRPCRoute.Status.RouteStatus.Parents, gatewayv1.RouteParentStatus{
 		ParentRef:      parentRef,
-		ControllerName: controllerName,
+		ControllerName: gatewayv1.GatewayController(g.ControllerName),
 		Conditions:     updates,
 	})
 }

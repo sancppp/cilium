@@ -18,6 +18,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/connector"
 	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
+	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
@@ -71,6 +72,7 @@ func newLocalNodeConfig(
 	wgAgent wgTypes.Agent,
 	ipsecCfg ipsec.Config,
 	connectorConfig connector.Config,
+	plugins plugin.Plugins,
 ) (config.Config, <-chan struct{}, error) {
 	auxPrefixes := []*cidr.CIDR{}
 
@@ -106,6 +108,14 @@ func newLocalNodeConfig(
 			return config.Config{}, directRoutingDevWatch, errors.New("direct routing device required but not configured")
 		}
 
+		// Ensure the device has at least one usable address for the enabled
+		// address families. If not, return the watch channel so we retry as
+		// soon as the device's addresses change.
+		if !directRoutingDeviceHasAddr(drd) {
+			return config.Config{}, directRoutingDevWatch,
+				fmt.Errorf("direct routing device %s has no usable addresses", drd.Name)
+		}
+
 		watchChans = append(watchChans, directRoutingDevWatch)
 		directRoutingDevice = drd
 	}
@@ -126,7 +136,7 @@ func newLocalNodeConfig(
 
 	hostEndpointID, _ := node.GetEndpointID()
 
-	ciliumHostDevice, _, hostWatch, ok := devices.GetWatch(txn, tables.DeviceNameIndex.Query(defaults.HostDevice))
+	ciliumHostDevice, _, hostWatch, ok := devices.GetWatch(txn, tables.DeviceByName(defaults.HostDevice))
 	if !ok {
 		return config.Config{}, hostWatch, fmt.Errorf("failed to look up link '%s'", defaults.HostDevice)
 	}
@@ -136,7 +146,7 @@ func newLocalNodeConfig(
 		return config.Config{}, nil, fmt.Errorf("failed to parse hardware address of '%s': %w", defaults.HostDevice, err)
 	}
 
-	ciliumNetDevice, _, netWatch, ok := devices.GetWatch(txn, tables.DeviceNameIndex.Query(defaults.SecondHostDevice))
+	ciliumNetDevice, _, netWatch, ok := devices.GetWatch(txn, tables.DeviceByName(defaults.SecondHostDevice))
 	if !ok {
 		return config.Config{}, netWatch, fmt.Errorf("failed to look up link '%s'", defaults.SecondHostDevice)
 	}
@@ -194,6 +204,7 @@ func newLocalNodeConfig(
 		MaglevConfig:                 maglevConfig,
 		DatapathIsLayer2:             connectorConfig.GetOperationalMode().IsLayer2(),
 		DatapathIsNetkit:             connectorConfig.GetOperationalMode().IsNetkit(),
+		Plugins:                      plugins,
 	}, common.MergeChannels(watchChans...), nil
 }
 
@@ -215,4 +226,21 @@ func getEphemeralPortRangeMin(sysctl sysctl.Sysctl) (int, error) {
 	}
 
 	return ephemeralPortMin, nil
+}
+
+// directRoutingDeviceHasAddr returns true if the device has at least one
+// usable address for the enabled address families.
+func directRoutingDeviceHasAddr(dev *tables.Device) bool {
+	for _, addr := range dev.Addrs {
+		if addr.Addr.IsUnspecified() {
+			continue
+		}
+		if option.Config.EnableIPv4 && addr.Addr.Is4() {
+			return true
+		}
+		if option.Config.EnableIPv6 && addr.Addr.Is6() {
+			return true
+		}
+	}
+	return false
 }

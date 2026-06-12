@@ -648,7 +648,8 @@ func remoteClusterStatusToError(status *models.RemoteCluster) error {
 		return errConfigRequiredNotRetrieved
 	case status.Synced == nil:
 		return errors.New("synchronization status unknown")
-	case !(status.Synced.Nodes && status.Synced.Endpoints && status.Synced.Identities && status.Synced.Services):
+	case !(status.Synced.Nodes && status.Synced.Endpoints && status.Synced.Identities && status.Synced.Services &&
+		(status.Synced.ServiceExports == nil || *status.Synced.ServiceExports)):
 		var toSync []string
 		appendNotSynced := func(name string, synced bool) {
 			if !synced {
@@ -659,6 +660,9 @@ func remoteClusterStatusToError(status *models.RemoteCluster) error {
 		appendNotSynced("identities", status.Synced.Identities)
 		appendNotSynced("nodes", status.Synced.Nodes)
 		appendNotSynced("services", status.Synced.Services)
+		if status.Synced.ServiceExports != nil {
+			appendNotSynced("service-exports", *status.Synced.ServiceExports)
+		}
 
 		return fmt.Errorf("synchronization in progress for %s", strings.Join(toSync, ", "))
 	default:
@@ -1417,7 +1421,10 @@ func (k *K8sClusterMesh) helmUpgradeClusters(ctx context.Context, client *k8s.Cl
 	var clustersRaw any
 	clustersRaw = clusters
 
-	versionStr := rel.MetadataAsMap()["Version"].(string)
+	versionStr, ok := rel.MetadataAsMap()["Version"].(string)
+	if !ok {
+		return fmt.Errorf("failed to get Helm chart version from release metadata on cluster %s", client.ClusterName())
+	}
 	version, err := versioncheck.Version(versionStr)
 	if err != nil {
 		return fmt.Errorf("Failed to parse Helm chart version %s on cluster %s: %w", versionStr, client.ClusterName(), err)
@@ -1794,11 +1801,10 @@ func getClustersFromValues(values map[string]any) (map[string]any, map[string]an
 		if !ok {
 			return nil, nil, fmt.Errorf("existing clustermesh.config.clusters is invalid")
 		}
-		if _, ok := cluster["name"]; !ok {
+		clusterName, ok := cluster["name"].(string)
+		if !ok {
 			return nil, nil, fmt.Errorf("existing clustermesh.config.clusters is invalid")
 		}
-
-		clusterName := cluster["name"].(string)
 		delete(cluster, "name")
 		clusters[clusterName] = cluster
 	}

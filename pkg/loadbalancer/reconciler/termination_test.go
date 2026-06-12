@@ -277,7 +277,6 @@ func TestPrivilegedSocketTermination_Datapath(t *testing.T) {
 		maglev.Cell,
 		lbmaps.Cell,
 		cell.Config(loadbalancer.DefaultUserConfig),
-		cell.Config(loadbalancer.DeprecatedConfig{}),
 		cell.Provide(
 			loadbalancer.NewBackendsTable,
 			statedb.RWTable[*loadbalancer.Backend].ToTable,
@@ -461,9 +460,9 @@ func benchmarkChangeIteration(b *testing.B, proto loadbalancer.L4Type) {
 		wtxn := db.WriteTxn(backends)
 		changeIter, err := backends.Changes(wtxn)
 		require.NoError(b, err)
-		wtxn.Commit()
+		rtxn := wtxn.Commit()
 
-		changes, _ := changeIter.Next(wtxn)
+		changes, _ := changeIter.Next(rtxn)
 		total, dead := 0, 0
 		for change := range changes {
 			backend := change.Object

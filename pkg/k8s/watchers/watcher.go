@@ -204,6 +204,7 @@ var ciliumResourceToGroupMapping = map[string]watcherInfo{
 	synced.CRDResourceName(cilium_v2.CCGName):           {waitOnly, k8sAPIGroupCiliumCIDRGroupV2},
 	synced.CRDResourceName(v2alpha1.L2AnnouncementName): {skip, ""}, // Handled by L2 announcement directly
 	synced.CRDResourceName(v2alpha1.CPIPName):           {skip, ""}, // Handled by multi-pool IPAM allocator
+	synced.CRDResourceName(v2alpha1.CDPPName):           {skip, ""}, // Handled by datapath plugins
 }
 
 func GetGroupsForCiliumResources(logger *slog.Logger, ciliumResources []string) ([]string, []string) {
@@ -286,7 +287,9 @@ func (k *K8sWatcher) enableK8sWatchers(ctx context.Context, resourceNames []stri
 				k.k8sCiliumEndpointsWatcher.initCiliumEndpointOrSlices(ctx)
 			}
 		case k8sAPIGroupCiliumEndpointSliceV2Alpha1:
-			// no-op; handled in k8sAPIGroupCiliumEndpointV2
+			if !k.kcfg.IsEnabled() && option.Config.DisableCiliumEndpointCRD {
+				k.k8sCiliumEndpointsWatcher.initCiliumEndpointOrSlices(ctx)
+			}
 		default:
 			logging.Fatal(k.logger,
 				"Not listening for Kubernetes resource updates for unhandled type",

@@ -10,9 +10,6 @@
 #define ENABLE_NODEPORT
 #define ENABLE_NODEPORT_ACCELERATION
 
-/* Skip ingress policy checks */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
-
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
 
@@ -85,6 +82,8 @@ long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
 }
 
 #include "lib/bpf_xdp.h"
+
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
@@ -419,7 +418,7 @@ static __always_inline int build_reply(struct __ctx_buff *ctx)
 	struct pktgen builder;
 	struct tcphdr *l4;
 	void *data;
-	__u16 nat_source_port = 0;
+	__be16 nat_source_port = 0;
 	__u32 key = 0;
 
 	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);

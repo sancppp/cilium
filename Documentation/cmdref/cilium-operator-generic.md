@@ -11,11 +11,11 @@ cilium-operator-generic [flags]
 ### Options
 
 ```
-      --auto-create-cilium-pod-ip-pools stringToString             Automatically create CiliumPodIPPool resources on startup. Specify pools in the form of <pool>=ipv4-cidrs:<cidr>,[<cidr>...];ipv4-mask-size:<size> (multiple pools can also be passed by repeating the CLI flag) (default [])
+      --auto-create-cilium-pod-ip-pools stringToString             Automatically create CiliumPodIPPool resources on startup. Specify pools in the form of <pool>=ipv4-cidrs:<cidr>,[<cidr>...];ipv4-mask-size:<size>[;allow-first-ip:<bool>][;allow-last-ip:<bool>] (multiple pools can also be passed by repeating the CLI flag) (default [])
       --ces-max-ciliumendpoints-per-ces int                        Maximum number of CiliumEndpoints allowed in a CES (default 100)
       --ces-rate-limits string                                     Configure rate limits for the CES controller. Accepts a list of rate limit configurations, must be a JSON formatted string. (default "[{\"nodes\":0,\"limit\":10,\"burst\":20}]")
       --cilium-endpoint-gc-interval duration                       GC interval for cilium endpoints (default 5m0s)
-      --cilium-pod-labels string                                   Cilium Pod's labels. Used to detect if a Cilium pod is running to remove the node taints where its running and set NetworkUnavailable to false (default "k8s-app=cilium")
+      --cilium-pod-labels string                                   Cilium Pod's labels selector. Used to detect if a Cilium pod is running to remove the node taints where its running and set NetworkUnavailable to false (default "k8s-app=cilium")
       --cilium-pod-namespace string                                Name of the Kubernetes namespace in which Cilium is deployed in. Defaults to the same namespace defined in k8s-namespace
       --cluster-id uint32                                          Unique identifier of the cluster
       --cluster-name string                                        Name of the cluster. It must consist of at most 32 lower case alphanumeric characters and '-', start and end with an alphanumeric character. (default "default")
@@ -41,6 +41,7 @@ cilium-operator-generic [flags]
       --double-write-metric-reporter-interval duration             Refresh interval for the Double Write Metric Reporter (default 1m0s)
       --enable-cilium-endpoint-slice                               If set to true, the CiliumEndpointSlice feature is enabled. If any CiliumEndpoints resources are created, updated, or deleted in the cluster, all those changes are broadcast as CiliumEndpointSlice updates to all of the Cilium agents.
       --enable-cilium-operator-server-access strings               List of cilium operator APIs which are administratively enabled. Supports '*'. (default [*])
+      --enable-cluster-pool-to-multi-pool-migration                Enable the migration of all nodes from cluster-pool IPAM to multi-pool IPAM
       --enable-gateway-api-alpn                                    Enables exposing ALPN with HTTP2 and HTTP/1.1 support for Gateway API
       --enable-gateway-api-app-protocol                            Enables Backend Protocol selection (GEP-1911) for Gateway API via appProtocol
       --enable-gateway-api-proxy-protocol                          Enable proxy protocol for all GatewayAPI listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.
@@ -68,6 +69,7 @@ cilium-operator-generic [flags]
       --gateway-api-hostnetwork-nodelabelselector string           Label selector that matches the nodes where the gateway listeners should be exposed. It's a list of comma-separated key-value label pairs. e.g. 'kubernetes.io/os=linux,kubernetes.io/hostname=kind-worker'
       --gateway-api-secrets-namespace string                       Namespace having tls secrets used by CEC for Gateway API (default "cilium-secrets")
       --gateway-api-service-externaltrafficpolicy string           Kubernetes LoadBalancer Service externalTrafficPolicy for all Gateway instances. (default "Cluster")
+      --gateway-api-use-remote-address                             Use the immediate client's IP address as the origin client's IP address (default true)
       --gateway-api-xff-num-trusted-hops uint32                    The number of additional GatewayAPI proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.
       --gops-port uint16                                           Port for gops server to listen on (default 9891)
   -h, --help                                                       help for cilium-operator-generic
@@ -91,8 +93,10 @@ cilium-operator-generic [flags]
       --ingress-lb-annotation-prefixes strings                     Annotations and labels which are needed to propagate from Ingress to the Load Balancer. (default [lbipam.cilium.io,service.beta.kubernetes.io,service.kubernetes.io,cloud.google.com])
       --ingress-secrets-namespace string                           Namespace having tls secrets used by Ingress and CEC. (default "cilium-secrets")
       --ingress-shared-lb-service-name string                      Name of shared LB service name for Ingress. (default "cilium-ingress")
+      --ingress-use-remote-address                                 Use the immediate client's IP address as the origin client's IP address (default true)
       --instance-tags-filter map                                   EC2 Instance tags in the form of k1=v1,k2=v2 (multiple k/v pairs can also be passed by repeating the CLI flag
       --ipam string                                                Backend to use for IPAM (default "cluster-pool")
+      --ipam-default-ip-pool string                                Name of the default IP Pool when using multi-pool (default "default")
       --k8s-api-server-urls strings                                Kubernetes API server URLs
       --k8s-client-connection-keep-alive duration                  Configures the keep alive duration of K8s client connections. K8 client is disabled if the value is set to 0 (default 30s)
       --k8s-client-connection-timeout duration                     Configures the timeout of K8s client connections. K8s client is disabled if the value is set to 0 (default 30s)
@@ -104,10 +108,10 @@ cilium-operator-generic [flags]
       --kvstore-lease-ttl duration                                 Time-to-live for the KVstore lease. (default 15m0s)
       --kvstore-max-consecutive-quorum-errors uint                 Max acceptable kvstore consecutive quorum errors before recreating the etcd connection (default 2)
       --kvstore-opt stringToString                                 Key-value store options e.g. etcd.address=127.0.0.1:4001 (default [])
-      --leader-election-lease-duration duration                    Duration that non-leader operator candidates will wait before forcing to acquire leadership (default 15s)
-      --leader-election-renew-deadline duration                    Duration that current acting master will retry refreshing leadership in before giving up the lock (default 10s)
-      --leader-election-resource-lock-timeout duration             Timeout for the HTTP requests to acquire/renew the leader election resource lock. When set to 0, defaults to max(1s, RenewDeadline/2)
-      --leader-election-retry-period duration                      Duration that LeaderElector clients should wait between retries of the actions (default 2s)
+      --leader-election-lease-duration duration                    Duration that non-leader candidates will wait to force acquire leadership (default 15s)
+      --leader-election-renew-deadline duration                    Duration that current acting master will retry refreshing leadership before giving up the lock (default 10s)
+      --leader-election-resource-lock-timeout duration             Timeout for HTTP requests to acquire/renew the leader election resource lock. When 0, defaults to max(1s, renew-deadline/2)
+      --leader-election-retry-period duration                      Duration the LeaderElector clients should wait between tries of actions (default 2s)
       --limit-ipam-api-burst int                                   Upper burst limit when accessing external APIs (default 20)
       --limit-ipam-api-qps float                                   Queries per second limit when accessing external IPAM APIs (default 4)
       --loadbalancer-l7 string                                     Enable L7 loadbalancer capabilities for services via L7 proxy. Applicable values: envoy
@@ -123,6 +127,7 @@ cilium-operator-generic [flags]
       --mesh-auth-spire-server-address string                      SPIRE server endpoint. (default "spire-server.spire.svc:8081")
       --mesh-auth-spire-server-connection-timeout duration         SPIRE server connection timeout. (default 10s)
       --metrics-sampling-interval duration                         Set the internal metrics sampling interval (default 5m0s)
+      --multi-pool-migration-workers int                           Number of workers to use for migrating nodes from cluster-pool IPAM to multi-pool IPAM (default 16)
       --nodes-gc-interval duration                                 GC interval for CiliumNodes (default 5m0s)
       --operator-api-serve-addr string                             Address to serve API requests (default "localhost:9234")
       --operator-k8s-client-burst int                              Burst value allowed for the K8s client (default 200)
@@ -140,20 +145,22 @@ cilium-operator-generic [flags]
       --parallel-alloc-workers int                                 Maximum number of parallel IPAM workers (default 50)
       --pod-restart-selector string                                cilium-operator will delete/restart any pods with these labels if the pod is not managed by Cilium. If this option is empty, then all pods may be restarted (default "k8s-app=kube-dns")
       --policy-default-local-cluster                               Control whether policy rules assume by default the local cluster if not explicitly selected (default true)
+      --policy-external-group-sync-interval duration               Period between refreshing the CIDRs for a given policy external group. (default 10m0s)
       --policy-secrets-namespace string                            Namespace where secrets used in TLS Interception will be synced to. (default "cilium-secrets")
+      --proxy-idle-timeout-seconds int                             Set Envoy upstream HTTP idle connection timeout in seconds. Does not apply to connections with pending requests. (default 60)
+      --proxy-stream-idle-timeout-seconds int                      Set Envoy HTTP stream idle timeout in seconds. A stream is considered idle when there is no upstream or downstream activity. (default 300)
       --remove-cilium-node-taints                                  Remove node taint "node.cilium.io/agent-not-ready" from Kubernetes nodes once Cilium is up and running (default true)
       --set-cilium-is-up-condition                                 Set CiliumIsUp Node condition to mark a Kubernetes Node that a Cilium pod is up and running in that node (default true)
       --set-cilium-node-taints                                     Set node taint "node.cilium.io/agent-not-ready" on Kubernetes nodes if Cilium is scheduled but not up and running
       --shell-sock-path string                                     Path to the shell UNIX socket (default "/var/run/cilium/shell.sock")
       --skip-crd-creation                                          When true, Kubernetes Custom Resource Definitions will not be created
-      --subnet-ids-filter strings                                  Subnets IDs (separated by commas)
-      --subnet-tags-filter map                                     Subnets tags in the form of k1=v1,k2=v2 (multiple k/v pairs can also be passed by repeating the CLI flag
       --synchronize-k8s-nodes                                      Perform GC of stale node entries from the KVStore (default true)
       --synchronize-k8s-services                                   Synchronize Kubernetes services to kvstore (default true)
       --taint-sync-workers int                                     Number of workers used to synchronize node taints and conditions (default 10)
       --unmanaged-pod-watcher-interval duration                    Interval to check for unmanaged kube-dns pods (0 to disable) (default 15s)
       --validate-network-policy                                    Whether to enable or disable the informational network policy validator (default true)
       --version                                                    Print version information
+      --ztunnel-ca-type string                                     CA backend used by ztunnel: 'spire' (external SPIRE server) or 'internal' (Cilium-managed CA) (default "internal")
 ```
 
 ### SEE ALSO

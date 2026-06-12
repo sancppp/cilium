@@ -195,7 +195,7 @@ func BenchmarkRegenerateCIDRDenyPolicyRules(b *testing.B) {
 		owner.previousMap = epPolicy.GetMapState()
 		epPolicy.Ready()
 	}
-	ip.detach(true, 0)
+	ip.Detach()
 	assert.Equal(b, 117515, owner.previousMap.Len())
 }
 
@@ -210,7 +210,7 @@ func TestRegenerateCIDRDenyPolicyRules(t *testing.T) {
 	epPolicy := ip.DistillPolicy(logger, owner, nil)
 	owner.previousMap = epPolicy.GetMapState()
 	epPolicy.Ready()
-	ip.detach(true, 0)
+	ip.Detach()
 	assert.Equal(t, 117515, owner.previousMap.Len())
 }
 
@@ -276,7 +276,7 @@ func TestL3WithIngressDenyWildcard(t *testing.T) {
 		PolicyOwner: DummyOwner{logger: hivetest.Logger(t)},
 	}
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestL3WithLocalHostWildcardd(t *testing.T) {
@@ -362,7 +362,7 @@ func TestL3WithLocalHostWildcardd(t *testing.T) {
 		PolicyOwner: DummyOwner{logger: logger},
 	}
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestMapStateWithIngressDenyWildcard(t *testing.T) {
@@ -459,7 +459,7 @@ func TestMapStateWithIngressDenyWildcard(t *testing.T) {
 	// compare policyMapState separately
 	require.Truef(t, policy.policyMapState.Equal(&expectedEndpointPolicy.policyMapState), policy.policyMapState.diff(&expectedEndpointPolicy.policyMapState))
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestMapStateWithIngressDeny(t *testing.T) {
@@ -613,12 +613,12 @@ func TestMapStateWithIngressDeny(t *testing.T) {
 
 	// Verify that cached selector is not found after Detach().
 	// Note that this depends on the other tests NOT using the same selector concurrently!
-	policy.SelectorPolicy.detach(true, 0)
+	policy.SelectorPolicy.Detach()
 	cachedSelectorTest = td.sc.findCachedIdentitySelector(api.NewESFromLabels(lblTest))
 	require.Nil(t, cachedSelectorTest)
 
 	// compare policyMapState separately
 	require.Truef(t, policy.policyMapState.Equal(&expectedEndpointPolicy.policyMapState), policy.policyMapState.diff(&expectedEndpointPolicy.policyMapState))
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }

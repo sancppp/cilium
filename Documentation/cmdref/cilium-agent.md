@@ -92,6 +92,7 @@ cilium-agent [flags]
       --controller-group-metrics strings                          List of controller group names for which to enable metrics. Accepts 'all' and 'none'. The set of controller group names available is not guaranteed to be stable between Cilium versions.
       --crd-wait-timeout duration                                 Cilium will exit if CRDs are not available within this duration upon startup (default 5m0s)
       --datapath-mode string                                      Datapath mode name (auto, veth, netkit, netkit-l2) (default "veth")
+      --datapath-plugins-state-dir string                         Parent directory for per-plugin subdirectories containing UNIX sockets for talking to a Cilium datapath plugin. (default "/var/run/cilium/plugins")
   -D, --debug                                                     Enable debugging mode
       --debug-verbose strings                                     List of enabled verbose debug groups
       --default-lb-service-ipam string                            Indicates the default LoadBalancer Service IPAM when no LoadBalancer class is set.Applicable values: lbipam, nodeipam, none (default "lbipam")
@@ -270,7 +271,6 @@ cilium-agent [flags]
       --hubble-metrics-server-tls-key-file string                 Path to the private key file for the Hubble metrics server. The file must contain PEM encoded data.
       --hubble-monitor-events strings                             Cilium monitor events for Hubble to observe: [drop debug capture trace policy-verdict trace-sock l7 agent]. By default, Hubble observes all monitor events.
       --hubble-network-policy-correlation-enabled                 Enable network policy correlation of Hubble flows (default true)
-      --hubble-prefer-ipv6                                        Prefer IPv6 addresses for announcing nodes when both address types are available.
       --hubble-redact-enabled                                     Hubble redact sensitive information from flows
       --hubble-redact-http-headers-allow strings                  HTTP headers to keep visible in flows
       --hubble-redact-http-headers-deny strings                   HTTP headers to redact from flows
@@ -392,11 +392,13 @@ cilium-agent [flags]
       --pprof-mutex-profile-fraction int                          Enable mutex contention profiling and set the fraction of sampled events (set to 1 to sample all events)
       --pprof-port uint16                                         Port that pprof listens on (default 6060)
       --preallocate-bpf-maps                                      Enable BPF map pre-allocation (default true)
+      --prefer-ipv6                                               Prefer IPv6 addresses over IPv4 when both are available
       --prepend-iptables-chains                                   Prepend custom iptables chains instead of appending (default true)
       --procfs string                                             Path to the host's proc filesystem mount (default "/proc")
       --prometheus-serve-addr string                              IP:Port on which to serve prometheus metrics (pass ":Port" to bind on all interfaces, "" is off)
       --proxy-admin-port int                                      Port to serve Envoy admin interface on.
       --proxy-cluster-max-connections uint32                      Maximum number of connections on Envoy clusters (default 1024)
+      --proxy-cluster-max-pending-requests uint32                 Maximum number of pending requests on Envoy clusters (default 1024)
       --proxy-cluster-max-requests uint32                         Maximum number of requests on Envoy clusters (default 1024)
       --proxy-connect-timeout uint                                Time after which a TCP connect attempt is considered failed unless completed (in seconds) (default 2)
       --proxy-gid uint                                            Group ID for proxy control plane sockets. (default 1337)
@@ -433,7 +435,6 @@ cilium-agent [flags]
       --tofqdns-idle-connection-grace-period duration             Time during which idle but previously active connections with expired DNS lookups are still considered alive (default 0s)
       --tofqdns-max-deferred-connection-deletes int               Maximum number of IPs to retain for expired DNS lookups with still-active connections (default 10000)
       --tofqdns-min-ttl int                                       The minimum time, in seconds, to use DNS data for toFQDNs policies
-      --tofqdns-pre-cache string                                  DNS cache data at this path is preloaded on agent startup
       --tofqdns-preallocate-identities                            Preallocate identities for ToFQDN selectors. This reduces proxied DNS response latency. Disable if you have many ToFQDN selectors. (default true)
       --tofqdns-proxy-port int                                    Global port on which the in-agent DNS proxy should listen. Default 0 is a OS-assigned port.
       --tofqdns-proxy-response-max-delay duration                 The maximum time the DNS proxy holds an allowed DNS response before sending it along. Responses are sent as soon as the datapath is updated with the new IP information. (default 100ms)

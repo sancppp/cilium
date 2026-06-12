@@ -20,17 +20,18 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/smithy-go"
 
+	"github.com/cilium/cilium/operator/pkg/ipam/nodemanager"
+	"github.com/cilium/cilium/operator/pkg/ipam/stats"
 	"github.com/cilium/cilium/pkg/aws/ec2"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/ip"
-	"github.com/cilium/cilium/pkg/ipam"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipam/option"
-	"github.com/cilium/cilium/pkg/ipam/stats"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	cslices "github.com/cilium/cilium/pkg/slices"
 )
 
 const (
@@ -44,7 +45,7 @@ const (
 type ipamNodeActions interface {
 	IsPrefixDelegationEnabled() bool
 	InstanceID() string
-	Ops() ipam.NodeOperations
+	Ops() nodemanager.NodeOperations
 	SetRunning(bool)
 	UpdatedResource(*v2.CiliumNode) bool
 }
@@ -75,7 +76,7 @@ type Node struct {
 }
 
 // NewNode returns a new Node
-func NewNode(node *ipam.Node, k8sObj *v2.CiliumNode, manager *InstancesManager) *Node {
+func NewNode(node *nodemanager.Node, k8sObj *v2.CiliumNode, manager *InstancesManager) *Node {
 	n := &Node{
 		rootLogger: manager.logger,
 		node:       node,
@@ -111,8 +112,8 @@ func (n *Node) PopulateStatusFields(k8sObj *v2.CiliumNode) {
 	k8sObj.Status.ENI.ENIs = map[string]eniTypes.ENI{}
 
 	n.manager.ForeachInstance(n.node.InstanceID(),
-		func(instanceID, interfaceID string, rev ipamTypes.InterfaceRevision) error {
-			e, ok := rev.Resource.(*eniTypes.ENI)
+		func(instanceID, interfaceID string, iface ipamTypes.Interface) error {
+			e, ok := iface.(*eniTypes.ENI)
 			if ok {
 				k8sObj.Status.ENI.ENIs[interfaceID] = *e.DeepCopy()
 			}
@@ -141,8 +142,12 @@ func (n *Node) getLimitsLocked() (ipamTypes.Limits, bool) {
 }
 
 // PrepareIPRelease prepares the release of ENI IPs.
-func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *ipam.ReleaseAction {
-	r := &ipam.ReleaseAction{}
+//
+// This function only covers 1.19 and below agents that use the CRD allocator.
+// 1.20+ agents use the multipool allocator and their IP release mechanism uses
+// PrepareCIDRRelease instead.
+func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *nodemanager.ReleaseAction {
+	r := &nodemanager.ReleaseAction{}
 
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
@@ -158,47 +163,41 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *ipam.Rel
 		if e.IsExcludedBySpec(n.k8sObj.Spec.ENI) {
 			continue
 		}
-		ipPrefixes := e.Prefixes
-		ipsOnENI := e.Addresses
+		prefixes := cslices.Map(e.Prefixes, func(p iputil.Prefix) netip.Prefix { return p.Prefix })
+		addrs := cslices.Map(e.Addresses, func(a iputil.Addr) netip.Addr { return a.Addr })
 		usedIPs := n.k8sObj.Status.IPAM.Used
 
 		matchedIPs := []string{}
 		// Returns the first ENI with either IPPrefixes/secondary IPs to release instead of
 		// looking for an ENI with max IPPrefixes/secondary IPs to release for faster and
 		// lower latency when early ENIs are eligible.
-		if len(ipPrefixes) > 0 {
+		if len(prefixes) > 0 {
 			scopedLog.Debug(
 				"Considering ENI for IPPrefix release",
 				fieldEniID, e.ID,
 				logfields.NeedIndex, *n.k8sObj.Spec.ENI.FirstInterfaceIndex,
 				logfields.Index, e.Number,
 				logfields.NumAddresses, len(e.Addresses),
-				logfields.LenPrefixes, len(ipPrefixes),
+				logfields.LenPrefixes, len(prefixes),
 				logfields.ExcessIPs, excessIPs,
 			)
 
 			unusedIPPrefixes := []string{}
 			if excessIPs >= option.ENIPDBlockSizeIPv4 {
 				// Identify unused IP prefixes to release
-				for _, prefix := range ipPrefixes {
-					prefixAddr, err := netip.ParsePrefix(prefix)
-					if err != nil {
-						continue
-					}
-
+				for _, prefix := range prefixes {
 					found := false
 					for ip := range usedIPs {
-						if prefixAddr.Contains(netip.MustParseAddr(ip)) {
+						if prefix.Contains(netip.MustParseAddr(ip)) {
 							found = true
 							break
 						}
 					}
 					if !found {
-						unusedIPPrefixes = append(unusedIPPrefixes, prefix)
-						for _, ipStr := range e.Addresses {
-							ip := netip.MustParseAddr(ipStr)
-							if prefixAddr.Contains(ip) {
-								matchedIPs = append(matchedIPs, ipStr)
+						unusedIPPrefixes = append(unusedIPPrefixes, prefix.String())
+						for _, addr := range addrs {
+							if prefix.Contains(addr) {
+								matchedIPs = append(matchedIPs, addr.String())
 							}
 						}
 						// Reduce excessIPs with option.ENIPDBlockSizeIPv4 number of IPs after adding a prefix
@@ -211,15 +210,15 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *ipam.Rel
 				}
 			}
 
-			secondaryIPs := getIndividualIPs(ipPrefixes, e.Addresses)
+			secondaryIPs := getIndividualIPs(prefixes, addrs)
 			if len(unusedIPPrefixes) > 0 || len(secondaryIPs) > 0 {
 				r.InterfaceID = eniId
 				r.PoolID = ipamTypes.PoolID(e.Subnet.ID)
 				r.IPPrefixesToRelease = unusedIPPrefixes
 				if len(secondaryIPs) > 0 {
-					secondaryIPs = getUnusedIPs(usedIPs, secondaryIPs, e.IP)
-					maxReleaseOnENI := min(excessIPs, len(secondaryIPs))
-					matchedIPs = append(matchedIPs, secondaryIPs[:maxReleaseOnENI]...)
+					unused := getUnusedIPs(usedIPs, cslices.Map(secondaryIPs, netip.Addr.String), e.IP.String())
+					maxReleaseOnENI := min(excessIPs, len(unused))
+					matchedIPs = append(matchedIPs, unused[:maxReleaseOnENI]...)
 				}
 				scopedLog.Debug(
 					"ENI has unused secondary IPs and/or IPPrefixes that can be released",
@@ -243,7 +242,7 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *ipam.Rel
 		)
 
 		// Count free IP addresses on this ENI
-		freeIpsOnENI := getUnusedIPs(usedIPs, ipsOnENI, e.IP)
+		freeIpsOnENI := getUnusedIPs(usedIPs, cslices.Map(addrs, netip.Addr.String), e.IP.String())
 		freeOnENICount := len(freeIpsOnENI)
 		if freeOnENICount <= 0 {
 			continue
@@ -268,8 +267,132 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *ipam.Rel
 	return r
 }
 
+// GetAttachedCIDRs returns the CIDRs (addresses as /32 or /128, and
+// prefixes) currently attached across all ENIs of this node.
+func (n *Node) GetAttachedCIDRs() []netip.Prefix {
+	n.mutex.RLock()
+	defer n.mutex.RUnlock()
+
+	var attached []netip.Prefix
+	for _, eni := range n.enis {
+		for _, prefix := range eni.Prefixes {
+			if prefix.IsValid() {
+				attached = append(attached, prefix.Prefix)
+			}
+		}
+		for _, addr := range eni.Addresses {
+			if addr.IsValid() {
+				attached = append(attached, netip.PrefixFrom(addr.Addr, addr.BitLen()))
+			}
+		}
+	}
+	return attached
+}
+
+// PrepareCIDRRelease maps released CIDRs back to their source ENIs
+// and returns release actions grouped by ENI interface ID.
+func (n *Node) PrepareCIDRRelease(releasedCIDRs []netip.Prefix) []*nodemanager.ReleaseAction {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	type eniRelease struct {
+		cidrs    []netip.Prefix
+		subnetID string
+	}
+	byENI := map[string]*eniRelease{}
+
+	for _, prefix := range releasedCIDRs {
+		for eniID, eni := range n.enis {
+			if eni.IsExcludedBySpec(n.k8sObj.Spec.ENI) {
+				continue
+			}
+
+			// Never release an ENI's primary IP. AWS rejects the
+			// UnassignPrivateIpAddresses call for primary IPs, which
+			// would leave the CIDR stuck in the release-marked map.
+			// Only reachable when UsePrimaryAddress is true, since
+			// otherwise the primary is filtered out of eni.Addresses
+			// at the EC2 layer.
+			if prefix.IsSingleIP() && prefix.Addr() == eni.IP.Addr {
+				break
+			}
+
+			var found bool
+			if prefix.IsSingleIP() {
+				found = slices.ContainsFunc(eni.Addresses, func(a iputil.Addr) bool { return a.Addr == prefix.Addr() })
+			} else {
+				found = slices.ContainsFunc(eni.Prefixes, func(p iputil.Prefix) bool { return p.Prefix == prefix })
+			}
+			if !found {
+				continue
+			}
+
+			rel, ok := byENI[eniID]
+			if !ok {
+				rel = &eniRelease{subnetID: eni.Subnet.ID}
+				byENI[eniID] = rel
+			}
+			rel.cidrs = append(rel.cidrs, prefix)
+			break // Found the ENI, move to next CIDR.
+		}
+	}
+
+	actions := make([]*nodemanager.ReleaseAction, 0, len(byENI))
+	for eniID, rel := range byENI {
+		actions = append(actions, &nodemanager.ReleaseAction{
+			InterfaceID:    eniID,
+			PoolID:         ipamTypes.PoolID(rel.subnetID),
+			CIDRsToRelease: rel.cidrs,
+		})
+	}
+	return actions
+}
+
+// ReleaseCIDRs releases the CIDRs in release.CIDRsToRelease from the ENI
+// identified by release.InterfaceID. Single-IP entries are unassigned via
+// UnassignPrivateIpAddresses; larger prefixes via UnassignENIPrefixes.
+//
+// Prefixes are released first, then single IPs. The returned slice contains
+// the CIDRs that were successfully released so the caller can prune its
+// tracking state even on partial failure.
+func (n *Node) ReleaseCIDRs(ctx context.Context, r *nodemanager.ReleaseAction) ([]netip.Prefix, error) {
+	var prefixes, ips []netip.Prefix
+	for _, c := range r.CIDRsToRelease {
+		if c.IsSingleIP() {
+			ips = append(ips, c)
+		} else {
+			prefixes = append(prefixes, c)
+		}
+	}
+
+	released := make([]netip.Prefix, 0, len(r.CIDRsToRelease))
+
+	if len(prefixes) > 0 {
+		strs := cslices.Map(prefixes, netip.Prefix.String)
+		if err := n.manager.ec2api.UnassignENIPrefixes(ctx, r.InterfaceID, strs); err != nil {
+			return released, err
+		}
+		released = append(released, prefixes...)
+	}
+
+	if len(ips) > 0 {
+		strs := cslices.Map(ips, func(p netip.Prefix) string { return p.Addr().String() })
+		if err := n.manager.ec2api.UnassignPrivateIpAddresses(ctx, r.InterfaceID, strs); err != nil {
+			return released, err
+		}
+		n.manager.RemoveIPsFromENI(n.node.InstanceID(), r.InterfaceID, strs)
+		released = append(released, ips...)
+	}
+
+	return released, nil
+}
+
 // ReleaseIPPrefixes performs the ENI IPPrefixes release operation
-func (n *Node) ReleaseIPPrefixes(ctx context.Context, r *ipam.ReleaseAction) error {
+//
+// This function only covers 1.19 and below agents that use the CRD allocator.
+// 1.20+ agents use the multipool allocator and their IP release mechanism uses
+// ReleaseCIDRs instead.
+func (n *Node) ReleaseIPPrefixes(ctx context.Context, r *nodemanager.ReleaseAction) error {
 	if err := n.manager.ec2api.UnassignENIPrefixes(ctx, r.InterfaceID, r.IPPrefixesToRelease); err != nil {
 		return err
 	}
@@ -290,32 +413,37 @@ func getUnusedIPs(usedIPs ipamTypes.AllocationMap, ipAddresses []string, primary
 }
 
 // Get Individual IPs that do not belong to any IPPrefix
-func getIndividualIPs(ipPrefixes, ipAddresses []string) (individualIPs []string) {
-	for _, ipStr := range ipAddresses {
+func getIndividualIPs(ipPrefixes []netip.Prefix, ipAddresses []netip.Addr) (individualIPs []netip.Addr) {
+	for _, ip := range ipAddresses {
 		matched := false
-		ip := netip.MustParseAddr(ipStr)
 		for _, prefix := range ipPrefixes {
-			prefixAddr, err := netip.ParsePrefix(prefix)
-			if err != nil {
-				continue
-			}
-			if prefixAddr.Contains(ip) {
+			if prefix.Contains(ip) {
 				matched = true
 				break
 			}
 		}
 		if !matched {
-			individualIPs = append(individualIPs, ipStr)
+			individualIPs = append(individualIPs, ip)
 		}
 	}
 	return individualIPs
 }
 
 // ReleaseIPs performs the ENI IP release operation
-func (n *Node) ReleaseIPs(ctx context.Context, r *ipam.ReleaseAction) error {
-	// Filter IPs that do not belong to any IPPrefix
+//
+// This function only covers 1.19 and below agents that use the CRD allocator.
+// 1.20+ agents use the multipool allocator and their IP release mechanism uses
+// ReleaseCIDRs instead.
+func (n *Node) ReleaseIPs(ctx context.Context, r *nodemanager.ReleaseAction) error {
+	// Filter IPs that do not belong to any IPPrefix.
+	//
+	// MustParse* is safe here: every writer of these fields derives the string
+	// from a netip.Addr/netip.Prefix (PrepareIPRelease above and the operator's
+	// nodemanager), so the round-trip is guaranteed to succeed.
 	if len(r.IPPrefixesToRelease) > 0 {
-		r.IPsToRelease = getIndividualIPs(r.IPPrefixesToRelease, r.IPsToRelease)
+		prefixes := cslices.Map(r.IPPrefixesToRelease, netip.MustParsePrefix)
+		addrs := cslices.Map(r.IPsToRelease, netip.MustParseAddr)
+		r.IPsToRelease = cslices.Map(getIndividualIPs(prefixes, addrs), netip.Addr.String)
 	}
 
 	if len(r.IPsToRelease) <= 0 {
@@ -332,13 +460,13 @@ func (n *Node) ReleaseIPs(ctx context.Context, r *ipam.ReleaseAction) error {
 
 // PrepareIPAllocation returns the number of ENI IPs and interfaces that can be
 // allocated/created.
-func (n *Node) PrepareIPAllocation(scopedLog *slog.Logger) (a *ipam.AllocationAction, err error) {
+func (n *Node) PrepareIPAllocation(scopedLog *slog.Logger) (a *nodemanager.AllocationAction, err error) {
 	limits, limitsAvailable := n.getLimits()
 	if !limitsAvailable {
 		return nil, errors.New(errUnableToDetermineLimits)
 	}
 
-	a = &ipam.AllocationAction{}
+	a = &nodemanager.AllocationAction{}
 
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
@@ -406,14 +534,14 @@ func isSubnetAtPrefixCapacity(err error) bool {
 }
 
 // AllocateIPs performs the ENI allocation operation
-func (n *Node) AllocateIPs(ctx context.Context, a *ipam.AllocationAction) error {
+func (n *Node) AllocateIPs(ctx context.Context, a *nodemanager.AllocationAction) error {
 	// Check if the interface to allocate on is prefix delegated
 	n.mutex.RLock()
 	isPrefixDelegated := n.node.Ops().IsPrefixDelegated()
 	n.mutex.RUnlock()
 
 	if isPrefixDelegated {
-		numPrefixes := ip.PrefixCeil(a.IPv4.AvailableForAllocation, option.ENIPDBlockSizeIPv4)
+		numPrefixes := iputil.PrefixCeil(a.IPv4.AvailableForAllocation, option.ENIPDBlockSizeIPv4)
 		err := n.manager.ec2api.AssignENIPrefixes(ctx, a.InterfaceID, int32(numPrefixes))
 		if !isSubnetAtPrefixCapacity(err) {
 			return err
@@ -437,7 +565,7 @@ func (n *Node) AllocateStaticIP(ctx context.Context, staticIPTags ipamTypes.Tags
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 	for _, eni := range n.enis {
-		if eni.PublicIP == "" {
+		if !eni.PublicIP.IsValid() {
 			return n.manager.ec2api.AssociateEIP(ctx, eni.ID, staticIPTags)
 		}
 	}
@@ -475,8 +603,8 @@ func (n *Node) getSecurityGroupIDs(ctx context.Context, eniSpec eniTypes.ENISpec
 	var securityGroups []string
 
 	n.manager.ForeachInstance(n.node.InstanceID(),
-		func(instanceID, interfaceID string, rev ipamTypes.InterfaceRevision) error {
-			e, ok := rev.Resource.(*eniTypes.ENI)
+		func(instanceID, interfaceID string, iface ipamTypes.Interface) error {
+			e, ok := iface.(*eniTypes.ENI)
 			if ok && e.Number == 0 {
 				securityGroups = make([]string, len(e.SecurityGroups))
 				copy(securityGroups, e.SecurityGroups)
@@ -558,7 +686,7 @@ const (
 // attaches it to the instance as specified by the CiliumNode. neededAddresses
 // of secondary IPs are assigned to the interface up to the maximum number of
 // addresses as allowed by the instance.
-func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationAction, scopedLog *slog.Logger) (int, string, error) {
+func (n *Node) CreateInterface(ctx context.Context, allocation *nodemanager.AllocationAction, scopedLog *slog.Logger) (int, string, error) {
 	limits, limitsAvailable := n.getLimits()
 	if !limitsAvailable {
 		return 0, unableToDetermineLimits, errors.New(errUnableToDetermineLimits)
@@ -642,7 +770,7 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 	scopedLog.Info("Created new ENI", fieldEniID, eniID)
 
 	if subnet.CIDR.IsValid() {
-		eni.Subnet.CIDR = subnet.CIDR.String()
+		eni.Subnet.CIDR = iputil.PrefixFrom(subnet.CIDR)
 	}
 
 	var attachmentID string
@@ -720,7 +848,7 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 	err error) {
 	limits, limitsAvailable := n.getLimits()
 	if !limitsAvailable {
-		return nil, stats, ipam.LimitsNotFound{}
+		return nil, stats, nodemanager.ErrLimitsNotFound
 	}
 
 	// n.node does not need to be protected by n.mutex as it is only written to
@@ -745,8 +873,8 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 	stats.NodeCapacity *= limits.Adapters
 
 	n.manager.ForeachInstance(instanceID,
-		func(instanceID, interfaceID string, rev ipamTypes.InterfaceRevision) error {
-			e, ok := rev.Resource.(*eniTypes.ENI)
+		func(instanceID, interfaceID string, iface ipamTypes.Interface) error {
+			e, ok := iface.(*eniTypes.ENI)
 			if !ok {
 				return nil
 			}
@@ -770,13 +898,13 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 				stats.RemainingAvailableInterfaceCount++
 			}
 
-			for _, ip := range e.Addresses {
-				available[ip] = ipamTypes.AllocationIP{Resource: e.ID}
+			for _, addr := range e.Addresses {
+				available[addr.String()] = ipamTypes.AllocationIP{Resource: e.ID}
 			}
 
 			// If the primary ENI has a public IP, we store it
-			if e.Number == 0 && e.PublicIP != "" {
-				stats.AssignedStaticIP = e.PublicIP
+			if e.Number == 0 && e.PublicIP.IsValid() {
+				stats.AssignedStaticIP = e.PublicIP.String()
 			}
 
 			return nil
@@ -936,7 +1064,7 @@ func (n *Node) IsPrefixDelegated() bool {
 		}
 		if len(eni.Prefixes) == 0 && len(eni.Addresses) > 0 {
 			// Ignore primary IP of the ENI
-			if len(eni.Addresses) == 1 && eni.Addresses[0] == eni.IP {
+			if len(eni.Addresses) == 1 && eni.Addresses[0].Addr == eni.IP.Addr {
 				continue
 			}
 			return false

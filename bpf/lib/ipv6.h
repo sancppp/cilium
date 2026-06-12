@@ -74,7 +74,7 @@ static __always_inline int ipv6_authlen(const struct ipv6_opt_hdr *opthdr)
 	return (opthdr->hdrlen + 2) << 2;
 }
 
-static __always_inline int ipv6_skip_exthdr(struct __ctx_buff *ctx, __u8 *nexthdr, int off)
+static __always_inline int ipv6_skip_exthdr(const struct __ctx_buff *ctx, __u8 *nexthdr, int off)
 {
 	struct ipv6_opt_hdr opthdr __align_stack_8;
 	__u8 nh = *nexthdr;
@@ -116,7 +116,7 @@ static __always_inline int ipv6_skip_exthdr(struct __ctx_buff *ctx, __u8 *nexthd
 	}
 }
 
-static __always_inline int ipv6_hdrlen_offset(struct __ctx_buff *ctx, int l3_off,
+static __always_inline int ipv6_hdrlen_offset(const struct __ctx_buff *ctx, int l3_off,
 					      __u8 *nexthdr, fraginfo_t *fraginfo)
 {
 	int i, len = sizeof(struct ipv6hdr);
@@ -161,37 +161,18 @@ static __always_inline int ipv6_hdrlen_offset(struct __ctx_buff *ctx, int l3_off
 	return DROP_INVALID_EXTHDR;
 }
 
-static __always_inline int ipv6_hdrlen_with_fraginfo(struct __ctx_buff *ctx,
-						     __u8 *nexthdr,
-						     fraginfo_t *fraginfo)
+__noinline __weak
+int ipv6_hdrlen_with_fraginfo(const struct __ctx_buff *ctx, __u8 *nexthdr, fraginfo_t *fraginfo)
 {
+	if (!nexthdr)
+		return DROP_INVALID;
+
 	return ipv6_hdrlen_offset(ctx, ETH_HLEN, nexthdr, fraginfo);
 }
 
-static __always_inline int ipv6_hdrlen(struct __ctx_buff *ctx, __u8 *nexthdr)
+static __always_inline int ipv6_hdrlen(const struct __ctx_buff *ctx, __u8 *nexthdr)
 {
 	return ipv6_hdrlen_offset(ctx, ETH_HLEN, nexthdr, NULL);
-}
-
-static __always_inline void ipv6_addr_copy(union v6addr *dst,
-					   const union v6addr *src)
-{
-	memcpy(dst, src, sizeof(*dst));
-}
-
-static __always_inline void ipv6_addr_copy_unaligned(union v6addr *dst,
-						     const union v6addr *src)
-{
-	dst->d1 = src->d1;
-	dst->d2 = src->d2;
-}
-
-static __always_inline bool ipv6_addr_equals(const union v6addr *a,
-					     const union v6addr *b)
-{
-	if (a->d1 != b->d1)
-		return false;
-	return a->d2 == b->d2;
 }
 
 static __always_inline
@@ -269,7 +250,7 @@ static __always_inline int ipv6_dec_hoplimit(struct __ctx_buff *ctx, int off)
 	return 0;
 }
 
-static __always_inline int ipv6_load_saddr(struct __ctx_buff *ctx, int off,
+static __always_inline int ipv6_load_saddr(const struct __ctx_buff *ctx, int off,
 					   union v6addr *dst)
 {
 	return ctx_load_bytes(ctx, off + offsetof(struct ipv6hdr, saddr), dst->addr,
@@ -283,7 +264,7 @@ static __always_inline int ipv6_store_saddr(struct __ctx_buff *ctx, const __u8 *
 	return ctx_store_bytes(ctx, off + offsetof(struct ipv6hdr, saddr), addr, 16, 0);
 }
 
-static __always_inline int ipv6_load_daddr(struct __ctx_buff *ctx, int off,
+static __always_inline int ipv6_load_daddr(const struct __ctx_buff *ctx, int off,
 					   union v6addr *dst)
 {
 	return ctx_load_bytes(ctx, off + offsetof(struct ipv6hdr, daddr), dst->addr,
@@ -297,7 +278,7 @@ ipv6_store_daddr(struct __ctx_buff *ctx, const __u8 *addr, int off)
 	return ctx_store_bytes(ctx, off + offsetof(struct ipv6hdr, daddr), addr, 16, 0);
 }
 
-static __always_inline int ipv6_load_nexthdr(struct __ctx_buff *ctx, int off,
+static __always_inline int ipv6_load_nexthdr(const struct __ctx_buff *ctx, int off,
 					     __u8 *nexthdr)
 {
 	return ctx_load_bytes(ctx, off + offsetof(struct ipv6hdr, nexthdr), nexthdr,
@@ -312,7 +293,7 @@ static __always_inline int ipv6_store_nexthdr(struct __ctx_buff *ctx, __u8 *next
 			      sizeof(__u8), 0);
 }
 
-static __always_inline int ipv6_load_paylen(struct __ctx_buff *ctx, int off,
+static __always_inline int ipv6_load_paylen(const struct __ctx_buff *ctx, int off,
 					    __be16 *len)
 {
 	return ctx_load_bytes(ctx, off + offsetof(struct ipv6hdr, payload_len),
@@ -352,7 +333,7 @@ static __always_inline int ipv6_addr_is_mapped(const union v6addr *addr)
 
 /* As opposed to ipfrag_encode_ipv6, this function can return errors. */
 static __always_inline fraginfo_t
-ipv6_get_fraginfo(struct __ctx_buff *ctx, const struct ipv6hdr *ip6)
+ipv6_get_fraginfo(const struct __ctx_buff *ctx, const struct ipv6hdr *ip6)
 {
 	int l3_off = (int)((void *)ip6 - ctx_data(ctx));
 	int i, len = sizeof(struct ipv6hdr);
@@ -407,7 +388,7 @@ ipv6_frag_get_l4ports(const struct ipv6_frag_id *frag_id,
 }
 
 static __always_inline int
-ipv6_handle_fragmentation(struct __ctx_buff *ctx,
+ipv6_handle_fragmentation(const struct __ctx_buff *ctx,
 			  const struct ipv6hdr *ip6,
 			  fraginfo_t fraginfo,
 			  int l4_off,
@@ -452,7 +433,7 @@ out:
 }
 
 static __always_inline int
-ipv6_load_l4_ports(struct __ctx_buff *ctx, struct ipv6hdr *ip6 __maybe_unused,
+ipv6_load_l4_ports(const struct __ctx_buff *ctx, const struct ipv6hdr *ip6 __maybe_unused,
 		   fraginfo_t fraginfo, int l4_off, enum ct_dir dir __maybe_unused,
 		   __be16 *ports)
 {

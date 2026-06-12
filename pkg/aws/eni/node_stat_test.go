@@ -4,16 +4,18 @@
 package eni
 
 import (
+	"net/netip"
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cilium/cilium/operator/pkg/ipam/nodemanager"
 	"github.com/cilium/cilium/pkg/aws/ec2/mock"
 	"github.com/cilium/cilium/pkg/aws/eni/limits"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
-	"github.com/cilium/cilium/pkg/ipam"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 )
@@ -28,9 +30,7 @@ func TestENIIPAMCapacityAccounting(t *testing.T) {
 		},
 	)
 	im := ipamTypes.NewInstanceMap()
-	im.Update(instanceID, ipamTypes.InterfaceRevision{
-		Resource: &eniTypes.ENI{},
-	})
+	im.Update(instanceID, &eniTypes.ENI{})
 
 	ipamNode := &mockIPAMNode{
 		instanceID: "i-000",
@@ -91,13 +91,11 @@ func TestENIIPAMCapacityAccounting(t *testing.T) {
 	ipamNode.prefixDelegation = false
 	n.enis["eni-a"] = eniTypes.ENI{
 		ID:       "eni-a",
-		Prefixes: []string{"10.0.0.1/28"},
+		Prefixes: []iputil.Prefix{iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.1/28"))},
 	}
-	n.manager.instances.Update("i-000", ipamTypes.InterfaceRevision{
-		Resource: &eniTypes.ENI{
-			ID:       "eni-a",
-			Prefixes: []string{"10.0.0.1/28"},
-		},
+	n.manager.instances.Update("i-000", &eniTypes.ENI{
+		ID:       "eni-a",
+		Prefixes: []iputil.Prefix{iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.1/28"))},
 	})
 
 	// Finally, we have the case where an eni has a leftover prefix available.
@@ -113,14 +111,14 @@ type mockIPAMNode struct {
 	prefixDelegation bool
 }
 
-func (m *mockIPAMNode) SetOpts(ipam.NodeOperations)           {}
-func (m *mockIPAMNode) SetPoolMaintainer(ipam.PoolMaintainer) {}
-func (m *mockIPAMNode) UpdatedResource(*v2.CiliumNode) bool   { panic("not impl") }
-func (m *mockIPAMNode) Update(*v2.CiliumNode)                 {}
-func (m *mockIPAMNode) InstanceID() string                    { return m.instanceID }
-func (m *mockIPAMNode) IsPrefixDelegationEnabled() bool       { return m.prefixDelegation }
-func (m *mockIPAMNode) Ops() ipam.NodeOperations              { panic("not impl") }
-func (m *mockIPAMNode) SetRunning(_ bool)                     { panic("not impl") }
+func (m *mockIPAMNode) SetOpts(nodemanager.NodeOperations)           {}
+func (m *mockIPAMNode) SetPoolMaintainer(nodemanager.PoolMaintainer) {}
+func (m *mockIPAMNode) UpdatedResource(*v2.CiliumNode) bool          { panic("not impl") }
+func (m *mockIPAMNode) Update(*v2.CiliumNode)                        {}
+func (m *mockIPAMNode) InstanceID() string                           { return m.instanceID }
+func (m *mockIPAMNode) IsPrefixDelegationEnabled() bool              { return m.prefixDelegation }
+func (m *mockIPAMNode) Ops() nodemanager.NodeOperations              { panic("not impl") }
+func (m *mockIPAMNode) SetRunning(_ bool)                            { panic("not impl") }
 
 var _ ipamNodeActions = (*mockIPAMNode)(nil)
 

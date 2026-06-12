@@ -52,6 +52,7 @@ type Parameters struct {
 	AssumeCiliumVersion       string
 	CiliumNamespace           string
 	TestNamespace             string
+	SharedTestNamespace       string
 	TestNamespaceIndex        int
 	TestConcurrency           int
 	SingleNode                bool
@@ -127,11 +128,12 @@ type Parameters struct {
 	ExpectedDropReasons []string
 	ExpectedXFRMErrors  []string
 
-	CodeOwners           []string
-	LogCodeOwners        bool
-	ExcludeCodeOwners    []string
-	LogCheckLevels       []string
-	LogCheckOnlyTestTime bool
+	CodeOwners              []string
+	LogCodeOwners           bool
+	ExcludeCodeOwners       []string
+	LogCheckLevels          []string
+	LogCheckExtraExceptions []string
+	LogCheckOnlyTestTime    bool
 
 	FlushCT               bool
 	SecondaryNetworkIface string

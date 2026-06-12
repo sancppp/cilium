@@ -18,6 +18,7 @@ import (
 	envoy_config_endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoy_config_listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	envoy_config_healthcheck "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/health_check/v3"
 	envoy_config_http "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
@@ -66,8 +67,14 @@ type CECResourceParser struct {
 	defaultMaxConcurrentRetries uint32
 	defaultMaxConnections       uint32
 	defaultMaxRequests          uint32
+	defaultMaxPendingRequests   uint32
 	httpLingerConfig            int
 	accessLogPath               string
+
+	// enableBPFTProxy indicates whether BPF TProxy is enabled. When set,
+	// SO_REUSEPORT is disabled on (non-internal) listeners as it is not
+	// compatible with BPF TPROXY.
+	enableBPFTProxy bool
 }
 
 type parserParams struct {
@@ -80,8 +87,9 @@ type parserParams struct {
 	DB            *statedb.DB
 	Nodes         statedb.Table[*node.LocalNode]
 
-	CecConfig   CECConfig
-	EnvoyConfig envoyCfg.ProxyConfig
+	DaemonConfig *option.DaemonConfig
+	CecConfig    CECConfig
+	EnvoyConfig  envoyCfg.ProxyConfig
 }
 
 func newCECResourceParser(params parserParams) *CECResourceParser {
@@ -91,7 +99,9 @@ func newCECResourceParser(params parserParams) *CECResourceParser {
 		defaultMaxConcurrentRetries: params.EnvoyConfig.ProxyMaxConcurrentRetries,
 		defaultMaxConnections:       params.EnvoyConfig.ProxyClusterMaxConnections,
 		defaultMaxRequests:          params.EnvoyConfig.ProxyClusterMaxRequests,
+		defaultMaxPendingRequests:   params.EnvoyConfig.ProxyClusterMaxPendingRequests,
 		httpLingerConfig:            params.EnvoyConfig.EnvoyHTTPUpstreamLingerTimeout,
+		enableBPFTProxy:             params.DaemonConfig.EnableBPFTProxy,
 	}
 	if params.EnvoyConfig.EnvoyAccessLogEnabled {
 		parser.accessLogPath = envoy.GetAccessLogSocketPath()
@@ -174,10 +184,12 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 				return envoy.Resources{}, fmt.Errorf("unspecified Listener name")
 			}
 
-			if option.Config.EnableBPFTProxy {
+			if r.enableBPFTProxy && listener.GetInternalListener() == nil {
 				// Envoy since 1.20.0 uses SO_REUSEPORT on listeners by default.
 				// BPF TPROXY is currently not compatible with SO_REUSEPORT, so
 				// disable it.  Note that this may degrade Envoy performance.
+				// Skip internal listeners as they don't bind to sockets and
+				// don't support the EnableReusePort field (validation would fail).
 				listener.EnableReusePort = &wrapperspb.BoolValue{Value: false}
 			}
 
@@ -342,7 +354,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 
 			fillInTransportSocketXDS(cecNamespace, cecName, cluster.TransportSocket)
 
-			fillInCircuitBreakers(cluster, r.defaultMaxConcurrentRetries, r.defaultMaxConnections, r.defaultMaxRequests)
+			fillInCircuitBreakers(cluster, r.defaultMaxConcurrentRetries, r.defaultMaxConnections, r.defaultMaxRequests, r.defaultMaxPendingRequests)
 
 			// Fill in EDS config source if unset
 			if enum := cluster.GetType(); enum == envoy_config_cluster.Cluster_EDS {
@@ -813,6 +825,28 @@ func qualifyHttpFilters(cecNamespace string, cecName string, hcmConfig *envoy_co
 					httpFilterConfig.ClusterMinHealthyPercentages = clusters
 					h.TypedConfig = toAny(httpFilterConfig)
 				}
+			case *extauthzv3.ExtAuthz:
+				var nameUpdated bool
+				switch svc := httpFilterConfig.Services.(type) {
+				case *extauthzv3.ExtAuthz_GrpcService:
+					if eg := svc.GrpcService.GetEnvoyGrpc(); eg != nil {
+						eg.ClusterName, nameUpdated = api.ResourceQualifiedName(cecNamespace, cecName, eg.ClusterName)
+						if nameUpdated {
+							updated = true
+							h.TypedConfig = toAny(httpFilterConfig)
+						}
+					}
+				case *extauthzv3.ExtAuthz_HttpService:
+					if uri := svc.HttpService.GetServerUri(); uri != nil {
+						if cluster, ok := uri.HttpUpstreamType.(*envoy_config_core.HttpUri_Cluster); ok {
+							cluster.Cluster, nameUpdated = api.ResourceQualifiedName(cecNamespace, cecName, cluster.Cluster)
+							if nameUpdated {
+								updated = true
+								h.TypedConfig = toAny(httpFilterConfig)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -965,13 +999,14 @@ func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_con
 	}
 }
 
-func fillInCircuitBreakers(cluster *envoy_config_cluster.Cluster, defaultConcurrentRetries uint32, defaultMaxConnections uint32, defaultRequests uint32) {
+func fillInCircuitBreakers(cluster *envoy_config_cluster.Cluster, defaultConcurrentRetries, defaultMaxConnections, defaultRequests, defaultPendingRequests uint32) {
 	if cluster.CircuitBreakers == nil {
 		cluster.CircuitBreakers = &envoy_config_cluster.CircuitBreakers{
 			Thresholds: []*envoy_config_cluster.CircuitBreakers_Thresholds{{
-				MaxRetries:     &wrapperspb.UInt32Value{Value: defaultConcurrentRetries},
-				MaxConnections: &wrapperspb.UInt32Value{Value: defaultMaxConnections},
-				MaxRequests:    &wrapperspb.UInt32Value{Value: defaultRequests},
+				MaxRetries:         &wrapperspb.UInt32Value{Value: defaultConcurrentRetries},
+				MaxConnections:     &wrapperspb.UInt32Value{Value: defaultMaxConnections},
+				MaxRequests:        &wrapperspb.UInt32Value{Value: defaultRequests},
+				MaxPendingRequests: &wrapperspb.UInt32Value{Value: defaultPendingRequests},
 			}},
 		}
 	}

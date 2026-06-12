@@ -202,7 +202,6 @@ Hive also by default provides the following globally available objects:
 - :ref:`api_lifecycle`: Methods for registering Start and Stop functions that are executed when Hive is started and stopped. 
   The hooks are appended to it in dependency order (since the constructors are invoked in dependency order).
 - :ref:`api_shutdowner`: Allows gracefully shutting down the hive from anywhere in case of a fatal error post-start.
-- ``logrus.FieldLogger``: Interface to the logger. Module() decorates it with ``subsys=<module id>``.
 
 .. _api_provide:
 
@@ -700,7 +699,6 @@ been registered with cobra:
       Ⓜ️ infra (Infrastructure):
         Ⓜ️ k8s-client (Kubernetes Client):
              ⚙️ (client.Config) {
-                 K8sAPIServer: (string) "",
                  K8sKubeConfigPath: (string) "",
                  K8sClientQPS: (float32) 0,
                  K8sClientBurst: (int) 0,
@@ -958,7 +956,7 @@ To find existing tests to use as reference you can grep for usage of scripttest.
 
 Here's a few scripts that are worth calling out:
 
-- ``daemon/k8s/testdata/pod.txtar``: Tests populating ``Table[LocalPod]`` from K8s objects defined in YAML. Good reference for the ``k8s/*`` and ``db/*`` commands.
+- ``pkg/k8s/tables/testdata/pod.txtar``: Tests populating ``Table[LocalPod]`` from K8s objects defined in YAML. Good reference for the ``k8s/*`` and ``db/*`` commands.
 - ``pkg/ciliumenvoyconfig/testdata``: Complex component integration tests that go from K8s objects down to BPF maps.
 - ``pkg/datapath/linux/testdata/device-detection.txtar``: Low-level test that manipulates network devices in a new network namespace
 
@@ -1086,7 +1084,7 @@ Kubernetes Resource and Store
 .. note::
 
    The ``Resource[T]`` pattern is being phased out in the Cilium Agent and new code should use StateDB.
-   See `daemon/k8s/tables.go <https://github.com/cilium/cilium/blob/main/daemon/k8s/tables.go>`_,
+   See `pkg/k8s/tables/tables.go <https://github.com/cilium/cilium/blob/main/pkg/k8s/tables/tables.go>`_,
    `pkg/k8s/statedb.go <https://github.com/cilium/cilium/blob/main/pkg/k8s/statedb.go>`_
    and `PR 34060 <https://github.com/cilium/cilium/pull/34060>`_.
 

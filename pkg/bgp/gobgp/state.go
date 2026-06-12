@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net/netip"
 
-	gobgp "github.com/osrg/gobgp/v3/api"
+	gobgp "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bgp/types"
@@ -55,6 +57,10 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context, req *types.GetPeerStateR
 
 		state := types.PeerState{}
 
+		if peer.Transport != nil {
+			state.Port = int64(peer.Transport.RemotePort)
+		}
+
 		if peer.Conf != nil {
 			if peer.Conf.Description != "" {
 				pd := peerDescription{}
@@ -69,15 +75,24 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context, req *types.GetPeerStateR
 			// the invalid case.
 			addr, _ := netip.ParseAddr(peer.Conf.NeighborAddress)
 			state.Address = addr
+			state.LocalAsn = int64(peer.Conf.LocalAsn)
+			state.PeerAsn = int64(peer.Conf.PeerAsn)
+			state.TCPPasswordEnabled = peer.Conf.AuthPassword != ""
 		}
 
 		if peer.State != nil {
+			if peer.Conf.PeerAsn == 0 { // if peerAsn is not set, use peer state peerAsn
+				state.PeerAsn = int64(peer.State.PeerAsn)
+			}
+
 			state.SessionState = toAgentSessionState(peer.State.SessionState)
+			state.LocalCapabilities = toAgentCap(peer.State.LocalCap)
+			state.RemoteCapabilities = toAgentCap(peer.State.RemoteCap)
 
 			// Uptime is time since session got established. It is
 			// calculated by difference in time from uptime
 			// timestamp till now.
-			if peer.State.SessionState == gobgp.PeerState_ESTABLISHED && peer.Timers != nil && peer.Timers.State != nil {
+			if peer.State.SessionState == gobgp.PeerState_SESSION_STATE_ESTABLISHED && peer.Timers != nil && peer.Timers.State != nil {
 				state.Uptime = time.Since(peer.Timers.State.Uptime.AsTime())
 			}
 		}
@@ -87,6 +102,36 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context, req *types.GetPeerStateR
 				continue
 			}
 			state.Families = append(state.Families, toAgentAfiSafiState(afiSafi.State))
+		}
+
+		if peer.EbgpMultihop != nil && peer.EbgpMultihop.Enabled {
+			state.EbgpMultihopTTL = int64(peer.EbgpMultihop.MultihopTtl)
+		} else {
+			state.EbgpMultihopTTL = int64(v2.DefaultBGPEBGPMultihopTTL) // defaults to 1 if not enabled
+		}
+
+		if peer.Timers != nil {
+			tConfig := peer.Timers.Config
+			tState := peer.Timers.State
+			if tConfig != nil {
+				state.Timers.ConnectRetryTime = time.Duration(tConfig.ConnectRetry) * time.Second
+				state.Timers.ConfiguredHoldTime = time.Duration(tConfig.HoldTime) * time.Second
+				state.Timers.ConfiguredKeepAliveTime = time.Duration(tConfig.KeepaliveInterval) * time.Second
+			}
+			if tState != nil {
+				if tState.NegotiatedHoldTime != 0 {
+					state.Timers.AppliedHoldTime = time.Duration(tState.NegotiatedHoldTime) * time.Second
+				}
+				if tState.KeepaliveInterval != 0 {
+					state.Timers.AppliedKeepAliveTime = time.Duration(tState.KeepaliveInterval) * time.Second
+				}
+			}
+		}
+
+		state.GracefulRestart = types.BgpGracefulRestart{}
+		if peer.GracefulRestart != nil {
+			state.GracefulRestart.Enabled = peer.GracefulRestart.Enabled
+			state.GracefulRestart.RestartTime = time.Duration(peer.GracefulRestart.RestartTime) * time.Second
 		}
 
 		res.Peers = append(res.Peers, state)
@@ -150,12 +195,12 @@ func (g *GoBGPServer) GetPeerStateLegacy(ctx context.Context) (types.GetPeerStat
 			}
 
 			peerState.SessionState = toAgentSessionState(peer.State.SessionState).String()
-			peerState.LocalCapabilities = toAgentCap(peer.State.LocalCap)
-			peerState.RemoteCapabilities = toAgentCap(peer.State.RemoteCap)
+			peerState.LocalCapabilities = toAgentCapLegacy(peer.State.LocalCap)
+			peerState.RemoteCapabilities = toAgentCapLegacy(peer.State.RemoteCap)
 
 			// Uptime is time since session got established.
 			// It is calculated by difference in time from uptime timestamp till now.
-			if peer.State.SessionState == gobgp.PeerState_ESTABLISHED && peer.Timers != nil && peer.Timers.State != nil {
+			if peer.State.SessionState == gobgp.PeerState_SESSION_STATE_ESTABLISHED && peer.Timers != nil && peer.Timers.State != nil {
 				peerState.UptimeNanoseconds = int64(time.Since(peer.Timers.State.Uptime.AsTime()))
 			}
 		}
@@ -233,15 +278,15 @@ func (g *GoBGPServer) GetRoutes(ctx context.Context, r *types.GetRoutesRequest) 
 	errs := []error{}
 	var routes []*types.Route
 
-	fn := func(destination *gobgp.Destination) {
-		paths, err := ToAgentPaths(destination.Paths)
+	fn := func(prefix bgp.NLRI, paths []*apiutil.Path) {
+		agentPaths, err := ToAgentPaths(paths)
 		if err != nil {
 			errs = append(errs, err)
 			return
 		}
 		routes = append(routes, &types.Route{
-			Prefix: destination.Prefix,
-			Paths:  paths,
+			Prefix: prefix.String(),
+			Paths:  agentPaths,
 		})
 	}
 
@@ -250,23 +295,20 @@ func (g *GoBGPServer) GetRoutes(ctx context.Context, r *types.GetRoutesRequest) 
 		return nil, fmt.Errorf("invalid table type: %w", err)
 	}
 
-	family := &gobgp.Family{
-		Afi:  gobgp.Family_Afi(r.Family.Afi),
-		Safi: gobgp.Family_Safi(r.Family.Safi),
-	}
+	family := bgp.NewFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
 
 	var neighbor string
 	if r.Neighbor.IsValid() {
 		neighbor = r.Neighbor.String()
 	}
 
-	req := &gobgp.ListPathRequest{
+	req := apiutil.ListPathRequest{
 		TableType: tt,
 		Family:    family,
 		Name:      neighbor,
 	}
 
-	if err := g.server.ListPath(ctx, req, fn); err != nil {
+	if err := g.server.ListPath(req, fn); err != nil {
 		return nil, err
 	}
 
@@ -279,13 +321,13 @@ func (g *GoBGPServer) GetRoutes(ctx context.Context, r *types.GetRoutesRequest) 
 func (g *GoBGPServer) GetRoutePolicies(ctx context.Context) (*types.GetRoutePoliciesResponse, error) {
 	// list defined sets into a map for later use
 	definedSets := make(map[string]*gobgp.DefinedSet)
-	err := g.server.ListDefinedSet(ctx, &gobgp.ListDefinedSetRequest{DefinedType: gobgp.DefinedType_NEIGHBOR}, func(ds *gobgp.DefinedSet) {
+	err := g.server.ListDefinedSet(ctx, &gobgp.ListDefinedSetRequest{DefinedType: gobgp.DefinedType_DEFINED_TYPE_NEIGHBOR}, func(ds *gobgp.DefinedSet) {
 		definedSets[ds.Name] = ds
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed listing neighbor defined sets: %w", err)
 	}
-	err = g.server.ListDefinedSet(ctx, &gobgp.ListDefinedSetRequest{DefinedType: gobgp.DefinedType_PREFIX}, func(ds *gobgp.DefinedSet) {
+	err = g.server.ListDefinedSet(ctx, &gobgp.ListDefinedSetRequest{DefinedType: gobgp.DefinedType_DEFINED_TYPE_PREFIX}, func(ds *gobgp.DefinedSet) {
 		definedSets[ds.Name] = ds
 	})
 	if err != nil {

@@ -29,6 +29,7 @@ func Endpoint(ep endpoint.Config, lnc *Config) any {
 	}
 
 	cfg.InterfaceIfIndex = uint32(ep.GetIfIndex())
+	cfg.DeviceMTU = uint16(lnc.DeviceMTU)
 
 	cfg.EndpointID = uint16(ep.GetID())
 	cfg.EndpointNetNSCookie = ep.GetEndpointNetNsCookie()
@@ -62,7 +63,7 @@ func Endpoint(ep endpoint.Config, lnc *Config) any {
 	cfg.TunnelProtocol = lnc.TunnelProtocol
 	cfg.TunnelPort = lnc.TunnelPort
 
-	cfg.FIBTableID = ep.GetFibTableID()
+	cfg.RtInfo, _ = ep.GetRTInfo()
 
 	cfg.EnableIPv4Fragments = option.Config.EnableIPv4FragmentsTracking
 	cfg.EnableIPv6Fragments = option.Config.EnableIPv6FragmentsTracking

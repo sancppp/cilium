@@ -21,9 +21,9 @@ import (
 	"github.com/cilium/cilium/pkg/controller"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
-	"github.com/cilium/cilium/pkg/identity"
 	identityPkg "github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/labels"
@@ -33,16 +33,19 @@ import (
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/revert"
 	"github.com/cilium/cilium/pkg/time"
-	"github.com/cilium/cilium/pkg/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 var (
 	endpointRegenerationRecoveryControllerGroup = controller.NewGroup("endpoint-regeneration-recovery")
 	syncAddressIdentityMappingControllerGroup   = controller.NewGroup("sync-address-identity-mapping")
+
+	errPolicyComputationStaleRevision = errors.New("policy computation result has stale revision")
+	errPolicyComputationNotFound      = errors.New("policy computation result not found in statedb")
 )
 
 // PreviousMapState returns an empty policy.MapState with preallocated map sizes from the current one.
@@ -50,18 +53,10 @@ func (e *Endpoint) PreviousMapState() *policy.MapState {
 	return e.desiredPolicy.GetMapState()
 }
 
-// GetNamedPort returns the port for the given name.
-func (e *Endpoint) GetNamedPort(ingress bool, name string, proto u8proto.U8proto, idents iter.Seq[identity.NumericIdentity]) uint16 {
-	if ingress {
-		// Ingress only needs the ports of the POD itself
-		return e.getNamedPortIngress(e.GetK8sPorts(), name, proto)
-	}
-	// egress needs named ports of the destination pods
-	return e.getNamedPortEgress(e.namedPortsGetter.GetNamedPorts(), name, proto, idents)
-}
-
-func (e *Endpoint) getNamedPortIngress(npMap types.NamedPortMap, name string, proto u8proto.U8proto) uint16 {
-	port, err := npMap.GetNamedPort(name, proto)
+// GetIngressNamedPort returns one port for the given name.
+func (e *Endpoint) GetIngressNamedPort(name string, proto u8proto.U8proto) uint16 {
+	// Ingress only needs the ports of the POD itself
+	port, err := e.GetK8sPorts().GetNamedPort(name, proto)
 	if err != nil && e.logLimiter.Allow() {
 		e.getLogger().Warn(
 			"Skipping named port",
@@ -74,53 +69,50 @@ func (e *Endpoint) getNamedPortIngress(npMap types.NamedPortMap, name string, pr
 	return port
 }
 
-func (e *Endpoint) getNamedPortEgress(npMap types.NamedPortMultiMap, name string, proto u8proto.U8proto, idents iter.Seq[identity.NumericIdentity]) uint16 {
-	port, err := npMap.GetNamedPort(name, proto, idents)
-	// Skip logging for ErrUnknownNamedPort on egress, as the destination POD with the port name
-	// is likely not scheduled yet.
-	if err != nil && !errors.Is(err, types.ErrUnknownNamedPort) && e.logLimiter.Allow() {
-		e.getLogger().Warn(
-			"Skipping named port",
-			logfields.Error, err,
-			logfields.PortName, name,
-			logfields.Protocol, proto,
-			logfields.TrafficDirection, "egress",
-		)
-	}
-	return port
-}
-
-// proxyID returns a unique string to identify a proxy mapping,
-// and the resolved destination port number, if any.
-// For port ranges the proxy is identified by the first port in
-// the range, as overlapping proxy port ranges are not supported.
-// Must be called with e.mutex held.
-func (e *Endpoint) proxyID(l4 *policy.L4Filter, listener string, scSnapshot policy.SelectorSnapshot) (string, uint16, u8proto.U8proto) {
+// proxyIDs returns unique strings to identify proxy mappings, and the resolved
+// destination port numbers, if any. For port ranges the proxy is identified by
+// the first port in the range, as overlapping proxy port ranges are not
+// supported. Must be called with e.mutex held.
+func (e *Endpoint) proxyIDs(selectorPolicy policy.SelectorPolicy, l4 *policy.L4Filter, listener string, scSnapshot policy.SelectorSnapshot) iter.Seq2[string, uint16] {
 	port := l4.Port
-	protocol := l4.U8Proto
-	// Calculate protocol if it is 0 (default) and
-	// is not "ANY" (that is, it was not calculated).
-	if protocol == 0 && !l4.Protocol.IsAny() {
-		proto, _ := u8proto.ParseProtocol(string(l4.Protocol))
-		protocol = proto
-	}
-	if port == 0 && l4.PortName != "" {
-		port = e.GetNamedPort(l4.Ingress, l4.PortName, protocol, l4.Identities(scSnapshot))
-		if port == 0 {
-			return "", 0, 0
+
+	if port == 0 {
+		if l4.PortName == "" {
+			return func(yield func(string, uint16) bool) {
+				yield(policy.ProxyID(e.ID, l4.Ingress, string(l4.Protocol), port, listener), port)
+			}
+		}
+		if l4.Ingress {
+			port = e.GetIngressNamedPort(l4.PortName, l4.U8Proto)
+			if port == 0 {
+				return func(func(string, uint16) bool) {}
+			}
+		} else {
+			// Egress named port with different ports for different identities.
+			return func(yield func(string, uint16) bool) {
+				for _, port := range selectorPolicy.GetEgressNamedPorts(l4.PortName, l4.U8Proto, l4.Identities(scSnapshot)) {
+					if !yield(policy.ProxyID(e.ID, false, string(l4.Protocol), port, listener), port) {
+						return
+					}
+				}
+			}
 		}
 	}
 
-	return policy.ProxyID(e.ID, l4.Ingress, string(l4.Protocol), port, listener), port, protocol
+	return func(yield func(string, uint16) bool) {
+		yield(policy.ProxyID(e.ID, l4.Ingress, string(l4.Protocol), port, listener), port)
+	}
 }
 
-// setNextPolicyRevision updates the desired policy revision field
+// setDesiredPolicyRevision updates the desired policy revision field
 // Must be called with the endpoint lock held for at least reading
-func (e *Endpoint) setNextPolicyRevision(revision uint64) {
-	e.nextPolicyRevision = revision
-	e.UpdateLogger(map[string]any{
-		logfields.DesiredPolicyRevision: e.nextPolicyRevision,
-	})
+func (e *Endpoint) setDesiredPolicyRevision(revision uint64) {
+	e.desiredPolicyRevision = revision
+	if e.Options != nil && e.Options.IsEnabled(option.Debug) {
+		e.UpdateLogger(map[string]any{
+			logfields.DesiredPolicyRevision: e.desiredPolicyRevision,
+		})
+	}
 }
 
 type policyGenerateResult struct {
@@ -197,7 +189,6 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 	}
 
 	// Copy out some values we care about, then unlock
-	forcePolicyCompute := e.forcePolicyCompute
 	securityIdentity := e.SecurityIdentity
 
 	// We are computing policy; set this to false.
@@ -221,31 +212,34 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 	}
 	e.unlock()
 
-	e.getLogger().Debug("Starting policy recalculation...")
-	skipPolicyRevision := e.nextPolicyRevision
-	if forcePolicyCompute || e.desiredPolicy == nil {
-		e.getLogger().Debug("Forced policy recalculation")
-		skipPolicyRevision = 0
-	}
-
-	var selectorPolicy policy.SelectorPolicy
-	selectorPolicy, result.policyRevision, err = e.policyRepo.GetSelectorPolicy(securityIdentity, skipPolicyRevision, stats, e.GetID())
+	e.getLogger().Debug("Fetching policy recalculation",
+		logfields.Identity, securityIdentity.ID,
+		logfields.PolicyRevision, datapathRegenCtxt.policyRevisionToWaitFor,
+	)
+	var (
+		pcr            *compute.Result
+		selectorPolicy policy.SelectorPolicy
+	)
+	stats.waitForPolicyCompute.Start()
+	pcr, err = e.waitForPolicyComputationResult(datapathRegenCtxt, securityIdentity)
+	stats.waitForPolicyCompute.End(err == nil)
 	if err != nil {
-		e.getLogger().Warn("Failed to calculate SelectorPolicy", logfields.Error, err)
-		return err
+		return newRegenerationError(regenerationFailureReasonPolicyRegenerationError,
+			fmt.Errorf("failed waiting for policy computation result: %w", err))
+	} else if pcr != nil {
+		selectorPolicy = pcr.NewPolicy
+		result.policyRevision = pcr.Revision
+		err = pcr.Err
 	}
-
-	// selectorPolicy is nil if skipRevision was matched.
-	if selectorPolicy == nil {
-		e.getLogger().Debug(
-			"Skipping unnecessary endpoint policy recalculation",
-			logfields.PolicyRevisionNext, e.nextPolicyRevision,
-			logfields.PolicyRevisionRepo, result.policyRevision,
-			logfields.PolicyChanged, e.nextPolicyRevision > e.policyRevision,
-		)
-		datapathRegenCtxt.policyResult = result
-		return nil
+	// Release the hold taken in waitForPolicyComputationResult. On success
+	// DistillPolicy registers the endpoint as a user before this runs, so the
+	// policy stays attached.
+	defer selectorPolicy.ReleaseHold()
+	if err != nil {
+		return newRegenerationError(regenerationFailureReasonPolicyRegenerationError,
+			fmt.Errorf("failed fetching policy computation result: %w", err))
 	}
+	datapathRegenCtxt.policyResult = result
 
 	// Add new redirects before Consume() so that all required proxy ports are available for it.
 	var desiredRedirects map[string]uint16
@@ -254,7 +248,7 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 		return err
 	}
 	// Ingress endpoint needs no redirects
-	if !e.isProperty(PropertySkipBPFPolicy) {
+	if !e.isProperty(endpointtypes.PropertySkipBPFPolicy) {
 		stats.proxyConfiguration.Start()
 		desiredRedirects, stats.missingProxyRedirectsCount, rf = e.addNewRedirects(selectorPolicy, datapathRegenCtxt.proxyWaitGroup)
 		stats.proxyConfiguration.End(true)
@@ -281,8 +275,64 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 	result.endpointPolicy = selectorPolicy.DistillPolicy(e.getLogger(), e, desiredRedirects)
 	stats.endpointPolicyCalculation.End(true)
 
-	datapathRegenCtxt.policyResult = result
 	return nil
+}
+
+func (e *Endpoint) waitForPolicyComputationResult(
+	datapathRegenCtxt *datapathRegenerationContext,
+	securityIdentity *identityPkg.Identity,
+) (*compute.Result, error) {
+	wantedRevision := datapathRegenCtxt.policyRevisionToWaitFor
+
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+
+	for {
+		computeResult, _, watch, found := e.policyFetcher.GetIdentityPolicyByIdentity(securityIdentity)
+		if found && computeResult.Revision >= wantedRevision {
+			if computeResult.NewPolicy.AddHold() {
+				e.getLogger().Debug(
+					"Retrieved identity policy from statedb",
+					logfields.PolicyRevision, computeResult.Revision,
+				)
+				return &computeResult, nil
+			}
+			// Policy was detached by a concurrent Supersede. Fall through
+			// to wait for the replacement.
+			e.getLogger().Debug(
+				"Policy was detached, waiting for replacement",
+				logfields.Identity, securityIdentity.ID,
+				logfields.PolicyRevision, computeResult.Revision,
+			)
+		} else if found {
+			e.getLogger().Debug(
+				"Policy computation result has stale revision, waiting for update",
+				logfields.Identity, securityIdentity.ID,
+				logfields.PolicyRevision, computeResult.Revision,
+				logfields.PolicyRevisionNext, wantedRevision,
+			)
+		} else {
+			e.getLogger().Debug(
+				"Policy computation result not found in statedb, waiting",
+				logfields.Identity, securityIdentity.ID,
+				logfields.PolicyRevisionNext, wantedRevision,
+			)
+		}
+
+		// Watch fires on insert/update of this identity's statedb entry.
+		select {
+		case <-watch:
+			continue
+		case <-timeout.C:
+			if found {
+				return nil, fmt.Errorf("%w: got rev=%d, want rev=%d",
+					errPolicyComputationStaleRevision,
+					computeResult.Revision,
+					wantedRevision)
+			}
+			return nil, errPolicyComputationNotFound
+		}
+	}
 }
 
 // setDesiredPolicy updates the endpoint with the results of a policy calculation.
@@ -332,10 +382,10 @@ func (e *Endpoint) setDesiredPolicy(datapathRegenCtxt *datapathRegenerationConte
 		return fmt.Errorf("endpoint %d SecurityIdentity revision changed during policy regeneration", e.ID)
 	}
 
-	oldNextPolicyRevision := e.nextPolicyRevision
+	oldDesiredPolicyRevision := e.desiredPolicyRevision
 	// Set the revision of this endpoint to the current revision of the policy
 	// repository.
-	e.setNextPolicyRevision(res.policyRevision)
+	e.setDesiredPolicyRevision(res.policyRevision)
 
 	if res.endpointPolicy != nil && res.endpointPolicy != e.desiredPolicy {
 		if e.desiredPolicy != e.realizedPolicy {
@@ -356,12 +406,13 @@ func (e *Endpoint) setDesiredPolicy(datapathRegenCtxt *datapathRegenerationConte
 		datapathRegenCtxt.revertStack.Push(func() error {
 			// Do nothing if e.policyMap was not initialized already
 			if e.policyMap != nil && e.desiredPolicy != e.realizedPolicy {
-				// Revert nextPolicyRevision; otherwise,
+				desiredPolicyMapLen := e.desiredPolicy.Len()
+				// Revert desiredPolicyRevision; otherwise,
 				// res.endpointPolicy will not be recalculated
 				// on the next regeneration attempt, and we
 				// won't advance to the true desired policy map
 				// state. See GH-38998.
-				e.setNextPolicyRevision(oldNextPolicyRevision)
+				e.setDesiredPolicyRevision(oldDesiredPolicyRevision)
 				e.desiredPolicy.Detach(e.getLogger())
 				e.desiredPolicy = e.realizedPolicy
 
@@ -374,6 +425,10 @@ func (e *Endpoint) setDesiredPolicy(datapathRegenCtxt *datapathRegenerationConte
 				if err != nil {
 					e.getLogger().Error("failed to sync PolicyMap when reverting to last known good policy", logfields.Error, err)
 				}
+
+				// The pressure was set when we performed the sync above;
+				// override it to the "real" value.
+				e.updatePolicyMapPressureMetric(desiredPolicyMapLen)
 			}
 			return nil
 		})
@@ -452,6 +507,8 @@ func (e *Endpoint) regenerate(ctx *regenerationContext) (retErr error) {
 	}
 	// reset to the default lowest level
 	e.skippedRegenerationLevel = regeneration.Invalid
+
+	e.consumeSkippedPolicyRevision(ctx.datapathRegenerationContext)
 
 	e.unlock()
 
@@ -569,7 +626,7 @@ func (e *Endpoint) updateRealizedState(stats *regenerationStatistics, origDir st
 
 	// Start periodic background full reconciliation of the policy map.
 	// Does nothing if it has already been started.
-	if !e.isProperty(PropertyFakeEndpoint) {
+	if !e.isProperty(endpointtypes.PropertyFakeEndpoint) {
 		e.startSyncPolicyMapController()
 	}
 
@@ -701,11 +758,24 @@ func (e *Endpoint) setRegenerateStateLocked(regenMetadata *regeneration.External
 		} else {
 			e.logStatusLocked(Other, OK, fmt.Sprintf("Skipped duplicate endpoint regeneration trigger due to %s", regenMetadata.GetRegenerationReason()))
 		}
+		// Keep the queued regen from completing at an older revision.
+		if regenMetadata.PolicyRevisionToWaitFor > e.skippedPolicyRevision {
+			e.skippedPolicyRevision = regenMetadata.PolicyRevisionToWaitFor
+		}
 		regen = false
 	default:
 		regen = e.setState(StateWaitingToRegenerate, fmt.Sprintf("Triggering endpoint regeneration due to %s", regenMetadata.GetRegenerationReason()))
 	}
 	return regen
+}
+
+// consumeSkippedPolicyRevision transfers any buffered revision to ctx.
+// Must be called with e.mutex held.
+func (e *Endpoint) consumeSkippedPolicyRevision(ctx *datapathRegenerationContext) {
+	if e.skippedPolicyRevision > ctx.policyRevisionToWaitFor {
+		ctx.policyRevisionToWaitFor = e.skippedPolicyRevision
+	}
+	e.skippedPolicyRevision = 0
 }
 
 // UpdatePolicy updates the endpoint's policy.
@@ -733,35 +803,30 @@ func (e *Endpoint) UpdatePolicy(idsToRegen *set.Set[identityPkg.NumericIdentity]
 		return
 	}
 
-	// If this endpoint's security ID has a policy update, we must regenerate. Otherwise,
-	// bump the policy revision directly (as long as we didn't miss an update somehow).
+	// If this endpoint's security ID has a policy update, we must regenerate.
+	// Otherwise, bump the policy revision directly.
 	if !idsToRegen.Has(secID) {
-		if e.policyRevision < fromRev {
-			// FIXME: https://github.com/cilium/cilium/issues/36493
-			// Currently policy repository version can be bumped through multiple triggers
-			// async to each other. This can lead to out of order processing of regeneration
-			// events. Continue with endpoint regeneration to be safe but log as Info.
-			e.getLogger().Info(
-				"Endpoint missed a policy revision; triggering regeneration",
-				logfields.PolicyRevision, fromRev,
-			)
-		} else {
-			e.getLogger().Debug(
-				"Policy update is a no-op, bumping policyRevision",
-				logfields.PolicyRevision, toRev,
-			)
-			e.setPolicyRevision(toRev)
-
+		if e.policyRevision == 0 {
+			// We are deferring to the upcoming regen since the endpoint is new.
 			unlock()
 			return
 		}
+		e.getLogger().Debug(
+			"Policy update is a no-op, bumping policyRevision",
+			logfields.PolicyRevision, toRev,
+		)
+		e.setPolicyRevision(toRev)
+
+		unlock()
+		return
 	}
 
 	// Policy change affected this endpoint's identity; queue regeneration
 	regenMetadata := &regeneration.ExternalRegenerationMetadata{
-		Reason:            regeneration.ReasonPolicyUpdate,
-		Message:           "policy rules updated",
-		RegenerationLevel: regeneration.RegenerateWithoutDatapath,
+		Reason:                  regeneration.ReasonPolicyUpdate,
+		Message:                 "policy rules updated",
+		RegenerationLevel:       regeneration.RegenerateWithoutDatapath,
+		PolicyRevisionToWaitFor: toRev,
 	}
 	regen := e.setRegenerateStateLocked(regenMetadata)
 	unlock()
@@ -972,7 +1037,7 @@ func (e *Endpoint) ComputeInitialPolicy(regenContext *regenerationContext) (erro
 
 		stats.proxyPolicyCalculation.Start()
 		// Initial NetworkPolicy is not reverted
-		err, _ = e.proxy.UpdateNetworkPolicy(e, e.desiredPolicy, nil)
+		err, _, finalize := e.proxy.UpdateNetworkPolicy(e, e.desiredPolicy, nil)
 		stats.proxyPolicyCalculation.End(err == nil)
 		if err != nil {
 			e.getLogger().Warn(
@@ -981,6 +1046,9 @@ func (e *Endpoint) ComputeInitialPolicy(regenContext *regenerationContext) (erro
 			)
 			// Do not error out so that the policy regeneration is tried again.
 			return nil, release
+		}
+		if finalize != nil {
+			finalize()
 		}
 	}
 
@@ -1158,7 +1226,7 @@ func (e *Endpoint) runIPIdentitySync(endpointIP netip.Addr) {
 func (e *Endpoint) SetIdentity(identity *identityPkg.Identity) (identityToRelease *identityPkg.Identity) {
 	oldIdentity := "no identity"
 	if e.SecurityIdentity != nil {
-		oldIdentity = e.SecurityIdentity.StringID()
+		oldIdentity = e.SecurityIdentity.String()
 	}
 
 	// Current security identity for endpoint is its old identity - delete its
@@ -1191,16 +1259,16 @@ func (e *Endpoint) SetIdentity(identity *identityPkg.Identity) (identityToReleas
 		e.runIPIdentitySync(e.IPv6)
 	}
 
-	if oldIdentity != identity.StringID() {
+	if oldIdentity != identity.String() {
 		e.getLogger().Info(
 			"Identity of endpoint changed",
-			logfields.IdentityNew, identity.StringID(),
+			logfields.IdentityNew, identity,
 			logfields.IdentityOld, oldIdentity,
 			logfields.IdentityLabels, map[string]labels.Label(identity.Labels),
 		)
 	}
 	e.UpdateLogger(map[string]any{
-		logfields.Identity: identity.StringID(),
+		logfields.Identity: identity.String(),
 	})
 	return identityToRelease
 }

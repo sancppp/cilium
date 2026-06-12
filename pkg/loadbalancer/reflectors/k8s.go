@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	daemonK8s "github.com/cilium/cilium/daemon/k8s"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container"
 	"github.com/cilium/cilium/pkg/k8s"
@@ -31,6 +30,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_discoveryv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	k8sUtils "github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -45,13 +45,6 @@ import (
 const (
 	// reflectorBufferSize is the maximum size of the event buffer.
 	reflectorBufferSize = 500
-
-	// reflectorWaitTime is the maximum amount of time to try and fill the buffer.
-	// A higher wait time will reduce processing of transient states and increases
-	// throughput as it gives bigger batches downstream for processing. Batching
-	// also helps to combine related objects, e.g. a Service may have multiple
-	// associated EndpointSlices and preferably these would be processed together.
-	reflectorWaitTime = 500 * time.Millisecond
 
 	// K8sInitializerPrefix is the StateDB initializer prefix used here. This can
 	// be used to wait for the tables to be populated just from k8s even when
@@ -79,7 +72,7 @@ type reflectorParams struct {
 	JobGroup               job.Group
 	Clientset              client.Clientset
 	EventStream            stream.Observable[event]
-	Pods                   statedb.Table[daemonK8s.LocalPod]
+	Pods                   statedb.Table[k8sTables.LocalPod]
 	Writer                 *writer.Writer
 	Config                 loadbalancer.Config
 	ExtConfig              loadbalancer.ExternalConfig
@@ -101,7 +94,7 @@ func (p reflectorParams) waitTime() time.Duration {
 		// Use a much lower wait time in tests to trigger more edge cases and make them faster.
 		return 10 * time.Millisecond
 	}
-	return reflectorWaitTime
+	return p.Config.ReflectorWaitTime
 }
 
 func RegisterK8sReflector(p reflectorParams) {
@@ -142,7 +135,7 @@ func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams,
 
 	rh := newReflectorHealth(health, p.Log)
 
-	processBuffer := func(txn writer.WriteTxn, buf iter.Seq2[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]]) {
+	processBuffer := func(txn writer.WriteTxn, buf iter.Seq2[types.NamespacedName, statedb.Change[k8sTables.LocalPod]]) {
 		for _, change := range buf {
 			obj := change.Object.Pod
 			if obj.Spec.HostNetwork {
@@ -195,9 +188,9 @@ func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams,
 			reflectorBufferSize,
 			p.waitTime(),
 
-			func(buf *container.InsertOrderedMap[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]], change statedb.Change[daemonK8s.LocalPod]) *container.InsertOrderedMap[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]] {
+			func(buf *container.InsertOrderedMap[types.NamespacedName, statedb.Change[k8sTables.LocalPod]], change statedb.Change[k8sTables.LocalPod]) *container.InsertOrderedMap[types.NamespacedName, statedb.Change[k8sTables.LocalPod]] {
 				if buf == nil {
-					buf = container.NewInsertOrderedMap[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]]()
+					buf = container.NewInsertOrderedMap[types.NamespacedName, statedb.Change[k8sTables.LocalPod]]()
 				}
 				pod := change.Object
 				buf.Insert(types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, change)
@@ -884,8 +877,15 @@ type replaceEndpointsEvent struct {
 
 func (replaceEndpointsEvent) isEvent() {}
 
-func endpointsEvents(log *slog.Logger, c client.Clientset) stream.Observable[event] {
-	lw := k8sUtils.ListerWatcherFromTyped(c.Slim().DiscoveryV1().EndpointSlices(""))
+func endpointsEvents(log *slog.Logger, c client.Clientset, cfg k8s.ConfigParams) (stream.Observable[event], error) {
+	optsModifier, err := utils.GetEndpointSliceListOptionsModifier(cfg.Config.K8sServiceProxyName, cfg.WatchConfig.EnableHeadlessServiceWatch)
+	if err != nil {
+		return nil, err
+	}
+	lw := k8sUtils.ListerWatcherWithModifiers(
+		k8sUtils.ListerWatcherFromTyped(c.Slim().DiscoveryV1().EndpointSlices("")),
+		optsModifier,
+	)
 	return stream.Map(
 		k8s.ListerWatcherToObservable(lw),
 		func(ev k8s.CacheStoreEvent) event {
@@ -909,7 +909,7 @@ func endpointsEvents(log *slog.Logger, c client.Clientset) stream.Observable[eve
 			default:
 				panic(fmt.Sprintf("unexpected k8s.CacheStoreEventKind: %#v", ev.Kind))
 			}
-		})
+		}), nil
 }
 
 func serviceEvents(cs client.Clientset, cfg k8s.ConfigParams) (stream.Observable[event], error) {
@@ -953,9 +953,13 @@ func newEventStream(log *slog.Logger, cs client.Clientset, cfg k8s.ConfigParams)
 	if err != nil {
 		return nil, err
 	}
+	epsEvents, err := endpointsEvents(log, cs, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return joinObservables(
 		svcEvents,
-		endpointsEvents(log, cs),
+		epsEvents,
 	), nil
 }
 

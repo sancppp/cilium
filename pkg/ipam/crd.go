@@ -10,18 +10,21 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"sync"
 
 	"github.com/vishvananda/netlink"
+	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 
-	alibabaCloud "github.com/cilium/cilium/pkg/alibabacloud/utils"
+	alibabaCloudTypes "github.com/cilium/cilium/pkg/alibabacloud/types"
+	azureTypes "github.com/cilium/cilium/pkg/azure/types"
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/ip"
@@ -235,36 +238,31 @@ func deriveVpcCIDRs(node *ciliumv2.CiliumNode) (primaryCIDR *cidr.CIDR, secondar
 	// A node belongs to a single VPC so we can pick the first ENI
 	// in the list and derive the VPC CIDR from it.
 	for _, eni := range node.Status.ENI.ENIs {
-		c, err := cidr.ParseCIDR(eni.VPC.PrimaryCIDR)
-		if err == nil {
-			primaryCIDR = c
+		if p := eni.VPC.PrimaryCIDR; p.IsValid() {
+			primaryCIDR = cidr.NewCIDR(netipx.PrefixIPNet(p.Masked()))
 			for _, sc := range eni.VPC.CIDRs {
-				c, err = cidr.ParseCIDR(sc)
-				if err == nil {
-					secondaryCIDRs = append(secondaryCIDRs, c)
+				if sc.IsValid() {
+					secondaryCIDRs = append(secondaryCIDRs, cidr.NewCIDR(netipx.PrefixIPNet(sc.Masked())))
 				}
 			}
 			return
 		}
 	}
 	for _, azif := range node.Status.Azure.Interfaces {
-		c, err := cidr.ParseCIDR(azif.CIDR)
-		if err == nil {
-			primaryCIDR = c
+		if p := azureInterfaceCIDR(azif); p.IsValid() {
+			primaryCIDR = cidr.NewCIDR(netipx.PrefixIPNet(p.Masked()))
 			return
 		}
 	}
 	// return AlibabaCloud vpc CIDR
 	if len(node.Status.AlibabaCloud.ENIs) > 0 {
-		c, err := cidr.ParseCIDR(node.Spec.AlibabaCloud.CIDRBlock)
-		if err == nil {
-			primaryCIDR = c
+		if p := node.Spec.AlibabaCloud.CIDRBlock; p.IsValid() {
+			primaryCIDR = cidr.NewCIDR(netipx.PrefixIPNet(p.Masked()))
 		}
 		for _, eni := range node.Status.AlibabaCloud.ENIs {
 			for _, sc := range eni.VPC.SecondaryCIDRs {
-				c, err = cidr.ParseCIDR(sc)
-				if err == nil {
-					secondaryCIDRs = append(secondaryCIDRs, c)
+				if sc.IsValid() {
+					secondaryCIDRs = append(secondaryCIDRs, cidr.NewCIDR(netipx.PrefixIPNet(sc.Masked())))
 				}
 			}
 			return
@@ -347,7 +345,7 @@ func (n *nodeStore) hasMinimumIPsInPool(localNodeStore *node.LocalNodeStore) (mi
 			minimumReached = true
 		}
 
-		if n.conf.IPAMMode() == ipamOption.IPAMENI || n.conf.IPAMMode() == ipamOption.IPAMAzure || n.conf.IPAMMode() == ipamOption.IPAMAlibabaCloud {
+		if n.conf.IPAMMode() == ipamOption.IPAMAzure || n.conf.IPAMMode() == ipamOption.IPAMAlibabaCloud {
 			if !n.autoDetectIPv4NativeRoutingCIDR(localNodeStore) {
 				minimumReached = false
 			}
@@ -437,8 +435,8 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 		// Retrieve the appropriate allocator
 		var allocator *crdAllocator
 		var ipFamily Family
-		if ipAddr := net.ParseIP(ip); ipAddr != nil {
-			ipFamily = DeriveFamily(ipAddr)
+		if parsedAddr, err := netip.ParseAddr(ip); err == nil {
+			ipFamily = DeriveFamily(parsedAddr)
 		}
 		if ipFamily == "" {
 			continue
@@ -480,14 +478,6 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 func (n *nodeStore) setOwnNodeWithoutPoolUpdate(node *ciliumv2.CiliumNode) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-
-	// Do not update to an inconsistent state (see updateLocalNodeResource)
-	if n.conf.IPAMMode() == ipamOption.IPAMENI {
-		if err := validateENIConfig(node); err != nil {
-			n.logger.Info("ENI state is not consistent yet", logfields.Error, err)
-			return
-		}
-	}
 
 	n.ownNode = node
 }
@@ -541,7 +531,7 @@ func (n *nodeStore) addAllocator(allocator *crdAllocator) {
 }
 
 // allocate checks if a particular IP can be allocated or return an error
-func (n *nodeStore) allocate(ip net.IP) (*ipamTypes.AllocationIP, error) {
+func (n *nodeStore) allocate(addr netip.Addr) (*ipamTypes.AllocationIP, error) {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
@@ -553,13 +543,13 @@ func (n *nodeStore) allocate(ip net.IP) (*ipamTypes.AllocationIP, error) {
 		return nil, fmt.Errorf("No IPs available")
 	}
 
-	if n.isIPInReleaseHandshake(ip.String()) {
+	if n.isIPInReleaseHandshake(addr.String()) {
 		return nil, fmt.Errorf("IP not available, marked or ready for release")
 	}
 
-	ipInfo, ok := n.ownNode.Spec.IPAM.Pool[ip.String()]
+	ipInfo, ok := n.ownNode.Spec.IPAM.Pool[addr.String()]
 	if !ok {
-		return nil, NewIPNotAvailableInPoolError(ip)
+		return nil, NewIPNotAvailableInPoolError(addr)
 	}
 
 	return &ipInfo, nil
@@ -579,31 +569,31 @@ func (n *nodeStore) isIPInReleaseHandshake(ip string) bool {
 }
 
 // allocateNext allocates the next available IP or returns an error
-func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Family, owner string) (net.IP, *ipamTypes.AllocationIP, error) {
+func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Family, owner string) (netip.Addr, *ipamTypes.AllocationIP, error) {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
 	if n.ownNode == nil {
-		return nil, nil, fmt.Errorf("CiliumNode for own node is not available")
+		return netip.Addr{}, nil, fmt.Errorf("CiliumNode for own node is not available")
 	}
 
 	// Check if IP has a custom owner (only supported in manual CRD mode)
 	if n.conf.IPAMMode() == ipamOption.IPAMCRD && len(owner) != 0 {
 		for ip, ipInfo := range n.ownNode.Spec.IPAM.Pool {
 			if ipInfo.Owner == owner {
-				parsedIP := net.ParseIP(ip)
-				if parsedIP == nil {
+				parsedAddr, err := netip.ParseAddr(ip)
+				if err != nil {
 					n.logger.Warn(
 						"Unable to parse IP in CiliumNode custom resource",
 						fieldName, n.ownNode.Name,
 						logfields.IPAddr, ip,
 					)
-					return nil, nil, fmt.Errorf("invalid custom ip %s for %s. ", ip, owner)
+					return netip.Addr{}, nil, fmt.Errorf("invalid custom ip %s for %s. ", ip, owner)
 				}
-				if DeriveFamily(parsedIP) != family {
+				if DeriveFamily(parsedAddr) != family {
 					continue
 				}
-				return parsedIP, &ipInfo, nil
+				return parsedAddr, &ipInfo, nil
 			}
 		}
 	}
@@ -619,8 +609,8 @@ func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Famil
 			if ipInfo.Owner != "" {
 				continue // IP is used by another
 			}
-			parsedIP := net.ParseIP(ip)
-			if parsedIP == nil {
+			parsedAddr, err := netip.ParseAddr(ip)
+			if err != nil {
 				n.logger.Warn(
 					"Unable to parse IP in CiliumNode custom resource",
 					fieldName, n.ownNode.Name,
@@ -629,11 +619,11 @@ func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Famil
 				continue
 			}
 
-			if DeriveFamily(parsedIP) != family {
+			if DeriveFamily(parsedAddr) != family {
 				continue
 			}
 
-			return parsedIP, &ipInfo, nil
+			return parsedAddr, &ipInfo, nil
 		}
 	}
 
@@ -643,7 +633,7 @@ func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Famil
 	} else {
 		msg += "once Cilium Operator allocates more IPs"
 	}
-	return nil, nil, errors.New(msg)
+	return netip.Addr{}, nil, errors.New(msg)
 }
 
 // totalPoolSize returns the total size of the allocation pool
@@ -697,26 +687,8 @@ func newCRDAllocator(logger *slog.Logger, family Family, c *option.DaemonConfig,
 	return allocator
 }
 
-// deriveGatewayIP accept the CIDR and the index of the IP in this CIDR.
-func deriveGatewayIP(logger *slog.Logger, cidr string, index int) string {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		logger.Warn(
-			"Unable to parse subnet CIDR",
-			logfields.Error, err,
-			logfields.CIDR, cidr,
-		)
-		return ""
-	}
-	gw := ip.GetIPAtIndex(*ipNet, int64(index))
-	if gw == nil {
-		return ""
-	}
-	return gw.String()
-}
-
-func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.AllocationIP) (result *AllocationResult, err error) {
-	result = &AllocationResult{IP: ip}
+func (a *crdAllocator) buildAllocationResult(addr netip.Addr, ipInfo *ipamTypes.AllocationIP) (result *AllocationResult, err error) {
+	result = &AllocationResult{IP: addr}
 
 	a.store.mutex.RLock()
 	defer a.store.mutex.RUnlock()
@@ -727,20 +699,23 @@ func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.Alloca
 
 	switch a.conf.IPAMMode() {
 
-	case ipamOption.IPAMENI:
-		return buildENIAllocationResult(a.logger, ip, a.store.ownNode, a.conf, a.ipMasqAgent)
-
 	// In Azure mode, the Resource points to the azure interface so we can
 	// derive the master interface
 	case ipamOption.IPAMAzure:
 		for _, iface := range a.store.ownNode.Status.Azure.Interfaces {
 			if iface.ID == ipInfo.Resource {
 				result.PrimaryMAC = iface.MAC
-				result.GatewayIP = iface.Gateway
-				result.CIDRs = append(result.CIDRs, iface.CIDR)
+				if iface.Gateway.IsValid() {
+					result.GatewayIP = iface.Gateway.Addr
+				}
+				if p := azureInterfaceCIDR(iface); p.IsValid() {
+					result.CIDRs = append(result.CIDRs, p)
+				}
 				// Add manually configured Native Routing CIDR
 				if a.conf.IPv4NativeRoutingCIDR != nil {
-					result.CIDRs = append(result.CIDRs, a.conf.IPv4NativeRoutingCIDR.String())
+					if p, ok := netipx.FromStdIPNet(a.conf.IPv4NativeRoutingCIDR.IPNet); ok {
+						result.CIDRs = append(result.CIDRs, p)
+					}
 				}
 				// If the ip-masq-agent is enabled, get the CIDRs that are not masqueraded.
 				// Note that the resulting ip rules will not be dynamically regenerated if the
@@ -748,10 +723,10 @@ func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.Alloca
 				if a.conf.EnableIPMasqAgent {
 					nonMasqCidrs := a.ipMasqAgent.NonMasqCIDRsFromConfig()
 					for _, prefix := range nonMasqCidrs {
-						if ip.To4() != nil && prefix.Addr().Is4() {
-							result.CIDRs = append(result.CIDRs, prefix.String())
-						} else if ip.To4() == nil && prefix.Addr().Is6() {
-							result.CIDRs = append(result.CIDRs, prefix.String())
+						if addr.Is4() && prefix.Addr().Is4() {
+							result.CIDRs = append(result.CIDRs, prefix)
+						} else if !addr.Is4() && prefix.Addr().Is6() {
+							result.CIDRs = append(result.CIDRs, prefix)
 						}
 					}
 				}
@@ -780,11 +755,15 @@ func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.Alloca
 				continue
 			}
 			result.PrimaryMAC = eni.MACAddress
-			result.CIDRs = []string{eni.VSwitch.CIDRBlock}
+			if eni.VSwitch.CIDRBlock.IsValid() {
+				p := eni.VSwitch.CIDRBlock.Prefix
+				result.CIDRs = []netip.Prefix{p}
 
-			// Ref: https://www.alibabacloud.com/help/doc-detail/65398.html
-			result.GatewayIP = deriveGatewayIP(a.logger, eni.VSwitch.CIDRBlock, -3)
-			result.InterfaceNumber = strconv.Itoa(alibabaCloud.GetENIIndexFromTags(a.logger, eni.Tags))
+				// AlibabaCloud reserves the third-to-last IP of the subnet for the gateway.
+				// Ref: https://www.alibabacloud.com/help/doc-detail/65398.html
+				result.GatewayIP = netipx.PrefixLastIP(p).Prev().Prev()
+			}
+			result.InterfaceNumber = strconv.Itoa(alibabaCloudTypes.GetENIIndexFromTags(a.logger, eni.Tags))
 			return
 		}
 		return nil, fmt.Errorf("unable to find ENI %s", ipInfo.Resource)
@@ -797,27 +776,27 @@ func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.Alloca
 // allocate it if it is available. If the IP is unavailable or already
 // allocated, an error is returned. The custom resource will be updated to
 // reflect the newly allocated IP.
-func (a *crdAllocator) Allocate(ip net.IP, owner string, pool Pool) (*AllocationResult, error) {
+func (a *crdAllocator) Allocate(addr netip.Addr, owner string, pool Pool) (*AllocationResult, error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if _, ok := a.allocated[ip.String()]; ok {
+	if _, ok := a.allocated[addr.String()]; ok {
 		return nil, fmt.Errorf("IP already in use")
 	}
 
-	ipInfo, err := a.store.allocate(ip)
+	ipInfo, err := a.store.allocate(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	result, err := a.buildAllocationResult(ip, ipInfo)
+	result, err := a.buildAllocationResult(addr, ipInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", ip, err)
+		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", addr, err)
 	}
 
-	a.markAllocated(ip, owner, *ipInfo)
+	a.markAllocated(addr, owner, *ipInfo)
 	// Update custom resource to reflect the newly allocated IP.
-	a.store.refreshTrigger.TriggerWithReason(fmt.Sprintf("allocation of IP %s", ip.String()))
+	a.store.refreshTrigger.TriggerWithReason(fmt.Sprintf("allocation of IP %s", addr))
 
 	return result, nil
 }
@@ -826,25 +805,25 @@ func (a *crdAllocator) Allocate(ip net.IP, owner string, pool Pool) (*Allocation
 // custom resource and allocate it if it is available. If the IP is
 // unavailable or already allocated, an error is returned. The custom resource
 // will not be updated.
-func (a *crdAllocator) AllocateWithoutSyncUpstream(ip net.IP, owner string, pool Pool) (*AllocationResult, error) {
+func (a *crdAllocator) AllocateWithoutSyncUpstream(addr netip.Addr, owner string, pool Pool) (*AllocationResult, error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if _, ok := a.allocated[ip.String()]; ok {
+	if _, ok := a.allocated[addr.String()]; ok {
 		return nil, fmt.Errorf("IP already in use")
 	}
 
-	ipInfo, err := a.store.allocate(ip)
+	ipInfo, err := a.store.allocate(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	result, err := a.buildAllocationResult(ip, ipInfo)
+	result, err := a.buildAllocationResult(addr, ipInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", ip, err)
+		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", addr, err)
 	}
 
-	a.markAllocated(ip, owner, *ipInfo)
+	a.markAllocated(addr, owner, *ipInfo)
 
 	return result, nil
 }
@@ -852,25 +831,25 @@ func (a *crdAllocator) AllocateWithoutSyncUpstream(ip net.IP, owner string, pool
 // Release will release the specified IP or return an error if the IP has not
 // been allocated before. The custom resource will be updated to reflect the
 // released IP.
-func (a *crdAllocator) Release(ip net.IP, pool Pool) error {
+func (a *crdAllocator) Release(addr netip.Addr, pool Pool) error {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if _, ok := a.allocated[ip.String()]; !ok {
-		return fmt.Errorf("IP %s is not allocated", ip.String())
+	if _, ok := a.allocated[addr.String()]; !ok {
+		return fmt.Errorf("IP %s is not allocated", addr.String())
 	}
 
-	delete(a.allocated, ip.String())
+	delete(a.allocated, addr.String())
 	// Update custom resource to reflect the newly released IP.
-	a.store.refreshTrigger.TriggerWithReason(fmt.Sprintf("release of IP %s", ip.String()))
+	a.store.refreshTrigger.TriggerWithReason(fmt.Sprintf("release of IP %s", addr.String()))
 
 	return nil
 }
 
 // markAllocated marks a particular IP as allocated
-func (a *crdAllocator) markAllocated(ip net.IP, owner string, ipInfo ipamTypes.AllocationIP) {
+func (a *crdAllocator) markAllocated(addr netip.Addr, owner string, ipInfo ipamTypes.AllocationIP) {
 	ipInfo.Owner = owner
-	a.allocated[ip.String()] = ipInfo
+	a.allocated[addr.String()] = ipInfo
 }
 
 // AllocateNext allocates the next available IP as offered by the custom
@@ -880,19 +859,19 @@ func (a *crdAllocator) AllocateNext(owner string, pool Pool) (*AllocationResult,
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	ip, ipInfo, err := a.store.allocateNext(a.allocated, a.family, owner)
+	addr, ipInfo, err := a.store.allocateNext(a.allocated, a.family, owner)
 	if err != nil {
 		return nil, err
 	}
 
-	result, err := a.buildAllocationResult(ip, ipInfo)
+	result, err := a.buildAllocationResult(addr, ipInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", ip, err)
+		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", addr, err)
 	}
 
-	a.markAllocated(ip, owner, *ipInfo)
+	a.markAllocated(addr, owner, *ipInfo)
 	// Update custom resource to reflect the newly allocated IP.
-	a.store.refreshTrigger.TriggerWithReason(fmt.Sprintf("allocation of IP %s", ip.String()))
+	a.store.refreshTrigger.TriggerWithReason(fmt.Sprintf("allocation of IP %s", addr.String()))
 
 	return result, nil
 }
@@ -904,17 +883,17 @@ func (a *crdAllocator) AllocateNextWithoutSyncUpstream(owner string, pool Pool) 
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	ip, ipInfo, err := a.store.allocateNext(a.allocated, a.family, owner)
+	addr, ipInfo, err := a.store.allocateNext(a.allocated, a.family, owner)
 	if err != nil {
 		return nil, err
 	}
 
-	result, err := a.buildAllocationResult(ip, ipInfo)
+	result, err := a.buildAllocationResult(addr, ipInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", ip, err)
+		return nil, fmt.Errorf("failed to associate IP %s inside CiliumNode: %w", addr, err)
 	}
 
-	a.markAllocated(ip, owner, *ipInfo)
+	a.markAllocated(addr, owner, *ipInfo)
 
 	return result, nil
 }
@@ -948,18 +927,18 @@ func (a *crdAllocator) RestoreFinished() {
 
 // NewIPNotAvailableInPoolError returns an error resprenting the given IP not
 // being available in the IPAM pool.
-func NewIPNotAvailableInPoolError(ip net.IP) error {
-	return &ErrIPNotAvailableInPool{ip: ip}
+func NewIPNotAvailableInPoolError(addr netip.Addr) error {
+	return &ErrIPNotAvailableInPool{addr: addr}
 }
 
 // ErrIPNotAvailableInPool represents an error when an IP is not available in
 // the pool.
 type ErrIPNotAvailableInPool struct {
-	ip net.IP
+	addr netip.Addr
 }
 
 func (e *ErrIPNotAvailableInPool) Error() string {
-	return fmt.Sprintf("IP %s is not available", e.ip.String())
+	return fmt.Sprintf("IP %s is not available", e.addr)
 }
 
 // Is provides this error type with the logic for use with errors.Is.
@@ -974,5 +953,18 @@ func (e *ErrIPNotAvailableInPool) Is(target error) bool {
 	if t == nil {
 		return false
 	}
-	return t.ip.Equal(e.ip)
+	return t.addr == e.addr
+}
+
+// azureInterfaceCIDR returns Subnet.CIDR, falling back to the deprecated
+// AzureInterface.CIDR for CiliumNodes written by operators predating the
+// Subnet.CIDR migration.
+//
+// TODO(https://github.com/cilium/cilium/issues/46074): remove once
+// AzureInterface.CIDR is deleted.
+func azureInterfaceCIDR(iface azureTypes.AzureInterface) netip.Prefix {
+	if iface.Subnet.CIDR.IsValid() {
+		return iface.Subnet.CIDR.Prefix
+	}
+	return iface.CIDR.Prefix //nolint:staticcheck // fallback for operators predating the Subnet.CIDR migration
 }

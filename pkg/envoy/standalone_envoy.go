@@ -115,6 +115,7 @@ type standaloneEnvoyConfig struct {
 	maxConcurrentRetries           uint32
 	maxConnections                 uint32
 	maxRequests                    uint32
+	maxPendingRequests             uint32
 }
 
 // startStandaloneEnvoyInternal starts an Envoy proxy instance.
@@ -151,6 +152,7 @@ func (o *onDemandXdsStarter) startStandaloneEnvoyInternal(config standaloneEnvoy
 		maxConcurrentRetries:           config.maxConcurrentRetries,
 		maxConnections:                 config.maxConnections,
 		maxRequests:                    config.maxRequests,
+		maxPendingRequests:             config.maxPendingRequests,
 		nodeLocalityEnabled:            config.nodeLocalityEnabled,
 	})
 	if err != nil {
@@ -184,8 +186,8 @@ func (o *onDemandXdsStarter) startStandaloneEnvoyInternal(config standaloneEnvoy
 			// main and worker threads.
 			logFormat = "%t|%l|%n|%v"
 
-			// Create a piper that parses and writes into logrus the log
-			// messages from Envoy.
+			// Create a piper that parses Envoy log messages and
+			// writes them to the Cilium agent log.
 			logWriter = o.newEnvoyLogPiper()
 		}
 		defer logWriter.Close()
@@ -318,7 +320,7 @@ func (o *onDemandXdsStarter) newEnvoyLogPiper() io.WriteCloser {
 				continue
 			}
 
-			// Map the Envoy log level to a logrus level.
+			// Map the Envoy log level to a Cilium log level.
 			switch logLevel {
 			case envoyLogLevelOff, envoyLogLevelCritical, envoyLogLevelError:
 				scopedLog.Error(logMsg)
@@ -378,6 +380,7 @@ type bootstrapConfig struct {
 	maxConcurrentRetries           uint32
 	maxConnections                 uint32
 	maxRequests                    uint32
+	maxPendingRequests             uint32
 	nodeLocalityEnabled            bool
 }
 
@@ -425,9 +428,10 @@ func (o *onDemandXdsStarter) writeBootstrapConfigFile(config bootstrapConfig) er
 
 	clusterRetryLimits := &envoy_config_cluster.CircuitBreakers{
 		Thresholds: []*envoy_config_cluster.CircuitBreakers_Thresholds{{
-			MaxRetries:     &wrapperspb.UInt32Value{Value: config.maxConcurrentRetries},
-			MaxConnections: &wrapperspb.UInt32Value{Value: config.maxConnections},
-			MaxRequests:    &wrapperspb.UInt32Value{Value: config.maxRequests},
+			MaxRetries:         &wrapperspb.UInt32Value{Value: config.maxConcurrentRetries},
+			MaxConnections:     &wrapperspb.UInt32Value{Value: config.maxConnections},
+			MaxRequests:        &wrapperspb.UInt32Value{Value: config.maxRequests},
+			MaxPendingRequests: &wrapperspb.UInt32Value{Value: config.maxPendingRequests},
 		}},
 	}
 
@@ -505,6 +509,7 @@ func (o *onDemandXdsStarter) writeBootstrapConfigFile(config bootstrapConfig) er
 						}},
 					},
 					TypedExtensionProtocolOptions: http2ProtocolOptions,
+					CircuitBreakers:               clusterRetryLimits,
 				},
 				{
 					Name:                 adminClusterName,

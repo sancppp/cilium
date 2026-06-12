@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/source"
@@ -28,6 +30,7 @@ import (
 // Writer provides validated write access to the service load-balancing state.
 type Writer struct {
 	config loadbalancer.Config
+	log    *slog.Logger
 
 	nodeName string
 
@@ -54,6 +57,7 @@ const LocalClusterID = 0
 type writerParams struct {
 	cell.In
 
+	Log           *slog.Logger
 	Config        loadbalancer.Config
 	DB            *statedb.DB
 	NodeAddresses statedb.Table[tables.NodeAddress]
@@ -68,6 +72,7 @@ type writerParams struct {
 func NewWriter(p writerParams) (*Writer, error) {
 	w := &Writer{
 		config:           p.Config,
+		log:              p.Log,
 		nodeName:         nodeTypes.GetName(),
 		db:               p.DB,
 		bes:              p.Backends,
@@ -293,6 +298,22 @@ func (w *Writer) upsertFrontendParams(txn WriteTxn, params loadbalancer.Frontend
 	return old, err
 }
 
+// isNodePortConflict reports whether addr is a NodePort-eligible node address within the NodePort range.
+// Such a frontend would suppress NodePort expansion and cause a gap after deletion. See #44730.
+func (w *Writer) isNodePortConflict(txn statedb.ReadTxn, addr loadbalancer.L3n4Addr) bool {
+	port := addr.Port()
+	if port < w.config.NodePortMin || port > w.config.NodePortMax {
+		return false
+	}
+	ip := addr.AddrCluster().Addr()
+	for na := range w.nodeAddrs.List(txn, tables.NodeAddressNodePortIndex.Query(true)) {
+		if na.Addr == ip {
+			return true
+		}
+	}
+	return false
+}
+
 // validateFrontends checks that the frontends being added are not already owned by other
 // services.
 func (w *Writer) validateFrontends(txn WriteTxn, fes ...loadbalancer.FrontendParams) error {
@@ -309,6 +330,23 @@ func (w *Writer) validateFrontends(txn WriteTxn, fes ...loadbalancer.FrontendPar
 // UpsertServiceAndFrontends upserts the service and updates the set of associated frontends.
 // Any frontends that do not exist in the new set are deleted.
 func (w *Writer) UpsertServiceAndFrontends(txn WriteTxn, svc *loadbalancer.Service, fes ...loadbalancer.FrontendParams) error {
+	// Filter out LB/ExternalIP frontends conflicting with NodePort expansion. See #44730.
+	filtered := fes[:0] // reuse the backing array
+	for _, fe := range fes {
+		if (fe.Type == loadbalancer.SVCTypeLoadBalancer || fe.Type == loadbalancer.SVCTypeExternalIPs) &&
+			w.isNodePortConflict(txn, fe.Address) {
+			w.log.Warn("Skipping LB/ExternalIP frontend conflicting with NodePort",
+				logfields.Address, fe.Address,
+				logfields.ServiceName, svc.Name,
+				logfields.NodePortMin, w.config.NodePortMin,
+				logfields.NodePortMax, w.config.NodePortMax,
+			)
+			continue
+		}
+		filtered = append(filtered, fe)
+	}
+	fes = filtered
+
 	if err := w.validateFrontends(txn, fes...); err != nil {
 		return err
 	}
@@ -403,6 +441,31 @@ func matchesFrontend(be *loadbalancer.Backend, fe *loadbalancer.Frontend) bool {
 	return true
 }
 
+// topologyPreferenceCandidate reports whether a backend should participate in
+// same-node and same-zone preference decisions. This mirrors kube-proxy's
+// behaviour where topology hint validation considers Ready endpoints only.
+func (w *Writer) topologyPreferenceCandidate(svc *loadbalancer.Service, be *loadbalancer.Backend) bool {
+	// Terminating backends are excluded from hint computation by the
+	// EndpointSlice controller, so they would always lack hints. Including
+	// them here would either spuriously trip the missing-hints safeguard or
+	// pin traffic to a draining Pod.
+	if be.State == loadbalancer.BackendStateTerminating ||
+		be.State == loadbalancer.BackendStateTerminatingNotServing {
+		return false
+	}
+
+	if w.isServiceHealthCheckedFunc == nil || !w.isServiceHealthCheckedFunc(svc) {
+		return true
+	}
+
+	// Health-checked services should only prefer backends that are currently
+	// usable. Otherwise a quarantined or not-yet-checked local backend would
+	// suppress fallback to healthy remote backends.
+	return be.State == loadbalancer.BackendStateActive &&
+		!be.Unhealthy &&
+		be.UnhealthyUpdatedAt != nil
+}
+
 func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadbalancer.Backend, statedb.Revision], svc *loadbalancer.Service, fe *loadbalancer.Frontend) iter.Seq2[*loadbalancer.Backend, statedb.Revision] {
 	onlyLocal := false
 	isLocalProxyDelegation := func(loadbalancer.L3n4Addr) bool { return true }
@@ -432,6 +495,9 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 			if !matchesFrontend(be, fe) {
 				continue
 			}
+			if !w.topologyPreferenceCandidate(svc, be) {
+				continue
+			}
 			candidatesFound = true
 			break
 		}
@@ -443,6 +509,9 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 						continue
 					}
 					if !matchesFrontend(be, fe) {
+						continue
+					}
+					if !w.topologyPreferenceCandidate(svc, be) {
 						continue
 					}
 					if !yield(be, rev) {
@@ -483,6 +552,9 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 					continue
 				}
 			}
+			if !w.topologyPreferenceCandidate(svc, be) {
+				continue
+			}
 
 			if be.Zone != nil && len(be.Zone.ForZones) > 0 {
 				if !candidatesFound && slices.Contains(be.Zone.ForZones, *thisZone) {
@@ -511,8 +583,11 @@ func (w *Writer) DefaultSelectBackends(txn statedb.ReadTxn, bes iter.Seq2[*loadb
 					continue
 				}
 			}
-			if checkZoneHints && !slices.Contains(be.Zone.ForZones, *thisZone) {
-				continue
+			if checkZoneHints {
+				if be.Zone == nil ||
+					!slices.Contains(be.Zone.ForZones, *thisZone) {
+					continue
+				}
 			}
 			if !yield(be, rev) {
 				return

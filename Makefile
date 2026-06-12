@@ -53,9 +53,9 @@ BENCH_EVAL := "."
 BENCH ?= $(BENCH_EVAL)
 BENCHFLAGS_EVAL := -bench=$(BENCH) -run=^$$ -benchtime=10s
 BENCHFLAGS ?= $(BENCHFLAGS_EVAL)
-SKIP_KVSTORES ?= "false"
-SKIP_K8S_CODE_GEN_CHECK ?= "true"
-SKIP_CUSTOMVET_CHECK ?= "false"
+SKIP_KVSTORES ?= false
+SKIP_K8S_CODE_GEN_CHECK ?= true
+SKIP_CUSTOMVET_CHECK ?= false
 
 JOB_BASE_NAME ?= cilium_test
 
@@ -108,7 +108,7 @@ tests-privileged: ## Run Go tests including ones that require elevated privilege
 	$(MAKE) generate-cov
 
 start-kvstores: ## Start running kvstores (etcd container) for integration tests.
-ifeq ($(SKIP_KVSTORES),"false")
+ifeq ($(SKIP_KVSTORES),false)
 	@echo Starting key-value store container...
 	-$(QUIET)$(CONTAINER_ENGINE) rm -f "cilium-etcd-test-container" 2> /dev/null
 	$(QUIET)$(CONTAINER_ENGINE) run -d \
@@ -125,7 +125,7 @@ ifeq ($(SKIP_KVSTORES),"false")
 endif
 
 stop-kvstores: ## Forcefully removes running kvstore components (etcd container) for integration tests.
-ifeq ($(SKIP_KVSTORES),"false")
+ifeq ($(SKIP_KVSTORES),false)
 	$(QUIET)$(CONTAINER_ENGINE) rm -f "cilium-etcd-test-container"
 endif
 
@@ -251,7 +251,7 @@ manifests: ## Generate K8s manifests e.g. CRD, RBAC etc.
 	contrib/scripts/k8s-manifests-gen.sh
 
 .PHONY: generate-apis
-generate-apis: generate-api generate-health-api generate-hubble-api generate-operator-api generate-kvstoremesh-api generate-sdp-api
+generate-apis: generate-api generate-health-api generate-hubble-api generate-operator-api generate-kvstoremesh-api generate-sdp-api generate-datapathplugins-api generate-clustermesh-api
 
 generate-api: api/v1/openapi.yaml ## Generate cilium-agent client, model and server code from openapi spec.
 	@$(ECHO_GEN)api/v1/openapi.yaml
@@ -332,6 +332,9 @@ generate-ztunnel-api: pkg/ztunnel/pb/ca_ztunnel.proto pkg/ztunnel/pb/workload_zt
 generate-sdp-api: api/v1/standalone-dns-proxy/standalone-dns-proxy.proto
 	$(QUIET) $(MAKE) $(SUBMAKEOPTS) -C api/v1
 
+generate-datapathplugins-api:
+	$(QUIET) $(MAKE) $(SUBMAKEOPTS) -C api/v1
+
 define generate_k8s_protobuf
 	$(GO) install k8s.io/code-generator/cmd/go-to-protobuf/protoc-gen-gogo && \
 	$(GO) install golang.org/x/tools/cmd/goimports && \
@@ -360,6 +363,26 @@ github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1beta1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/util/intstr
 endef
 
+define CLUSTERMESH_PROTO_PACKAGES
+-github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1
+github.com/cilium/cilium/pkg/clustermesh/types/endpointslice/internal
+endef
+
+.PHONY: generate-clustermesh-api-local
+generate-clustermesh-api-local:
+	$(ASSERT_CILIUM_MODULE)
+
+	$(eval TMPDIR := $(shell mktemp -d -t cilium.tmpXXXXXXXX))
+
+	$(QUIET) $(call generate_k8s_protobuf,${CLUSTERMESH_PROTO_PACKAGES},"$(TMPDIR)")
+
+	$(QUIET) rm -rf "$(TMPDIR)"
+
+.PHONY: generate-clustermesh-api
+generate-clustermesh-api:
+	contrib/scripts/builder.sh \
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/ generate-clustermesh-api-local
+
 .PHONY: generate-k8s-api-local
 generate-k8s-api-local:
 	$(ASSERT_CILIUM_MODULE)
@@ -373,13 +396,17 @@ generate-k8s-api-local:
 
 .PHONY: generate-k8s-api
 generate-k8s-api: ## Generate Cilium k8s API client, deepcopy and deepequal Go sources.
+	@$(ECHO_DOCKER)
 	contrib/scripts/builder.sh \
-		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/ generate-k8s-api-local
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/ generate-k8s-api-local V=$(V)
 
 .PHONY: generate-bpf
 generate-bpf: ## Generate config structs from BPF objects using dpgen and Go skeletons with bpf2go
+	@$(ECHO_DOCKER)
 	contrib/scripts/builder.sh \
-		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/bpf generate
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/bpf generate V=$(V)
+	@$(ECHO_CHECK) bpf-skel
+	$(QUIET)git status bpf/ pkg/ --porcelain
 
 check-k8s-clusterrole: ## Ensures there is no diff between preflight's clusterrole and runtime's clusterrole.
 	./contrib/scripts/check-preflight-clusterrole.sh
@@ -402,11 +429,23 @@ govet: ## Run govet on Go source files in the repository.
 	@$(ECHO_CHECK) vetting all packages...
 	$(QUIET) $(GO_VET) ./...
 
-.PHONY: custom-lint
-custom-lint: ## Run extra local linters
+.PHONY: custom-lint metrics-lint cloud-dep-check statedb-lint
+custom-lint: metrics-lint statedb-lint cloud-dep-check ## Run extra local linters
+
+metrics-lint:
 	$(ECHO_CHECK) metricslint
 	$(QUIET)$(MAKE) -C tools/metricslint
 	$(QUIET)tools/metricslint/metricslint ./...
+
+cloud-dep-check:
+	$(ECHO_CHECK) cloud-dep-check
+	$(QUIET)$(MAKE) -C tools/cloud-dep-check
+	$(QUIET)tools/cloud-dep-check/cilium-cloud-dep-check -root .
+
+statedb-lint:
+	$(ECHO_CHECK) statedblint
+	$(QUIET)$(MAKE) -C tools/statedblint
+	$(QUIET)tools/statedblint/statedblint ./...
 
 golangci-lint: ## Run golangci-lint
 ifneq (,$(findstring $(GOLANGCILINT_WANT_VERSION:v%=%),$(GOLANGCILINT_VERSION)))
@@ -465,7 +504,7 @@ fuzz: check-fuzz # Run fuzzer tests briefly for FUZZ_TIME seconds
 	./test/fuzzing/go-fuzz.sh | $(GOTEST_FORMATTER)
 
 precheck: ## Peform build precheck for the source code.
-ifeq ($(SKIP_K8S_CODE_GEN_CHECK),"false")
+ifeq ($(SKIP_K8S_CODE_GEN_CHECK),false)
 	@$(ECHO_CHECK) contrib/scripts/check-k8s-code-gen.sh
 	$(QUIET) contrib/scripts/check-k8s-code-gen.sh
 endif
@@ -477,7 +516,7 @@ endif
 	$(QUIET) contrib/scripts/lock-check.sh
 	@$(ECHO_CHECK) contrib/scripts/check-viper.sh
 	$(QUIET) contrib/scripts/check-viper.sh
-ifeq ($(SKIP_CUSTOMVET_CHECK),"false")
+ifeq ($(SKIP_CUSTOMVET_CHECK),false)
 	@$(ECHO_CHECK) contrib/scripts/custom-vet-check.sh
 	$(QUIET) contrib/scripts/custom-vet-check.sh
 endif
@@ -497,8 +536,6 @@ endif
 	$(QUIET) contrib/scripts/check-datapathconfig.sh
 	@$(ECHO_CHECK) $(GO) run ./tools/slogloggercheck .
 	$(QUIET)$(GO) run ./tools/slogloggercheck .
-	@$(ECHO_CHECK) contrib/scripts/check-fipsonly.sh
-	$(QUIET) contrib/scripts/check-fipsonly.sh
 	$(MAKE) check-fuzz
 
 pprof-heap: ## Get Go pprof heap profile.
@@ -593,23 +630,31 @@ mcs-api-conformance: ## Run MCS-API conformance tests.
 	@$(ECHO_CHECK) running MCS-API conformance tests...
 	MCS_API_CONFORMANCE_TESTS=1 \
 	$(GO_TEST) $(GO_TEST_FLAGS) -p 4 -v ./pkg/clustermesh/mcsapi/conformance \
+		-organization Cilium -project Cilium -url 'https://cilium.io/' \
+		-version "$(VERSION)"  \
 		$(MCS_API_TEST_FLAGS) \
 		-test.run $(MCS_API_CONFORMANCE_TEST_NAME) \
 	| $(GOTEST_FORMATTER)
 
-BPF_TEST ?= ""
-BPF_TEST_DUMP_CTX ?= ""
-BPF_TEST_VERBOSE ?= 0
+BPF_TEST ?=
+BPF_TEST_DUMP_CTX ?=
+BPF_TEST_FLAGS ?=
+SUDO ?= sudo -E
 
 run_bpf_tests: ## Build and run the BPF unit tests using the cilium-builder container image.
-	DOCKER_ARGS="--privileged -v /sys:/sys" RUN_AS_ROOT=1 contrib/scripts/builder.sh \
-		env MAKEFLAGS="$(filter-out --jobserver-auth=% --jobserver-fds=%,$(MAKEFLAGS))" \
-		make $(SUBMAKEOPTS) -C bpf/tests/ run \
-			"BPF_TEST=$(BPF_TEST)" \
-			"BPF_TEST_DUMP_CTX=$(BPF_TEST_DUMP_CTX)" \
-			"LOG_CODEOWNERS=$(LOG_CODEOWNERS)" \
-			"JUNIT_PATH=$(JUNIT_PATH)" \
-			"V=$(BPF_TEST_VERBOSE)"
+	contrib/scripts/builder.sh \
+		env MAKEFLAGS="$(filter-out --jobserver-auth=%,$(MAKEFLAGS))" \
+		make $(SUBMAKEOPTS) -C bpf/tests/ all
+	$(GO) test ./bpf/tests/bpftest \
+		-bpf-test-path $(ROOT_DIR)/bpf/tests \
+		-exec "$(SUDO)" \
+		$(GO_TEST_FLAGS) \
+		$(and $(filter 1,$(V)),-test.v) \
+		$(and $(RUN),-run $(RUN)) \
+		$(and $(BPF_TEST_DUMP_CTX),-dump-ctx) \
+		$(and $(BPF_TEST),-test $(BPF_TEST)) \
+		$(BPF_TEST_FLAGS) \
+	| $(GOTEST_FORMATTER)
 
 run-builder: ## Drop into a shell inside a container running the cilium-builder image.
 	DOCKER_ARGS="-it" contrib/scripts/builder.sh bash

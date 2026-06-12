@@ -57,7 +57,7 @@ concurrency:
 
 env:
   # renovate: datasource=golang-version depName=go
-  go-version: 1.26.1
+  go-version: 1.26.4
 
 jobs:
   echo-inputs:
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/cilium/.github/actions/set-commit-status@main
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -86,19 +86,19 @@ jobs:
       matrix:
         include:
           - kernel: '5.15'
-            kernel-name: '515'
+            kernel-name: 'v5.15'
             ci-kernel: '510'
           - kernel: '6.1'
-            kernel-name: '61'
+            kernel-name: 'v6.1'
             ci-kernel: '61'
           - kernel: '6.6'
-            kernel-name: '66'
+            kernel-name: 'v6.6'
             ci-kernel: '61'
           - kernel: '6.12'
-            kernel-name: '612'
+            kernel-name: 'v6.12'
             ci-kernel: '61'
           - kernel: '6.18'
-            kernel-name: '618'
+            kernel-name: 'v6.18'
             ci-kernel: '61'
           - kernel: 'bpf-next'
             kernel-name: 'bpf-next'
@@ -106,7 +106,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Set commit status to pending
-        uses: cilium/cilium/.github/actions/set-commit-status@main
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -142,23 +142,23 @@ jobs:
           KERNEL="${{ matrix.kernel }}"
           case "$KERNEL" in
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "5.15") FULL_KERNEL="5.15-20260310.122539" ;;
+            "5.15") FULL_KERNEL="5.15-20260525.014435" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.1") FULL_KERNEL="6.1-20260310.122539" ;;
+            "6.1") FULL_KERNEL="6.1-20260525.014435" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.6") FULL_KERNEL="6.6-20260310.122539" ;;
+            "6.6") FULL_KERNEL="6.6-20260525.014435" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.12") FULL_KERNEL="6.12-20260310.122539" ;;
+            "6.12") FULL_KERNEL="6.12-20260525.014435" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.18") FULL_KERNEL="6.18-20260310.122539" ;;
+            "6.18") FULL_KERNEL="6.18-20260525.014435" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "bpf-next") FULL_KERNEL="bpf-next-20260310.122539" ;;
+            "bpf-next") FULL_KERNEL="bpf-next-20260525.014435" ;;
             *) FULL_KERNEL="$KERNEL" ;;
           esac
           echo "full=${FULL_KERNEL}" >> $GITHUB_OUTPUT
 
       - name: Provision LVH VMs
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         with:
           test-name: datapath-bpf-complexity
           image: 'complexity-test'
@@ -167,7 +167,7 @@ jobs:
           images-folder-parent: "/tmp"
           cpu: 4
           # renovate: datasource=github-tags depName=cilium/little-vm-helper
-          lvh-version: "v0.0.28"
+          lvh-version: "v0.0.30"
           install-dependencies: 'true'
           cmd: |
             for i in {1..5}; do curl "https://golang.org" > /dev/null 2>&1 && break || sleep 5; echo "Waiting for systemd-resolved to be ready..."; done
@@ -197,7 +197,7 @@ jobs:
             rm -r /var/tmp/llvm
 
       - name: Run verifier tests (on base branch)
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -210,7 +210,7 @@ jobs:
             mv /host/datapath-verifier/verifier-complexity.json /host/datapath-verifier/verifier-complexity-base.json
 
       - name: Run verifier tests (on PR branch)
-        uses: cilium/little-vm-helper@ad43ff511dd5365a0011ae9f864ec959c36daebf # v0.0.28
+        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
         if: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           provision: 'false'
@@ -225,7 +225,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ always() }}
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: datapath-verifier_${{ matrix.kernel }}
           path: datapath-verifier
@@ -234,6 +234,7 @@ jobs:
   merge-and-diff:
     name: Merge & Diff
     needs: setup-and-test
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     steps:
     - name: Checkout pull request branch (NOT TRUSTED)
@@ -256,14 +257,19 @@ jobs:
       if: ${{ github.event_name == 'workflow_dispatch' }}
       run: |
         cat ./artifacts/*/verifier-complexity-pull.json | jq -s 'add' > ./artifacts/verifier-complexity-pull.json
-        go run ./tools/complexity-diff ./artifacts/verifier-complexity-base.json ./artifacts/verifier-complexity-pull.json ./artifacts/complexity-diff.json >> $GITHUB_STEP_SUMMARY
+        go run ./tools/complexity-diff -diff-file ./artifacts/complexity-diff.json ./artifacts/verifier-complexity-base.json ./artifacts/verifier-complexity-pull.json >> $GITHUB_STEP_SUMMARY
+
+    - name: Display current state
+      if: ${{ github.event_name != 'workflow_dispatch' }}
+      run: |
+        go run ./tools/complexity-diff ./artifacts/verifier-complexity-base.json >> $GITHUB_STEP_SUMMARY
 
     - name: Remove per-kernel results from workspace
       run: |
         rm -Rf ./artifacts/datapath-verifier*
 
     - name: Upload merged
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: verifier-complexity
         path: ./artifacts
@@ -272,11 +278,11 @@ jobs:
   commit-status-final:
     if: ${{ always() }}
     name: Commit Status Final
-    needs: setup-and-test
+    needs: [merge-and-diff, setup-and-test]
     runs-on: ubuntu-24.04
     steps:
       - name: Set final commit status
-        uses: cilium/cilium/.github/actions/set-commit-status@main
+        uses: cilium/cilium/.github/actions/set-commit-status@main # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
-          status: ${{ needs.setup-and-test.result }}
+          status: ${{ needs.setup-and-test.result == 'success' && needs.merge-and-diff.result || needs.setup-and-test.result }}

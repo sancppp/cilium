@@ -15,7 +15,6 @@ import (
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/k8s"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -39,6 +38,11 @@ var LocalNodeSyncCell = cell.Module(
 	cell.Provide(newLocalNodeSynchronizer),
 )
 
+// InitFunc is called before during startup to fill in the local node before other
+// sub-systems can access it. This is called after the [node.LocalNode] is filled in
+// from configuration and k8s node.
+type InitFunc func(context.Context, *node.LocalNode) error
+
 type localNodeSynchronizerParams struct {
 	cell.In
 
@@ -48,6 +52,7 @@ type localNodeSynchronizerParams struct {
 	K8sLocalNode       agentK8s.LocalNodeResource
 	K8sCiliumLocalNode agentK8s.LocalCiliumNodeResource
 	IPsecConfig        ipsec.Config
+	ExtraInitFuncs     []InitFunc `group:"init-funcs"`
 }
 
 // localNodeSynchronizer performs the bootstrapping of the LocalNodeStore,
@@ -61,7 +66,6 @@ type localNodeSynchronizer struct {
 
 func (ini *localNodeSynchronizer) InitLocalNode(ctx context.Context, n *node.LocalNode) error {
 	n.Source = source.Local
-	n.NodeIdentity = uint32(identity.ReservedIdentityHost)
 
 	if err := ini.initFromConfig(n); err != nil {
 		return err
@@ -76,6 +80,12 @@ func (ini *localNodeSynchronizer) InitLocalNode(ctx context.Context, n *node.Loc
 	n.BootID = node.GetBootID(ini.Logger)
 	if ini.IPsecConfig.Enabled() && n.BootID == "" {
 		return fmt.Errorf("IPSec requires a valid BootID")
+	}
+
+	for _, fn := range ini.ExtraInitFuncs {
+		if err := fn(ctx, n); err != nil {
+			return err
+		}
 	}
 
 	return nil

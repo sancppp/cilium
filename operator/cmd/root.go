@@ -40,6 +40,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/ciliumendpointslice"
 	"github.com/cilium/cilium/operator/pkg/ciliumenvoyconfig"
 	"github.com/cilium/cilium/operator/pkg/ciliumidentity"
+	"github.com/cilium/cilium/operator/pkg/ciliumpod"
 	"github.com/cilium/cilium/operator/pkg/client"
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
 	gatewayapi "github.com/cilium/cilium/operator/pkg/gateway-api"
@@ -52,7 +53,6 @@ import (
 	"github.com/cilium/cilium/operator/pkg/nodeipam"
 	"github.com/cilium/cilium/operator/pkg/secretsync"
 	"github.com/cilium/cilium/operator/pkg/ztunnel"
-	"github.com/cilium/cilium/operator/policyderivative"
 	"github.com/cilium/cilium/operator/unmanagedpods"
 	operatorWatchers "github.com/cilium/cilium/operator/watchers"
 	clustercfgcell "github.com/cilium/cilium/pkg/clustermesh/clustercfg/cell"
@@ -68,6 +68,7 @@ import (
 	"github.com/cilium/cilium/pkg/dial"
 	"github.com/cilium/cilium/pkg/gops"
 	"github.com/cilium/cilium/pkg/hive"
+	hiveHealth "github.com/cilium/cilium/pkg/hive/health"
 	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/k8s/apis"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -95,6 +96,13 @@ var (
 
 		// Runs the gops agent, a tool to diagnose Go processes.
 		gops.Cell(defaults.EnableGops, defaults.GopsPortOperator),
+
+		// Provides the 'health/history' command. The health history logs are stored
+		// in the state directory.
+		hiveHealth.HistoryCell,
+		cell.ProvidePrivate(func(cfg *option.DaemonConfig) hiveHealth.HistoryDir {
+			return hiveHealth.HistoryDir(filepath.Join(defaults.RuntimePath, defaults.StateDir))
+		}),
 
 		// Provides a Kubernetes client and ClientBuilderFunc that can be used by other cells to create a client.
 		client.Cell,
@@ -177,18 +185,6 @@ var (
 			return unmanagedpods.SharedConfig{
 				DisableCiliumEndpointCRD: daemonCfg.DisableCiliumEndpointCRD,
 				K8sEnabled:               clientset.IsEnabled(),
-			}
-		}),
-
-		cell.Provide(func(
-			daemonCfg *option.DaemonConfig,
-			clientset k8sClient.Clientset,
-		) policyderivative.SharedConfig {
-			return policyderivative.SharedConfig{
-				EnableCiliumNetworkPolicy:            daemonCfg.EnableCiliumNetworkPolicy,
-				EnableCiliumClusterwideNetworkPolicy: daemonCfg.EnableCiliumClusterwideNetworkPolicy,
-				ClusterName:                          daemonCfg.ClusterName,
-				K8sEnabled:                           clientset.IsEnabled(),
 			}
 		}),
 
@@ -299,17 +295,17 @@ var (
 		// that may have started before Cilium was ready.
 		unmanagedpods.Cell,
 
-		// Policy Derivative Watchers manage derivative policies for CNP and CCNP
-		// resources. They watch for policy CRD events and update policy-to-groups
-		// mappings periodically.
-		policyderivative.Cell,
-
 		// Cilium Endpoint Slice Garbage Collector. One-off GC that deletes all CES
 		// present in a cluster when CES feature is disabled.
 		endpointslicegc.Cell,
 
 		// Integrates the controller-runtime library and provides its components via Hive.
 		controllerruntime.Cell,
+
+		// Shared configuration identifying the Cilium agent pods in the cluster
+		// (namespace and label selector). Consumed by ingress, nodesgc and the
+		// node taint sync cell.
+		ciliumpod.Cell,
 
 		// Cilium Gateway API controller that manages the Gateway API related CRDs.
 		gatewayapi.Cell,
@@ -340,12 +336,8 @@ var (
 		// Cilium L7 LoadBalancing with Envoy.
 		ciliumenvoyconfig.Cell,
 
-		// Informational policy validation.
+		// All network policy functions
 		networkpolicy.Cell,
-
-		// Synchronizes Secrets referenced in CiliumNetworkPolicy to the configured secret
-		// namespace.
-		networkpolicy.SecretSyncCell,
 
 		// The feature Cell will retrieve information from all other cells /
 		// configuration to describe, in form of prometheus metrics, which
@@ -409,6 +401,8 @@ func Operator() cell.Cell {
 		"operator",
 		"Cilium Operator",
 
+		cell.Config(defaultLeaderElectionConfig),
+
 		Infrastructure,
 		ControlPlane,
 
@@ -454,6 +448,7 @@ func NewOperatorCmd(h *hive.Hive) *cobra.Command {
 	// Overwrite the metrics namespace with the one specific for the Operator
 	metrics.Namespace = metrics.CiliumOperatorNamespace
 
+	troubleshoot.DisableLocalNameLookup = true
 	cmd.AddCommand(
 		cmdref.NewCmd(cmd),
 		MetricsCmd,
@@ -479,12 +474,12 @@ func Execute(cmd *cobra.Command) {
 	}
 }
 
-func registerOperatorHooks(log *slog.Logger, lc cell.Lifecycle, llc *LeaderLifecycle, clientset k8sClient.Clientset, shutdowner hive.Shutdowner) {
+func registerOperatorHooks(log *slog.Logger, lc cell.Lifecycle, llc *LeaderLifecycle, clientset k8sClient.Clientset, shutdowner hive.Shutdowner, leCfg leaderElectionConfig) {
 	var wg sync.WaitGroup
 	lc.Append(cell.Hook{
 		OnStart: func(cell.HookContext) error {
 			wg.Go(func() {
-				runOperator(log, llc, clientset, shutdowner)
+				runOperator(log, llc, clientset, shutdowner, leCfg)
 			})
 			return nil
 		},
@@ -533,7 +528,7 @@ func doCleanup() {
 // runOperator implements the logic of leader election for cilium-operator using
 // built-in leader election capability in kubernetes.
 // See: https://github.com/kubernetes/client-go/blob/master/examples/leader-election/main.go
-func runOperator(log *slog.Logger, lc *LeaderLifecycle, clientset k8sClient.Clientset, shutdowner hive.Shutdowner) {
+func runOperator(log *slog.Logger, lc *LeaderLifecycle, clientset k8sClient.Clientset, shutdowner hive.Shutdowner, leCfg leaderElectionConfig) {
 	isLeader.Store(false)
 
 	leaderElectionCtx, leaderElectionCtxCancel = context.WithCancel(context.Background())
@@ -566,9 +561,9 @@ func runOperator(log *slog.Logger, lc *LeaderLifecycle, clientset k8sClient.Clie
 	// NewFromKubeconfig behavior. Users with high-latency control planes can
 	// override this with --leader-election-resource-lock-timeout.
 	rlConfig := *clientset.RestConfig()
-	rlTimeout := operatorOption.Config.LeaderElectionResourceLockTimeout
+	rlTimeout := leCfg.ResourceLockTimeout
 	if rlTimeout == 0 {
-		rlTimeout = max(time.Second, operatorOption.Config.LeaderElectionRenewDeadline/2)
+		rlTimeout = max(time.Second, leCfg.RenewDeadline/2)
 	}
 	rlConfig.Timeout = rlTimeout
 	leaderElectionClient := kubernetes.NewForConfigOrDie(rest.AddUserAgent(&rlConfig, "leader-election"))
@@ -595,9 +590,9 @@ func runOperator(log *slog.Logger, lc *LeaderLifecycle, clientset k8sClient.Clie
 		Lock:            leResourceLock,
 		ReleaseOnCancel: true,
 
-		LeaseDuration: operatorOption.Config.LeaderElectionLeaseDuration,
-		RenewDeadline: operatorOption.Config.LeaderElectionRenewDeadline,
-		RetryPeriod:   operatorOption.Config.LeaderElectionRetryPeriod,
+		LeaseDuration: leCfg.LeaseDuration,
+		RenewDeadline: leCfg.RenewDeadline,
+		RetryPeriod:   leCfg.RetryPeriod,
 
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {

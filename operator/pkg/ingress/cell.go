@@ -16,6 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	operatorOption "github.com/cilium/cilium/operator/option"
+	"github.com/cilium/cilium/operator/pkg/ciliumenvoyconfig"
+	"github.com/cilium/cilium/operator/pkg/ciliumpod"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	ingressTranslation "github.com/cilium/cilium/operator/pkg/model/translation/ingress"
 	"github.com/cilium/cilium/operator/pkg/secretsync"
@@ -44,6 +46,7 @@ var Cell = cell.Module(
 		IngressHostnetworkHTTPSListenerPort:          0,
 		IngressHostnetworkTLSPassthroughListenerPort: 0,
 		IngressHostnetworkNodelabelselector:          "",
+		IngressUseRemoteAddress:                      true,
 	}),
 	cell.Invoke(registerReconciler),
 	cell.Provide(registerSecretSync),
@@ -68,6 +71,7 @@ type IngressConfig struct {
 	IngressHostnetworkTLSPassthroughListenerPort uint32
 	IngressHostnetworkNodelabelselector          string
 	IngressDefaultXffNumTrustedHops              uint32
+	IngressUseRemoteAddress                      bool
 }
 
 func (r IngressConfig) Flags(flags *pflag.FlagSet) {
@@ -89,6 +93,7 @@ func (r IngressConfig) Flags(flags *pflag.FlagSet) {
 	flags.Uint32("ingress-hostnetwork-tls-passthrough-listener-port", r.IngressHostnetworkTLSPassthroughListenerPort, "Port on the host network that gets used for the shared TLS passthrough listener")
 	flags.String("ingress-hostnetwork-nodelabelselector", r.IngressHostnetworkNodelabelselector, "Label selector that matches the nodes where the ingress listeners should be exposed. It's a list of comma-separated key-value label pairs. e.g. 'kubernetes.io/os=linux,kubernetes.io/hostname=kind-worker'")
 	flags.Uint32("ingress-default-xff-num-trusted-hops", r.IngressDefaultXffNumTrustedHops, "The number of additional ingress proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.")
+	flags.Bool("ingress-use-remote-address", r.IngressUseRemoteAddress, "Use the immediate client's IP address as the origin client's IP address")
 }
 
 // IsEnabled returns true if the Ingress Controller is enabled.
@@ -104,6 +109,8 @@ type ingressParams struct {
 	AgentConfig        *option.DaemonConfig
 	OperatorConfig     *operatorOption.OperatorConfig
 	IngressConfig      IngressConfig
+	ProxyTimeouts      ciliumenvoyconfig.EnvoyProxyTimeouts
+	PodCfg             ciliumpod.Config
 }
 
 func registerReconciler(params ingressParams) error {
@@ -128,10 +135,10 @@ func registerReconciler(params ingressParams) error {
 		},
 		ListenerConfig: translation.ListenerConfig{
 			UseProxyProtocol:         params.IngressConfig.EnableIngressProxyProtocol,
-			StreamIdleTimeoutSeconds: params.OperatorConfig.ProxyStreamIdleTimeoutSeconds,
+			StreamIdleTimeoutSeconds: params.ProxyTimeouts.ProxyStreamIdleTimeoutSeconds,
 		},
 		ClusterConfig: translation.ClusterConfig{
-			IdleTimeoutSeconds: params.OperatorConfig.ProxyIdleTimeoutSeconds,
+			IdleTimeoutSeconds: params.ProxyTimeouts.ProxyIdleTimeoutSeconds,
 			UseAppProtocol:     false,
 		},
 		RouteConfig: translation.RouteConfig{
@@ -139,6 +146,7 @@ func registerReconciler(params ingressParams) error {
 		},
 		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
 			XFFNumTrustedHops: params.IngressConfig.IngressDefaultXffNumTrustedHops,
+			UseRemoteAddress:  params.IngressConfig.IngressUseRemoteAddress,
 		},
 	})
 
@@ -151,7 +159,7 @@ func registerReconciler(params ingressParams) error {
 		cecTranslator,
 		dedicatedIngressTranslator,
 
-		operatorOption.Config.CiliumK8sNamespace,
+		params.PodCfg.ResolveNamespace(params.AgentConfig.K8sNamespace),
 		params.IngressConfig.IngressLBAnnotationPrefixes,
 		params.IngressConfig.IngressSharedLBServiceName,
 		params.IngressConfig.IngressDefaultLBMode,

@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/gateway-api/indexers"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	gatewayApiTranslation "github.com/cilium/cilium/operator/pkg/model/translation/gateway-api"
@@ -54,10 +55,16 @@ func Test_gammaReconciler_Reconcile(t *testing.T) {
 		ClusterConfig: translation.ClusterConfig{
 			IdleTimeoutSeconds: 60,
 		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			UseRemoteAddress: true,
+		},
 	})
 	gatewayAPITranslator := gatewayApiTranslation.NewTranslator(cecTranslator, translation.Config{
 		ServiceConfig: translation.ServiceConfig{
 			ExternalTrafficPolicy: string(corev1.ServiceExternalTrafficPolicyCluster),
+		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			UseRemoteAddress: true,
 		},
 	})
 
@@ -90,7 +97,7 @@ func Test_gammaReconciler_Reconcile(t *testing.T) {
 					input := readInputDir(t, fmt.Sprintf("testdata/gamma/%s/input", tt.name))
 
 					c := fake.NewClientBuilder().
-						WithScheme(testScheme()).
+						WithScheme(helpers.TestScheme(helpers.AllOptionalKinds)).
 						WithObjects(append(base, input...)...).
 						WithIndex(&gatewayv1.HTTPRoute{}, indexers.GammaHTTPRouteParentRefsIndex, indexers.IndexHTTPRouteByGammaService).
 						WithIndex(&gatewayv1.GRPCRoute{}, indexers.GammaGRPCRouteParentRefsIndex, indexers.IndexGRPCRouteByGammaService).
@@ -100,9 +107,10 @@ func Test_gammaReconciler_Reconcile(t *testing.T) {
 						Build()
 
 					r := &gammaReconciler{
-						Client:     c,
-						translator: gatewayAPITranslator,
-						logger:     logger,
+						Client:         c,
+						translator:     gatewayAPITranslator,
+						logger:         logger,
+						controllerName: defaultControllerName,
 					}
 
 					// Reconcile all related HTTPRoute objects
@@ -119,7 +127,7 @@ func Test_gammaReconciler_Reconcile(t *testing.T) {
 
 					t.Logf("Test %s, HTTPRoutes: %d, GRPCRoutes: %d", tt.name, len(filterHTTPRouteList), len(filterGRPCRouteList))
 					result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: serviceKey})
-					require.Equal(t, tt.wantErr, err != nil, "Error mismatch")
+					require.Equal(t, tt.wantErr, err != nil, "Error mismatch, error was %s", err)
 					require.Equal(t, ctrl.Result{}, result)
 
 					// Checking the output for Service

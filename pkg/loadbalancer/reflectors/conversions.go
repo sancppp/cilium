@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
-	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -18,7 +17,6 @@ import (
 	"github.com/cilium/cilium/pkg/annotation"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container/cache"
-	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/k8s"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	k8sLabels "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
@@ -33,7 +31,19 @@ import (
 var (
 	zeroV4 = cmtypes.MustParseAddrCluster("0.0.0.0")
 	zeroV6 = cmtypes.MustParseAddrCluster("::")
+
+	ingressDummyAddress = cmtypes.MustParseAddrCluster("192.192.192.192")
+	ingressDummyPort    = uint16(9999)
 )
+
+func isIngressDummyEndpoint(l3n4Addr loadbalancer.L3n4Addr) bool {
+	// The ingress and gateway-api controllers (operator/pkg/model/translation/{gateway-api,ingress}) create
+	// a dummy endpoint to force Cilium to reconcile the service. This is no longer required with this new
+	// control-plane, but due to rolling upgrades we cannot remove it immediately. Hence we have the
+	// special handling here to just ignore this endpoint to avoid populating the tables with unnecessary
+	// data.
+	return l3n4Addr.AddrCluster() == ingressDummyAddress && l3n4Addr.Port() == ingressDummyPort
+}
 
 func getAnnotationServiceForwardingMode(cfg loadbalancer.Config, svc *slim_corev1.Service) (loadbalancer.SVCForwardingMode, error) {
 	if value, ok := annotation.Get(svc, annotation.ServiceForwardingMode); ok {
@@ -345,35 +355,43 @@ func convertService(cfg loadbalancer.Config, extCfg loadbalancer.ExternalConfig,
 }
 
 func getIPFamilies(svc *slim_corev1.Service) []slim_corev1.IPFamily {
-	if len(svc.Spec.IPFamilies) == 0 {
-		// No IP families specified, try to deduce them from the cluster IPs
-		if len(svc.Spec.ClusterIP) == 0 || svc.Spec.ClusterIP == slim_corev1.ClusterIPNone {
-			return nil
-		}
+	if len(svc.Spec.IPFamilies) > 0 {
+		return svc.Spec.IPFamilies
+	}
 
-		ipv4, ipv6 := false, false
-		if len(svc.Spec.ClusterIPs) > 0 {
-			for _, cip := range svc.Spec.ClusterIPs {
-				if ip.IsIPv6(net.ParseIP(cip)) {
+	// No IP families specified, try to deduce them from the cluster IPs
+	if len(svc.Spec.ClusterIP) == 0 || svc.Spec.ClusterIP == slim_corev1.ClusterIPNone {
+		return nil
+	}
+
+	ipv4, ipv6 := false, false
+	if len(svc.Spec.ClusterIPs) > 0 {
+		for _, cip := range svc.Spec.ClusterIPs {
+			if addr, err := netip.ParseAddr(cip); err == nil {
+				if addr.Is6() {
 					ipv6 = true
 				} else {
 					ipv4 = true
 				}
 			}
-		} else {
-			ipv6 = ip.IsIPv6(net.ParseIP(svc.Spec.ClusterIP))
-			ipv4 = !ipv6
 		}
-		families := make([]slim_corev1.IPFamily, 0, 2)
-		if ipv4 {
-			families = append(families, slim_corev1.IPv4Protocol)
+	} else {
+		if addr, err := netip.ParseAddr(svc.Spec.ClusterIP); err == nil {
+			if addr.Is6() {
+				ipv6 = true
+			} else {
+				ipv4 = true
+			}
 		}
-		if ipv6 {
-			families = append(families, slim_corev1.IPv4Protocol)
-		}
-		return families
 	}
-	return svc.Spec.IPFamilies
+	families := make([]slim_corev1.IPFamily, 0, 2)
+	if ipv4 {
+		families = append(families, slim_corev1.IPv4Protocol)
+	}
+	if ipv6 {
+		families = append(families, slim_corev1.IPv6Protocol)
+	}
+	return families
 }
 
 func convertEndpoints(rawlog *slog.Logger, cfg loadbalancer.ExternalConfig, svcName loadbalancer.ServiceName, bes iter.Seq2[cmtypes.AddrCluster, *k8s.Backend]) iter.Seq[loadbalancer.Backend] {
@@ -403,6 +421,9 @@ func convertEndpoints(rawlog *slog.Logger, cfg loadbalancer.ExternalConfig, svcN
 					l4Addr.Port,
 					loadbalancer.ScopeExternal,
 				)
+				if isIngressDummyEndpoint(l3n4Addr) {
+					continue
+				}
 
 				// Filter out the unnamed port, if present
 				if idx := slices.Index(portNames, ""); idx != -1 {
@@ -415,6 +436,8 @@ func convertEndpoints(rawlog *slog.Logger, cfg loadbalancer.ExternalConfig, svcN
 
 				var state loadbalancer.BackendState
 				switch {
+				case be.Maintenance:
+					state = loadbalancer.BackendStateMaintenance
 				case be.Conditions.IsReady():
 					// A backend that is ready (regardless of serving and terminating) is considered
 					// active. We may see backends that are ready+terminating if 'PublishNotReadyAddresses'
@@ -440,11 +463,15 @@ func convertEndpoints(rawlog *slog.Logger, cfg loadbalancer.ExternalConfig, svcN
 					// to existing connections when a backend readiness is flapping.
 					state = loadbalancer.BackendStateMaintenance
 				}
+				weight := be.Weight
+				if weight == 0 && !be.Maintenance {
+					weight = loadbalancer.DefaultBackendWeight
+				}
 				bep := loadbalancer.Backend{
 					Address:   l3n4Addr,
 					NodeName:  be.NodeName,
 					PortNames: portNames,
-					Weight:    loadbalancer.DefaultBackendWeight,
+					Weight:    weight,
 					State:     state,
 				}
 				if be.Zone != "" {

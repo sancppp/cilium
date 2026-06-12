@@ -108,7 +108,7 @@ func withProtocol(protocolVersion HTTPVersionType) ClusterMutator {
 	}
 }
 
-func withTLSOrigination(tls *model.BackendTLSOrigination) ClusterMutator {
+func withTLSOrigination(secretsNamespace string, tls *model.BackendTLSOrigination) ClusterMutator {
 	return func(cluster *envoy_config_cluster_v3.Cluster) *envoy_config_cluster_v3.Cluster {
 		// This mutator should not get added to the list if this is the case, but just to be safe.
 		if tls == nil {
@@ -127,6 +127,9 @@ func withTLSOrigination(tls *model.BackendTLSOrigination) ClusterMutator {
 		tlsContext := &envoy_config_tls.UpstreamTlsContext{
 			Sni: tls.SNI,
 			CommonTlsContext: &envoy_config_tls.CommonTlsContext{
+				TlsParams: &envoy_config_tls.TlsParameters{
+					TlsMaximumProtocolVersion: envoy_config_tls.TlsParameters_TLSv1_3,
+				},
 				ValidationContextType: &envoy_config_tls.CommonTlsContext_CombinedValidationContext{
 					CombinedValidationContext: &envoy_config_tls.CommonTlsContext_CombinedCertificateValidationContext{
 						DefaultValidationContext: &envoy_config_tls.CertificateValidationContext{},
@@ -139,11 +142,11 @@ func withTLSOrigination(tls *model.BackendTLSOrigination) ClusterMutator {
 							//
 							// * BackendTLSPolicy references ConfigMap
 							// * SecretSync sees ConfigMap reference
-							// * SecretSync copies ConfigMap into Secret in cilium-secrets namespace, using the below
+							// * SecretSync copies ConfigMap into Secret in the configured secrets namespace, using the below
 							//   naming format
 							// * This translation references that Secret
 							// * The Cilium Agent reads the Secret directly and suppies it to Envoy via SDS.
-							Name: "cilium-secrets" + "/" + tls.CACertRef.Namespace + "-cfgmap-" + tls.CACertRef.Name,
+							Name: secretsNamespace + "/" + tls.CACertRef.Namespace + "-cfgmap-" + tls.CACertRef.Name,
 						},
 					},
 				},

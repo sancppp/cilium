@@ -5,6 +5,8 @@ package ingress
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +31,7 @@ import (
 	ingressTranslation "github.com/cilium/cilium/operator/pkg/model/translation/ingress"
 	"github.com/cilium/cilium/pkg/envoy"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
 const (
@@ -42,6 +45,85 @@ const (
 	testDefaultStreamTimout             = 300
 	testIngressDefaultRequestTimeout    = time.Duration(0)
 )
+
+func TestReconcileDedicatedResourcesUseShortenedNames(t *testing.T) {
+	logger := hivetest.Logger(t)
+
+	cfg := translation.Config{
+		SecretsNamespace: testCiliumNamespace,
+		ListenerConfig: translation.ListenerConfig{
+			UseProxyProtocol:         testUseProxyProtocol,
+			StreamIdleTimeoutSeconds: testDefaultStreamTimout,
+		},
+		ClusterConfig: translation.ClusterConfig{
+			IdleTimeoutSeconds: testDefaultTimeout,
+		},
+	}
+
+	longIngressName := strings.Repeat("a", 52)
+	svcName := shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, longIngressName))
+	cecName := shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, "test", longIngressName))
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(
+			&networkingv1.Ingress{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      longIngressName,
+					Annotations: map[string]string{
+						"ingress.cilium.io/loadbalancer-mode": "dedicated",
+					},
+				},
+				Spec: networkingv1.IngressSpec{
+					IngressClassName: ptr.To("cilium"),
+					DefaultBackend:   defaultBackend(),
+				},
+			},
+		).
+		Build()
+
+	cecTranslator := translation.NewCECTranslator(cfg)
+	dedicatedIngressTranslator := ingressTranslation.NewDedicatedIngressTranslator(logger, cecTranslator, false)
+	reconciler := newIngressReconciler(logger, fakeClient, cecTranslator, dedicatedIngressTranslator, testCiliumNamespace, []string{}, testDefaultLoadbalancingServiceName, "dedicated", testDefaultSecretNamespace, testDefaultSecretName, false, testIngressDefaultRequestTimeout, false, 0, 0, 0, 0)
+
+	_, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "test", Name: longIngressName},
+	})
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(svcName), 63)
+	require.LessOrEqual(t, len(cecName), 63)
+
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: svcName}, &corev1.Service{})
+	require.NoError(t, err, "Dedicated loadbalancer service should exist with shortened name")
+
+	eps := discoveryv1.EndpointSlice{}
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: svcName}, &eps)
+	require.NoError(t, err, "Dedicated EndpointSlice should exist with shortened name")
+	require.Equal(t, svcName, eps.Labels[discoveryv1.LabelServiceName])
+
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: cecName}, &ciliumv2.CiliumEnvoyConfig{})
+	require.NoError(t, err, "Dedicated CiliumEnvoyConfig should exist with shortened name")
+
+	ing := &networkingv1.Ingress{}
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: longIngressName}, ing)
+	require.NoError(t, err)
+	ing.Spec.IngressClassName = ptr.To("other")
+	err = fakeClient.Update(t.Context(), ing)
+	require.NoError(t, err)
+
+	_, err = reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "test", Name: longIngressName},
+	})
+	require.NoError(t, err)
+
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: svcName}, &corev1.Service{})
+	require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated loadbalancer service should be cleaned up with shortened name")
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: svcName}, &discoveryv1.EndpointSlice{})
+	require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated EndpointSlice should be cleaned up with shortened name")
+	err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: cecName}, &ciliumv2.CiliumEnvoyConfig{})
+	require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated CiliumEnvoyConfig should be cleaned up with shortened name")
+}
 
 func TestReconcile(t *testing.T) {
 	logger := hivetest.Logger(t)
@@ -91,6 +173,11 @@ func TestReconcile(t *testing.T) {
 		svc := corev1.Service{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &svc)
 		require.NoError(t, err, "Dedicated loadbalancer service should exist")
+
+		eps := discoveryv1.EndpointSlice{}
+		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &eps)
+		require.NoError(t, err, "Dedicated loadbalancer service endpoints should exist")
+		require.Equal(t, "cilium-ingress-test", eps.Labels[discoveryv1.LabelServiceName])
 
 		cec := ciliumv2.CiliumEnvoyConfig{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &cec)
@@ -144,6 +231,10 @@ func TestReconcile(t *testing.T) {
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &svc)
 		require.NoError(t, err, "Dedicated loadbalancer service should exist")
 
+		eps := discoveryv1.EndpointSlice{}
+		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &eps)
+		require.NoError(t, err, "Dedicated loadbalancer service endpoints should exist")
+
 		cec := ciliumv2.CiliumEnvoyConfig{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &cec)
 		require.NoError(t, err, "Dedicated CiliumEnvoyConfig should exist")
@@ -196,7 +287,7 @@ func TestReconcile(t *testing.T) {
 		require.True(t, k8sApiErrors.IsNotFound(err), "Service should not be created")
 
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &discoveryv1.EndpointSlice{})
-		require.True(t, k8sApiErrors.IsNotFound(err), "EndpointSlice should not be created")
+		require.True(t, k8sApiErrors.IsNotFound(err), "Endpoints should not be created")
 
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &ciliumv2.CiliumEnvoyConfig{})
 		require.True(t, k8sApiErrors.IsNotFound(err), "CiliumEnvoyConfig should not be created")
@@ -317,7 +408,7 @@ func TestReconcile(t *testing.T) {
 
 		eps := discoveryv1.EndpointSlice{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &eps)
-		require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated loadbalancer EndpointSlice should not exist for shared Ingress")
+		require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated loadbalancer endpoints should not exist for shared Ingress")
 
 		cec := ciliumv2.CiliumEnvoyConfig{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &cec)
@@ -379,7 +470,7 @@ func TestReconcile(t *testing.T) {
 
 		eps := discoveryv1.EndpointSlice{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &eps)
-		require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated loadbalancer EndpointSlice should not exist at all")
+		require.NoError(t, err, "Dedicated loadbalancer service endpoints should exist")
 
 		cec := ciliumv2.CiliumEnvoyConfig{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &cec)
@@ -515,7 +606,7 @@ func TestReconcile(t *testing.T) {
 
 		eps := discoveryv1.EndpointSlice{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &eps)
-		require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated loadbalancer EndpointSlice should be cleaned up")
+		require.True(t, k8sApiErrors.IsNotFound(err), "Dedicated loadbalancer endpoints should be cleaned up")
 
 		cec := ciliumv2.CiliumEnvoyConfig{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &cec)
@@ -672,6 +763,65 @@ func TestReconcile(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, ingress.Status.LoadBalancer.Ingress, 1, "Loadbalancer status should contain the IP of the dedicated loadbalancer service")
 		require.Equal(t, "172.21.255.202", ingress.Status.LoadBalancer.Ingress[0].IP, "Loadbalancer status should contain the IP of the dedicated loadbalancer service")
+	})
+
+	t.Run("Reconcile of dedicated Cilium Ingress with long name will update the status according to the IP of the dedicated loadbalancer service using the shortened name", func(t *testing.T) {
+		longIngressName := strings.Repeat("a", 52)
+		svcName := shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, longIngressName))
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(testScheme()).
+			WithObjects(
+				&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      longIngressName,
+						Annotations: map[string]string{
+							"ingress.cilium.io/loadbalancer-mode": "dedicated",
+						},
+					},
+					Spec: networkingv1.IngressSpec{
+						IngressClassName: ptr.To("cilium"),
+						DefaultBackend:   defaultBackend(),
+					},
+				},
+				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      svcName,
+					},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{
+								{
+									IP: "172.21.255.203",
+								},
+							},
+						},
+					},
+				},
+			).
+			Build()
+
+		cecTranslator := translation.NewCECTranslator(cfg)
+		dedicatedIngressTranslator := ingressTranslation.NewDedicatedIngressTranslator(logger, cecTranslator, false)
+
+		reconciler := newIngressReconciler(logger, fakeClient, cecTranslator, dedicatedIngressTranslator, testCiliumNamespace, []string{}, testDefaultLoadbalancingServiceName, "dedicated", testDefaultSecretNamespace, testDefaultSecretName, false, testIngressDefaultRequestTimeout, false, 0, 0, 0, 0)
+
+		result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: "test",
+				Name:      longIngressName,
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+
+		ingress := networkingv1.Ingress{}
+		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: longIngressName}, &ingress)
+		require.NoError(t, err)
+		require.Len(t, ingress.Status.LoadBalancer.Ingress, 1, "Loadbalancer status should contain the IP of the dedicated loadbalancer service")
+		require.Equal(t, "172.21.255.203", ingress.Status.LoadBalancer.Ingress[0].IP, "Loadbalancer status should contain the IP of the dedicated loadbalancer service")
 	})
 
 	t.Run("Reconcile of shared Cilium Ingress will update the status according to the IP of the shared loadbalancer service", func(t *testing.T) {
@@ -848,6 +998,18 @@ func TestReconcile(t *testing.T) {
 						},
 					},
 				},
+				&discoveryv1.EndpointSlice{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "cilium-ingress-test",
+						Annotations: map[string]string{
+							"additional.annotation/test-annotation": "test",
+						},
+						Labels: map[string]string{
+							"additional.label/test-label": "test",
+						},
+					},
+				},
 				&ciliumv2.CiliumEnvoyConfig{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "test",
@@ -886,6 +1048,14 @@ func TestReconcile(t *testing.T) {
 
 		require.Contains(t, svc.Labels, "additional.label/test-label", "Existing labels should not be deleted")
 		require.Contains(t, svc.Annotations, "additional.annotation/test-annotation", "Existing annotations should not be deleted")
+
+		eps := discoveryv1.EndpointSlice{}
+		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &eps)
+		require.NoError(t, err)
+		require.Equal(t, "cilium-ingress-test", eps.Labels[discoveryv1.LabelServiceName])
+
+		require.Contains(t, eps.Labels, "additional.label/test-label", "Existing labels should not be deleted")
+		require.Contains(t, eps.Annotations, "additional.annotation/test-annotation", "Existing annotations should not be deleted")
 
 		cec := ciliumv2.CiliumEnvoyConfig{}
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &cec)
@@ -981,7 +1151,7 @@ func TestReconcile(t *testing.T) {
 		require.True(t, k8sApiErrors.IsNotFound(err), "Service should not be created")
 
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &discoveryv1.EndpointSlice{})
-		require.True(t, k8sApiErrors.IsNotFound(err), "EndpointSlice should not be created")
+		require.True(t, k8sApiErrors.IsNotFound(err), "Endpoints should not be created")
 
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &ciliumv2.CiliumEnvoyConfig{})
 		require.True(t, k8sApiErrors.IsNotFound(err), "CiliumEnvoyConfig should not be created")
@@ -1039,7 +1209,7 @@ func TestReconcile(t *testing.T) {
 		require.True(t, k8sApiErrors.IsNotFound(err), "Service should not be created")
 
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test"}, &discoveryv1.EndpointSlice{})
-		require.True(t, k8sApiErrors.IsNotFound(err), "EndpointSlice should not be created")
+		require.True(t, k8sApiErrors.IsNotFound(err), "Endpoints should not be created")
 
 		err = fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "cilium-ingress-test-test"}, &ciliumv2.CiliumEnvoyConfig{})
 		require.True(t, k8sApiErrors.IsNotFound(err), "CiliumEnvoyConfig should not be created")
@@ -1121,6 +1291,69 @@ func TestReconcile(t *testing.T) {
 		assert.Len(t, dedicatedIngressTranslator.model.HTTP, 1)
 		assert.Equal(t, uint32(55555), dedicatedIngressTranslator.model.HTTP[0].Port)
 	})
+
+	t.Run("Reconcile of dedicated TLS passthrough Ingress with a non-root path skips invalid rules without panicking", func(t *testing.T) {
+		pathType := networkingv1.PathTypePrefix
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(testScheme()).
+			WithObjects(
+				&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "test",
+						Annotations: map[string]string{
+							"ingress.cilium.io/loadbalancer-mode": "dedicated",
+							"ingress.cilium.io/tls-passthrough":   "true",
+						},
+					},
+					Spec: networkingv1.IngressSpec{
+						IngressClassName: ptr.To("cilium"),
+						Rules: []networkingv1.IngressRule{
+							{
+								Host: "example.com",
+								IngressRuleValue: networkingv1.IngressRuleValue{
+									HTTP: &networkingv1.HTTPIngressRuleValue{
+										Paths: []networkingv1.HTTPIngressPath{
+											{
+												Path:     "/api/webhook",
+												PathType: &pathType,
+												Backend: networkingv1.IngressBackend{
+													Service: &networkingv1.IngressServiceBackend{
+														Name: "test",
+														Port: networkingv1.ServiceBackendPort{
+															Number: 8080,
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			).
+			Build()
+
+		cecTranslator := &fakeCECTranslator{}
+		dedicatedIngressTranslator := &fakeDedicatedIngressTranslator{}
+
+		reconciler := newIngressReconciler(logger, fakeClient, cecTranslator, dedicatedIngressTranslator, testCiliumNamespace, []string{}, testDefaultLoadbalancingServiceName, "dedicated", testDefaultSecretNamespace, testDefaultSecretName, false, testIngressDefaultRequestTimeout, false, 0, 0, 0, 0)
+
+		result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: "test",
+				Name:      "test",
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+
+		assert.Empty(t, dedicatedIngressTranslator.model.TLSPassthrough)
+		assert.Empty(t, dedicatedIngressTranslator.model.HTTP)
+	})
 }
 
 var _ translation.CECTranslator = &fakeCECTranslator{}
@@ -1144,11 +1377,12 @@ type fakeDedicatedIngressTranslator struct {
 	model *model.Model
 }
 
-func (r *fakeDedicatedIngressTranslator) Translate(model *model.Model) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, error) {
+func (r *fakeDedicatedIngressTranslator) Translate(model *model.Model) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, []*discoveryv1.EndpointSlice, error) {
 	r.model = model
 
 	return &ciliumv2.CiliumEnvoyConfig{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "test"}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "test"}},
+		[]*discoveryv1.EndpointSlice{{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "test"}}},
 		nil
 }
 

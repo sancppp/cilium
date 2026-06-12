@@ -5,11 +5,15 @@ package iptables
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
+
+	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
 type expectation struct {
@@ -1106,14 +1110,14 @@ func TestEncryptionRules(t *testing.T) {
 		haveBPFSocketAssign:  false,
 		ipEarlyDemuxDisabled: false,
 		sharedCfg: SharedConfig{
-			EnableIPv4:      true,
-			EnableIPv6:      true,
-			EnableWireguard: true,
+			EnableIPv4:  true,
+			EnableIPv6:  true,
+			EnableIPSec: true,
 		},
 		ip4tables: mockIp4tables,
 		ip6tables: mockIp6tables,
 	}
-	t.Run("test adding iptables rules for wireguard encryption", func(t *testing.T) {
+	t.Run("test adding iptables rules for ipsec encryption", func(t *testing.T) {
 
 		mockIp4tables.expectations = []expectation{
 			{args: "-t filter -A CILIUM_INPUT -m mark --mark 0x00000e00/0x00000f00 -m comment --comment exclude encrypt/decrypt marks from filter CILIUM_INPUT chain -j ACCEPT"},
@@ -1160,6 +1164,39 @@ func TestEncryptionRules(t *testing.T) {
 		}
 
 		assert.NoError(t, testMgr.addCiliumNoTrackEncryptionRules())
+		assert.NoError(t, mockIp4tables.checkExpectations())
+		assert.NoError(t, mockIp6tables.checkExpectations())
+	})
+
+	t.Run("test adding iptables rules for wireguard encryption", func(t *testing.T) {
+		testMgr.sharedCfg = SharedConfig{
+			EnableIPv4:      true,
+			EnableIPv6:      true,
+			EnableWireguard: true,
+		}
+
+		port := wgTypes.ListenPort
+		expected := "%s -A %s -p udp --dport %d -m comment --comment %s"
+
+		mockIp4tables.expectations = []expectation{
+			{args: fmt.Sprintf(expected, "-t raw", "CILIUM_PRE_raw", port, "cilium: NOTRACK for wireguard traffic -j CT --notrack")},
+			{args: fmt.Sprintf(expected, "-t raw", "CILIUM_OUTPUT_raw", port, "cilium: NOTRACK for wireguard traffic -j CT --notrack")},
+		}
+
+		mockIp6tables.expectations = mockIp4tables.expectations
+
+		assert.NoError(t, testMgr.addCiliumNoTrackEncryptionRules())
+		assert.NoError(t, mockIp4tables.checkExpectations())
+		assert.NoError(t, mockIp6tables.checkExpectations())
+
+		mockIp4tables.expectations = []expectation{
+			{args: fmt.Sprintf(expected, "-t filter", "CILIUM_OUTPUT", port, "cilium: ACCEPT for wireguard traffic -j ACCEPT")},
+			{args: fmt.Sprintf(expected, "-t filter", "CILIUM_INPUT", port, "cilium: ACCEPT for wireguard traffic -j ACCEPT")},
+		}
+
+		mockIp6tables.expectations = mockIp4tables.expectations
+
+		assert.NoError(t, testMgr.addCiliumAcceptEncryptionRules())
 		assert.NoError(t, mockIp4tables.checkExpectations())
 		assert.NoError(t, mockIp6tables.checkExpectations())
 	})
@@ -1230,4 +1267,37 @@ func TestAllEgressMasqueradeCmdsRandomFully(t *testing.T) {
 		assert.Contains(t, cmd, "--random-fully",
 			"Expected --random-fully when enabled with multiple interfaces")
 	}
+}
+
+func TestInstallMasqueradeRouteSourceRules(t *testing.T) {
+	routes := []netlink.Route{
+		{Dst: mustParseCIDR("0.0.0.0/0"), Src: net.ParseIP("198.18.4.4"), LinkIndex: 0, Family: 2},
+		{Dst: mustParseCIDR("10.0.0.0/16"), Src: net.ParseIP("10.0.0.1"), LinkIndex: 5, Family: 2},
+		{Dst: mustParseCIDR("10.0.1.0/24"), Src: net.ParseIP("10.0.1.1"), LinkIndex: 5, Family: 2},
+	}
+
+	mockProg := &mockIptables{t: t, prog: "iptables", expectations: []expectation{
+		{args: "-t nat -A CILIUM_POST_nat -s 11.0.0.0/24 -d 10.0.1.0/24 -o eth0 -m comment --comment cilium snat non-cluster via source route -j SNAT --to-source 10.0.1.1"},
+		{args: "-t nat -A CILIUM_POST_nat -s 11.0.0.0/24 -d 10.0.0.0/16 -o eth0 -m comment --comment cilium snat non-cluster via source route -j SNAT --to-source 10.0.0.1"},
+		{args: "-t nat -A CILIUM_POST_nat -s 11.0.0.0/24 ! -d 11.0.0.0/24 ! -o cilium_+ -m comment --comment cilium snat non-cluster via source route -j SNAT --to-source 198.18.4.4"},
+	}}
+
+	linkByIndex := func(index int) (netlink.Link, error) {
+		return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth0", Index: 5}}, nil
+	}
+
+	mgr := &manager{}
+	err := mgr.installMasqueradeRouteSourceRules(
+		mockProg, routes, linkByIndex,
+		[]string{"eth0"}, "11.0.0.0/24", "11.0.0.0/24",
+	)
+	require.NoError(t, err)
+	require.NoError(t, mockProg.checkExpectations())
+}
+func mustParseCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
 }

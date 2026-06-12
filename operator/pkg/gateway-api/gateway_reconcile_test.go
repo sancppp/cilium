@@ -14,7 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/testing/protocmp"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -28,6 +30,8 @@ import (
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	gatewayApiTranslation "github.com/cilium/cilium/operator/pkg/model/translation/gateway-api"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
 var (
@@ -47,17 +51,30 @@ var (
 	}
 	tlsRouteTypeMeta = metav1.TypeMeta{
 		Kind:       "TLSRoute",
-		APIVersion: gatewayv1alpha2APIVersion,
+		APIVersion: gatewayv1APIVersion,
 	}
 	backendTLSPolicyTypeMeta = metav1.TypeMeta{
 		Kind:       "BackendTLSPolicy",
 		APIVersion: gatewayv1APIVersion,
+	}
+	tcpRouteTypeMeta = metav1.TypeMeta{
+		Kind:       "TCPRoute",
+		APIVersion: gatewayv1alpha2APIVersion,
+	}
+	udpRouteTypeMeta = metav1.TypeMeta{
+		Kind:       "UDPRoute",
+		APIVersion: gatewayv1alpha2APIVersion,
+	}
+	endpointSliceTypeMeta = metav1.TypeMeta{
+		Kind:       "EndpointSlice",
+		APIVersion: discoveryv1.SchemeGroupVersion.String(),
 	}
 )
 
 func Test_Conformance(t *testing.T) {
 	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 	cecTranslator := translation.NewCECTranslator(translation.Config{
+		SecretsNamespace: "cilium-secrets",
 		RouteConfig: translation.RouteConfig{
 			HostNameSuffixMatch: true,
 		},
@@ -67,16 +84,23 @@ func Test_Conformance(t *testing.T) {
 		ClusterConfig: translation.ClusterConfig{
 			IdleTimeoutSeconds: 60,
 		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			UseRemoteAddress: true,
+		},
 	})
 	gatewayAPITranslator := gatewayApiTranslation.NewTranslator(cecTranslator, translation.Config{
 		ServiceConfig: translation.ServiceConfig{
 			ExternalTrafficPolicy: string(corev1.ServiceExternalTrafficPolicyCluster),
+		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			UseRemoteAddress: true,
 		},
 	})
 
 	type gwDetails struct {
 		FullName types.NamespacedName
 		wantErr  bool
+		skipCEC  bool
 	}
 
 	var (
@@ -89,6 +113,8 @@ func Test_Conformance(t *testing.T) {
 		name                 string
 		gateway              []gwDetails
 		disableServiceImport bool
+		disableTCPRoute      bool
+		disableUDPRoute      bool
 		wantErr              bool
 	}{
 		{
@@ -105,7 +131,7 @@ func Test_Conformance(t *testing.T) {
 		{
 			name: "gateway-invalid-route-kind",
 			gateway: []gwDetails{
-				{FullName: types.NamespacedName{Name: "gateway-only-invalid-route-kind", Namespace: "gateway-conformance-infra"}, wantErr: true},
+				{FullName: types.NamespacedName{Name: "gateway-only-invalid-route-kind", Namespace: "gateway-conformance-infra"}},
 				{FullName: types.NamespacedName{Name: "gateway-supported-and-invalid-route-kind", Namespace: "gateway-conformance-infra"}},
 			},
 		},
@@ -199,7 +225,12 @@ func Test_Conformance(t *testing.T) {
 		{name: "grpcroute-listener-hostname-matching", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "grpcroute-listener-hostname-matching", Namespace: "gateway-conformance-infra"}}}},
 		{name: "httproute-backend-protocol-h2c", gateway: []gwDetails{gatewaySameNamespace}},
 		{name: "httproute-backend-protocol-websocket", gateway: []gwDetails{gatewaySameNamespace}},
+		{name: "httproute-cors", gateway: []gwDetails{gatewaySameNamespace}},
 		{name: "httproute-cross-namespace", gateway: []gwDetails{gatewayBackendNamespace}},
+		{
+			name:    "httproute-allowed-kind-by-section-name",
+			gateway: []gwDetails{{FullName: types.NamespacedName{Name: "kind-restricted-multi-listener", Namespace: "gateway-conformance-infra"}}},
+		},
 		{
 			name:    "httproute-disallowed-kind",
 			gateway: []gwDetails{{FullName: types.NamespacedName{Name: "tlsroutes-only", Namespace: "gateway-conformance-infra"}}},
@@ -268,6 +299,18 @@ func Test_Conformance(t *testing.T) {
 		{name: "httproute-backendtlspolicy-conflict-resolution", gateway: []gwDetails{gatewaySameNamespace}},
 		{name: "httproute-backendtlspolicy-invalid-ca-cert", gateway: []gwDetails{gatewaySameNamespace}},
 		{name: "httproute-backendtlspolicy-invalid-kind", gateway: []gwDetails{gatewaySameNamespace}},
+		{name: "gateway-multi-port-https", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "multi-port-https", Namespace: "gateway-conformance-infra"}}}},
+		{name: "tcproute-invalid-reference-grant", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-tcproute-referencegrant", Namespace: "gateway-conformance-infra"}, skipCEC: true}}},
+		{name: "tcproute-simple-same-namespace", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-tcproute", Namespace: "gateway-conformance-infra"}, skipCEC: true}}},
+		{name: "udproute-invalid-reference-grant", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-udproute-referencegrant", Namespace: "gateway-conformance-infra"}, skipCEC: true}}},
+		{name: "udproute-simple-same-namespace", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-udproute", Namespace: "gateway-conformance-infra"}, skipCEC: true}}},
+		// A single Gateway mixing an L7 (HTTP) and an L4 (TCP) listener: the
+		// L7 path produces a CiliumEnvoyConfig while the L4 path produces a
+		// managed EndpointSlice for the TCP backend (no dummy slice is added
+		// because a real L4 slice already exists).
+		{name: "gateway-mixed-http-tcp", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-mixed", Namespace: "gateway-conformance-infra"}}}},
+		{name: "tcproute-crd-not-installed", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-tcproute", Namespace: "gateway-conformance-infra"}, skipCEC: true}}, disableTCPRoute: true},
+		{name: "udproute-crd-not-installed", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-udproute", Namespace: "gateway-conformance-infra"}, skipCEC: true}}, disableUDPRoute: true},
 		{name: "tlsroute-invalid-reference-grant", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-tlsroute-referencegrant", Namespace: "gateway-conformance-infra"}}}},
 		{name: "tlsroute-simple-same-namespace", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "gateway-tlsroute", Namespace: "gateway-conformance-infra"}}}},
 		{name: "tlsroute-hostname-intersection", gateway: []gwDetails{
@@ -281,6 +324,14 @@ func Test_Conformance(t *testing.T) {
 			{FullName: types.NamespacedName{Name: "gateway-tlsroute-https-only", Namespace: "gateway-conformance-infra"}, wantErr: false},
 			{FullName: types.NamespacedName{Name: "gateway-tlsroute-tls-passthrough-only", Namespace: "gateway-conformance-infra"}, wantErr: false},
 		}},
+		{name: "tlsroute-mixed-protocol-listeners", gateway: []gwDetails{
+			{FullName: types.NamespacedName{Name: "gateway-tlsroute-mixed", Namespace: "gateway-conformance-infra"}},
+		}},
+		{name: "gateway-multi-port-tls-passthrough", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "multi-port-tls-passthrough", Namespace: "gateway-conformance-infra"}}}},
+		{name: "gateway-multi-port-https-with-multi-port-tls-passthrough", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "multi-port-https-with-multi-port-tls-passthrough", Namespace: "gateway-conformance-infra"}}}},
+		{name: "gateway-cross-protocol-same-hostname", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "cross-protocol-same-hostname", Namespace: "gateway-conformance-infra"}}}},
+		{name: "gateway-cross-protocol-same-port-same-hostname", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "cross-protocol-same-port-same-hostname", Namespace: "gateway-conformance-infra"}, wantErr: true}}},
+		{name: "gateway-ns-restricted-same-hostname", gateway: []gwDetails{{FullName: types.NamespacedName{Name: "ns-restricted-same-hostname", Namespace: "gateway-conformance-infra"}}}},
 	}
 
 	for _, tt := range tests {
@@ -294,30 +345,48 @@ func Test_Conformance(t *testing.T) {
 				WithStatusSubresource(&corev1.Namespace{}).
 				WithStatusSubresource(&gatewayv1.GRPCRoute{}).
 				WithStatusSubresource(&gatewayv1.HTTPRoute{}).
-				WithStatusSubresource(&gatewayv1alpha2.TLSRoute{}).
+				WithStatusSubresource(&gatewayv1.TLSRoute{}).
 				WithStatusSubresource(&gatewayv1.Gateway{}).
 				WithStatusSubresource(&gatewayv1.GatewayClass{}).
 				WithStatusSubresource(&gatewayv1.BackendTLSPolicy{})
 
-			switch tt.disableServiceImport {
-			case true:
-				clientBuilder.WithScheme(testSchemeNoServiceImport())
-			case false:
-				clientBuilder.WithScheme(testScheme())
+			disabledKinds := map[string]bool{
+				helpers.ServiceImportKind: tt.disableServiceImport,
+				helpers.TCPRouteKind:      tt.disableTCPRoute,
+				helpers.UDPRouteKind:      tt.disableUDPRoute,
 			}
+			optionalKinds := make([]schema.GroupVersionKind, 0, len(helpers.AllOptionalKinds))
+			for _, k := range helpers.AllOptionalKinds {
+				if disabledKinds[k.Kind] {
+					continue
+				}
+				optionalKinds = append(optionalKinds, k)
+			}
+			clientBuilder.WithScheme(helpers.TestScheme(optionalKinds))
 
 			// Add any required indexes here
 			clientBuilder.WithIndex(&gatewayv1.HTTPRoute{}, indexers.GatewayHTTPRouteIndex, indexers.IndexHTTPRouteByGateway)
 			clientBuilder.WithIndex(&gatewayv1.HTTPRoute{}, indexers.BackendServiceHTTPRouteIndex, fakeIndexHTTPRouteByBackendService)
 			clientBuilder.WithIndex(&gatewayv1.GRPCRoute{}, indexers.GatewayGRPCRouteIndex, indexers.IndexGRPCRouteByGateway)
-			clientBuilder.WithIndex(&gatewayv1alpha2.TLSRoute{}, indexers.GatewayTLSRouteIndex, indexers.IndexTLSRouteByGateway)
+			clientBuilder.WithIndex(&gatewayv1.TLSRoute{}, indexers.GatewayTLSRouteIndex, indexers.IndexTLSRouteByGateway)
+			// TCPRoute/UDPRoute types are only registered in the scheme when their
+			// CRDs are installed, so only set their status subresource and index then.
+			if !tt.disableTCPRoute {
+				clientBuilder.WithStatusSubresource(&gatewayv1alpha2.TCPRoute{})
+				clientBuilder.WithIndex(&gatewayv1alpha2.TCPRoute{}, indexers.GatewayTCPRouteIndex, indexers.IndexTCPRouteByGateway)
+			}
+			if !tt.disableUDPRoute {
+				clientBuilder.WithStatusSubresource(&gatewayv1alpha2.UDPRoute{})
+				clientBuilder.WithIndex(&gatewayv1alpha2.UDPRoute{}, indexers.GatewayUDPRouteIndex, indexers.IndexUDPRouteByGateway)
+			}
 
 			c := clientBuilder.Build()
 
 			r := &gatewayReconciler{
-				Client:     c,
-				translator: gatewayAPITranslator,
-				logger:     logger,
+				Client:         c,
+				translator:     gatewayAPITranslator,
+				logger:         logger,
+				controllerName: defaultControllerName,
 			}
 
 			// Reconcile all related HTTPRoute objects
@@ -326,7 +395,7 @@ func Test_Conformance(t *testing.T) {
 			require.NoError(t, err)
 
 			// Reconcile all related TLSRoute objects
-			tlsrList := &gatewayv1alpha2.TLSRouteList{}
+			tlsrList := &gatewayv1.TLSRouteList{}
 			err = c.List(t.Context(), tlsrList)
 			require.NoError(t, err)
 
@@ -339,6 +408,20 @@ func Test_Conformance(t *testing.T) {
 			btlspList := &gatewayv1.BackendTLSPolicyList{}
 			err = c.List(t.Context(), btlspList)
 			require.NoError(t, err)
+
+			// Reconcile all TCPRoute objects
+			tcprList := &gatewayv1alpha2.TCPRouteList{}
+			if !tt.disableTCPRoute {
+				err = c.List(t.Context(), tcprList)
+				require.NoError(t, err)
+			}
+
+			// Reconcile all UDPRoute objects
+			udprList := &gatewayv1alpha2.UDPRouteList{}
+			if !tt.disableUDPRoute {
+				err = c.List(t.Context(), udprList)
+				require.NoError(t, err)
+			}
 
 			for _, gwDetail := range tt.gateway {
 				// Reconcile the gateway under test
@@ -355,10 +438,13 @@ func Test_Conformance(t *testing.T) {
 				expectedGateway := &gatewayv1.Gateway{}
 				readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/%s.yaml", tt.name, gwDetail.FullName.Name), expectedGateway)
 				require.Empty(t, cmp.Diff(expectedGateway, actualGateway, cmpIgnoreFields...))
-				if !gwDetail.wantErr {
+				if !gwDetail.wantErr && !gwDetail.skipCEC {
 					// Checking the output for CiliumEnvoyConfig
 					actualCEC := &ciliumv2.CiliumEnvoyConfig{}
-					err = c.Get(t.Context(), client.ObjectKey{Namespace: gwDetail.FullName.Namespace, Name: "cilium-gateway-" + gwDetail.FullName.Name}, actualCEC)
+					err = c.Get(t.Context(), client.ObjectKey{
+						Namespace: gwDetail.FullName.Namespace,
+						Name:      shortener.ShortenK8sResourceName(gatewayApiTranslation.CiliumGatewayPrefix + gwDetail.FullName.Name),
+					}, actualCEC)
 					require.NoError(t, err, "Could not get CiliumEnvoyConfig and wasn't expecting a reconciliation error")
 					expectedCEC := &ciliumv2.CiliumEnvoyConfig{}
 					readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/cec-%s.yaml", tt.name, gwDetail.FullName.Name), expectedCEC)
@@ -367,6 +453,23 @@ func Test_Conformance(t *testing.T) {
 				}
 
 			}
+
+			// Checking the output for EndpointSlices
+			epsList := &discoveryv1.EndpointSliceList{}
+			err = c.List(t.Context(), epsList, client.MatchingLabels{
+				gatewayApiTranslation.EndpointSliceManagedByLabel: gatewayApiTranslation.EndpointSliceManagedByValue,
+			})
+			require.NoError(t, err)
+			for _, eps := range epsList.Items {
+				actualEPS := &discoveryv1.EndpointSlice{}
+				err = c.Get(t.Context(), client.ObjectKeyFromObject(&eps), actualEPS)
+				actualEPS.TypeMeta = endpointSliceTypeMeta
+				require.NoError(t, err, "error getting EndpointSlice %s/%s: %v", eps.Namespace, eps.Name, err)
+				expectedEPS := &discoveryv1.EndpointSlice{}
+				readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/endpointslice-%s.yaml", tt.name, eps.Name), expectedEPS)
+				require.Empty(t, cmp.Diff(expectedEPS, actualEPS, cmpIgnoreFields...))
+			}
+
 			// Checking the output for related HTTPRoute objects
 			for _, hr := range hrList.Items {
 				actualHR := &gatewayv1.HTTPRoute{}
@@ -381,11 +484,11 @@ func Test_Conformance(t *testing.T) {
 			}
 
 			for _, tlsr := range tlsrList.Items {
-				actualTLSR := &gatewayv1alpha2.TLSRoute{}
+				actualTLSR := &gatewayv1.TLSRoute{}
 				err = c.Get(t.Context(), client.ObjectKeyFromObject(&tlsr), actualTLSR)
 				actualTLSR.TypeMeta = tlsRouteTypeMeta
 				require.NoError(t, err, "error getting TLSRoute %s/%s: %v", tlsr.Namespace, tlsr.Name, err)
-				expectedTLSR := &gatewayv1alpha2.TLSRoute{}
+				expectedTLSR := &gatewayv1.TLSRoute{}
 				readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/tlsroute-%s.yaml", tt.name, tlsr.Name), expectedTLSR)
 				require.Empty(t, cmp.Diff(expectedTLSR, actualTLSR, cmpIgnoreFields...))
 			}
@@ -409,8 +512,280 @@ func Test_Conformance(t *testing.T) {
 				readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/backendtlspolicy-%s.yaml", tt.name, btlsp.Name), expectedBTLSP)
 				require.Empty(t, cmp.Diff(expectedBTLSP, actualBTLSP, cmpIgnoreFields...))
 			}
+
+			for _, tcpr := range tcprList.Items {
+				actualTCPR := &gatewayv1alpha2.TCPRoute{}
+				err = c.Get(t.Context(), client.ObjectKeyFromObject(&tcpr), actualTCPR)
+				actualTCPR.TypeMeta = tcpRouteTypeMeta
+				require.NoError(t, err, "error getting TCPRoute %s/%s: %v", tcpr.Namespace, tcpr.Name, err)
+				expectedTCPR := &gatewayv1alpha2.TCPRoute{}
+				readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/tcproute-%s.yaml", tt.name, tcpr.Name), expectedTCPR)
+				require.Empty(t, cmp.Diff(expectedTCPR, actualTCPR, cmpIgnoreFields...))
+			}
+
+			for _, udpr := range udprList.Items {
+				actualUDPR := &gatewayv1alpha2.UDPRoute{}
+				err = c.Get(t.Context(), client.ObjectKeyFromObject(&udpr), actualUDPR)
+				actualUDPR.TypeMeta = udpRouteTypeMeta
+				require.NoError(t, err, "error getting UDPRoute %s/%s: %v", udpr.Namespace, udpr.Name, err)
+				expectedUDPR := &gatewayv1alpha2.UDPRoute{}
+				readOutput(t, fmt.Sprintf("testdata/gateway/%s/output/udproute-%s.yaml", tt.name, udpr.Name), expectedUDPR)
+				require.Empty(t, cmp.Diff(expectedUDPR, actualUDPR, cmpIgnoreFields...))
+			}
 		})
 	}
+}
+
+func Test_grpcWebTranslationEnabled(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *v2alpha1.CiliumGatewayClassConfig
+		want   bool
+	}{
+		{
+			name: "nil config",
+			want: true,
+		},
+		{
+			name:   "empty config",
+			config: &v2alpha1.CiliumGatewayClassConfig{},
+			want:   true,
+		},
+		{
+			name: "nil enabled",
+			config: &v2alpha1.CiliumGatewayClassConfig{
+				Spec: v2alpha1.CiliumGatewayClassConfigSpec{
+					HTTPOptions: &v2alpha1.HTTPOptions{
+						GRPCWebTranslation: &v2alpha1.GRPCWebTranslationConfig{},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "explicitly enabled",
+			config: &v2alpha1.CiliumGatewayClassConfig{
+				Spec: v2alpha1.CiliumGatewayClassConfigSpec{
+					HTTPOptions: &v2alpha1.HTTPOptions{
+						GRPCWebTranslation: &v2alpha1.GRPCWebTranslationConfig{
+							Enabled: ptr.To(true),
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "disabled",
+			config: &v2alpha1.CiliumGatewayClassConfig{
+				Spec: v2alpha1.CiliumGatewayClassConfigSpec{
+					HTTPOptions: &v2alpha1.HTTPOptions{
+						GRPCWebTranslation: &v2alpha1.GRPCWebTranslationConfig{
+							Enabled: ptr.To(false),
+						},
+					},
+				},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.config.GRPCWebTranslationEnabled())
+		})
+	}
+}
+
+func Test_gatewayReconciler_Reconcile_cleansUpResourcesOnHandoff(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		gatewayClass string
+		objects      []client.Object
+	}{
+		{
+			name:         "gatewayclass missing",
+			gatewayClass: "missing",
+		},
+		{
+			name:         "gatewayclass controller no longer matches",
+			gatewayClass: "other",
+			objects: []client.Object{
+				&gatewayv1.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "other"},
+					Spec: gatewayv1.GatewayClassSpec{
+						ControllerName: "example.com/other-controller",
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "handoff-gateway",
+					Namespace: "default",
+					UID:       types.UID("gateway-uid"),
+				},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: gatewayv1.ObjectName(tc.gatewayClass),
+				},
+			}
+
+			serviceName := shortener.ShortenK8sResourceName(gatewayApiTranslation.CiliumGatewayPrefix + gw.Name)
+			shortGatewayName := shortener.ShortenK8sResourceName(gw.Name)
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName,
+					Namespace: gw.Namespace,
+					Labels: map[string]string{
+						owningGatewayLabel:                       shortGatewayName,
+						"gateway.networking.k8s.io/gateway-name": shortGatewayName,
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: gatewayv1.GroupVersion.String(),
+							Kind:       "Gateway",
+							Name:       gw.Name,
+							UID:        gw.UID,
+							Controller: ptr.To(true),
+						},
+					},
+				},
+			}
+			cec := &ciliumv2.CiliumEnvoyConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      shortener.ShortenK8sResourceName(gatewayApiTranslation.CiliumGatewayPrefix + gw.Name),
+					Namespace: gw.Namespace,
+					Labels: map[string]string{
+						"gateway.networking.k8s.io/gateway-name": shortGatewayName,
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: gatewayv1.GroupVersion.String(),
+							Kind:       "Gateway",
+							Name:       gw.Name,
+							UID:        gw.UID,
+							Controller: ptr.To(true),
+						},
+					},
+				},
+			}
+
+			objects := append([]client.Object{gw, svc, cec}, tc.objects...)
+			c := fake.NewClientBuilder().
+				WithScheme(helpers.TestScheme(helpers.AllOptionalKinds)).
+				WithObjects(objects...).
+				Build()
+
+			r := &gatewayReconciler{
+				Client:         c,
+				logger:         hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug)),
+				controllerName: defaultControllerName,
+			}
+
+			result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(gw)})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+
+			err = c.Get(t.Context(), client.ObjectKeyFromObject(svc), &corev1.Service{})
+			require.ErrorContains(t, err, "not found")
+
+			err = c.Get(t.Context(), client.ObjectKeyFromObject(cec), &ciliumv2.CiliumEnvoyConfig{})
+			require.ErrorContains(t, err, "not found")
+
+			actualGateway := &gatewayv1.Gateway{}
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(gw), actualGateway))
+		})
+	}
+}
+
+// Test_gatewayReconciler_ensureEnvoyConfig_deletesStaleCEC verifies that a
+// CiliumEnvoyConfig left over from a previous HTTP/TLS state is cleaned up when
+// the Gateway no longer needs Envoy (e.g. it switches to pure L4 TCP/UDP
+// Routes, so the translator returns a nil desired CEC).
+func Test_gatewayReconciler_ensureEnvoyConfig_deletesStaleCEC(t *testing.T) {
+	t.Parallel()
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "l4-gateway",
+			Namespace: "default",
+			UID:       types.UID("gateway-uid"),
+		},
+	}
+
+	cecKey := types.NamespacedName{
+		Namespace: gw.Namespace,
+		Name:      shortener.ShortenK8sResourceName(gatewayApiTranslation.CiliumGatewayPrefix + gw.Name),
+	}
+
+	ownedCEC := func() *ciliumv2.CiliumEnvoyConfig {
+		return &ciliumv2.CiliumEnvoyConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cecKey.Name,
+				Namespace: cecKey.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: gatewayv1.GroupVersion.String(),
+						Kind:       "Gateway",
+						Name:       gw.Name,
+						UID:        gw.UID,
+						Controller: ptr.To(true),
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("deletes owned stale CEC when desired is nil", func(t *testing.T) {
+		c := fake.NewClientBuilder().
+			WithScheme(helpers.TestScheme(helpers.AllOptionalKinds)).
+			WithObjects(gw, ownedCEC()).
+			Build()
+		r := &gatewayReconciler{
+			Client: c,
+			logger: hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug)),
+		}
+
+		require.NoError(t, r.ensureEnvoyConfig(t.Context(), gw, nil))
+
+		err := c.Get(t.Context(), cecKey, &ciliumv2.CiliumEnvoyConfig{})
+		require.ErrorContains(t, err, "not found")
+	})
+
+	t.Run("keeps CEC not owned by the Gateway", func(t *testing.T) {
+		foreign := ownedCEC()
+		foreign.OwnerReferences[0].UID = types.UID("other-uid")
+		foreign.OwnerReferences[0].Name = "other-gateway"
+		c := fake.NewClientBuilder().
+			WithScheme(helpers.TestScheme(helpers.AllOptionalKinds)).
+			WithObjects(gw, foreign).
+			Build()
+		r := &gatewayReconciler{
+			Client: c,
+			logger: hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug)),
+		}
+
+		require.NoError(t, r.ensureEnvoyConfig(t.Context(), gw, nil))
+
+		require.NoError(t, c.Get(t.Context(), cecKey, &ciliumv2.CiliumEnvoyConfig{}))
+	})
+
+	t.Run("no error when no CEC exists", func(t *testing.T) {
+		c := fake.NewClientBuilder().
+			WithScheme(helpers.TestScheme(helpers.AllOptionalKinds)).
+			WithObjects(gw).
+			Build()
+		r := &gatewayReconciler{
+			Client: c,
+			logger: hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug)),
+		}
+
+		require.NoError(t, r.ensureEnvoyConfig(t.Context(), gw, nil))
+	})
 }
 
 func filterHTTPRoute(hrList *gatewayv1.HTTPRouteList, gatewayName string, namespace string) []gatewayv1.HTTPRoute {
@@ -443,114 +818,6 @@ func filterGRPCRoute(hrList *gatewayv1.GRPCRouteList, gatewayName string, namesp
 		}
 	}
 	return filterList
-}
-
-func Test_isValidPemFormat(t *testing.T) {
-	cert := []byte(`-----BEGIN CERTIFICATE-----
-MIIENDCCApygAwIBAgIRAKD/BLFBfwKIZ0WGrHtTH6gwDQYJKoZIhvcNAQELBQAw
-dzEeMBwGA1UEChMVbWtjZXJ0IGRldmVsb3BtZW50IENBMSYwJAYDVQQLDB10YW1t
-YWNoQGZlZG9yYS5sYW4gKFRhbSBNYWNoKTEtMCsGA1UEAwwkbWtjZXJ0IHRhbW1h
-Y2hAZmVkb3JhLmxhbiAoVGFtIE1hY2gpMB4XDTIzMDIyMTExMDg0M1oXDTI1MDUy
-MTEyMDg0M1owUTEnMCUGA1UEChMebWtjZXJ0IGRldmVsb3BtZW50IGNlcnRpZmlj
-YXRlMSYwJAYDVQQLDB10YW1tYWNoQGZlZG9yYS5sYW4gKFRhbSBNYWNoKTCCASIw
-DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMIZy+0JRVjqpWgeq2dP+1oliO4A
-CcZnMg4tSqPalhDQL6Mf68HYLfizyJIpRzMJ905rYd0AcmXmu/g0Eo8ykHxFDz5T
-sePs2XQng8MN4azsRmm1l4f74ovawQzQcb822QP1CS6ILZ3VtwNjRh2nAwthYBMo
-CkngDGeQ8Gl0tjHLFnBdTdSwQRmE2jtDBcAgyEGpq+6ReYt+/47nNn7dCftsVqhE
-BYr9XH3itefHmsbfj7zWFbptdko7q9lMHwnBd+0hd40MmJIXMZrOGGFZjawJDBqS
-sBq2Q3l6XQz8X7P/GA8Dn8h4w3rppmiaN7LOmGXeki3xX2wqnM+0s6aZYZsCAwEA
-AaNhMF8wDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB8GA1Ud
-IwQYMBaAFGQ2DB06CdQFQBsYPye0NBwErUNEMBcGA1UdEQQQMA6CDHVuaXR0ZXN0
-LmNvbTANBgkqhkiG9w0BAQsFAAOCAYEArtHdKWXR6aELpfal17biabCPvIF9j6nw
-uDzcdMYQLrXm8M+NHe8x3dpI7u3lltO+dzLng+nVKQOR3alQACSmRD9c7ie8eT5d
-7zKOTk6keY195I1wVV4jbNLbNWa9y4RJQRTvBLAvAP9NVtUw2Q/w/ErUTqSyz+ob
-dwnt4gYCw6dGnluLxlfF34DB9KflvVNSnkyMB/gsB4A3r1GPOIo0Gyf74ig3FWrS
-wHYKnBbtZfYO0JV0LCoPyHe8g0XajZe8DCbP/E6SmlTNAmJESVjigTTcIBAkFI+n
-toBAdxfhjKUGaClOHS29cpaiynjSayGm4RkHkx7mcAua9lWPf7pSa3mCcFb+wFr3
-ABkHDPJH2acfaUK1vgKTgOwcG/6KA820/PraoSihLaPK/A7eg77r1EeYpt0Neppb
-XjvUp3YmVlIMZXPzrjOsastoDSrsygj5jdVtm4Pslv9nPhzDrBjlZpEJScW4Jlb+
-6wtd7p03UDBSKfTbVROVAe5mvJvA0hoS
------END CERTIFICATE-----
-`)
-	key := []byte(`-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDCGcvtCUVY6qVo
-HqtnT/taJYjuAAnGZzIOLUqj2pYQ0C+jH+vB2C34s8iSKUczCfdOa2HdAHJl5rv4
-NBKPMpB8RQ8+U7Hj7Nl0J4PDDeGs7EZptZeH++KL2sEM0HG/NtkD9QkuiC2d1bcD
-Y0YdpwMLYWATKApJ4AxnkPBpdLYxyxZwXU3UsEEZhNo7QwXAIMhBqavukXmLfv+O
-5zZ+3Qn7bFaoRAWK/Vx94rXnx5rG34+81hW6bXZKO6vZTB8JwXftIXeNDJiSFzGa
-zhhhWY2sCQwakrAatkN5el0M/F+z/xgPA5/IeMN66aZomjeyzphl3pIt8V9sKpzP
-tLOmmWGbAgMBAAECggEAEjASoMJ2og9Ssn/1NbgT6G2N+Cc+wz2WPifWT6ZC2452
-eEWcdMyJ+jz2dWOyzUCI0OtU/z10esH1KRvQBWUKjup1tDRpfd8KvUyalyNs2yRE
-sNEYQuDCaLJ11nqNvgooqatDUf3msFx/Sqz5u/uTWHSmaQUeea+p2eaF8IvEKsQf
-6QNklkeHsv+GVPv+iibfbXXne6I5aV35Rc4Q08zRCgYX/BN1AYXV6ho4RC9dZVGP
-JUkSLzRadegok/EONKkrqLZOFJVb2wtFq85gJ01lODM/gj7GqM59M/wk55CaQIRD
-9x5H4X4rpM2rhmiNLkIN0tGLKO8X31up7hTx9bvJcQKBgQD51MLWYYUPz/umvSrN
-QOT9UhEHI/bxtCbWQthW3L1qrVT7DB8Jko/6/xYlXhl7nwVwJz24jJf9vuxWbBpL
-HZRf0QsDO2/O4rqhKDov/GMUCx2shzc+J7k+T93KNVANYa05guqMeB8n30HProkF
-LgihVFF20k9Z6SibUvgTMpF1EwKBgQDG5MBgc8oFXmlr/7pHKizC4F3eDAXUxVHM
-WCIbSwMyzOXKqDcdXNDz8cQrjhKa2rD1fKhE0oRR+QvHz8IPC+0MsT7Q6QsIHYj5
-CXubHr0s5k8PJAp+Lk2EdHePZQM/I/vj/gSwxnJ9Qs64FWZ25K9zYnNNsiojQel7
-WVmI9IVaWQKBgD3BYggsQwANoV8uE455JCGaT6s8MKa+qXr9Owz9s7TS89a6wFFV
-cVHSDF9gS1xLisSWbqNX3ZpTv4f9YOKAhVTKD7bU0maJlSiREREbikJCHSuwoO80
-Uo4cn+6EDy2/n1pACkp+xvTMMzBrLGOjZW67sQd2JTdMc0Ux1TCpp1sRAoGAaEVI
-rchGYyYp8pqw19o+eTQTQfPforqHta+GwfRDiwBsgCBMNLKSQTHAfG0RR+na1/gw
-Z1ROVoNQL8K1pBnGft71ZaSnSeviAV19Vcd5ue5MCE4GyjwQG57Lh3uXhiShS9fC
-McL4Br9djJh7jV06ti0o8dSzzqQhea9QB0LaHpECgYApc8oBoiK69s0wXyI4+Phx
-ScBJ0XqDBYFkxyXr8Y5pEarEaqCtl1OPPMOiQRDWoxRR+FwA/0laSfh5xw0U3b+q
-iZ2XpkrbQp034rC0UR6p+Km1Sv9AVCACAjrcQ3NZaf8bDOWqvpla7Auq0oG8i6UX
-hEKCKf/N3gE1oMrTxVzUDQ==
------END PRIVATE KEY-----
-`)
-	keyAndCert := append(key, cert...)
-	type args struct {
-		b []byte
-	}
-	tests := []struct {
-		name string
-		args args
-		want bool
-	}{
-		{
-			name: "valid cert pem",
-			args: args{
-				b: cert,
-			},
-			want: true,
-		},
-		{
-			name: "value key pem",
-			args: args{
-				b: key,
-			},
-			want: true,
-		},
-		{
-			name: "multiple valid pem blocks",
-			args: args{
-				b: keyAndCert,
-			},
-			want: true,
-		},
-		{
-			name: "invalid first block",
-			args: args{
-				b: append([]byte("invalid block"), key...),
-			},
-			want: false,
-		},
-		{
-			name: "invalid pem",
-			args: args{
-				b: []byte("invalid pem"),
-			},
-			want: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equalf(t, tt.want, isValidPemFormat(tt.args.b), "isValidPemFormat(%v)", tt.args.b)
-		})
-	}
 }
 
 func Test_sectionNameMatched(t *testing.T) {
@@ -731,7 +998,8 @@ func fakeIndexHTTPRouteByBackendService(rawObj client.Object) []string {
 				continue
 			}
 			namespace := helpers.NamespaceDerefOr(backend.Namespace, route.Namespace)
-			backendServices = append(backendServices,
+			backendServices = append(
+				backendServices,
 				types.NamespacedName{
 					Namespace: namespace,
 					Name:      string(backend.Name),

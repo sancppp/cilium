@@ -5,7 +5,6 @@ package reconciler
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -66,9 +65,13 @@ type ServiceReconciler struct {
 
 // ServiceReconcilerMetadata holds per-instance reconciler state.
 type ServiceReconcilerMetadata struct {
-	ServicePaths               ResourceAFPathsMap
+	// ServicePaths and ServiceRoutePolicies hold actual router state,
+	// must be updated upon unsuccessful partial reconciliation as well.
+	ServicePaths         ResourceAFPathsMap
+	ServiceRoutePolicies ResourceRoutePolicyMap
+
+	// The below reconciler metadata needs to be updated only upon successful reconciliation.
 	ServiceAdvertisements      PeerAdvertisements
-	ServiceRoutePolicies       ResourceRoutePolicyMap
 	FrontendChanges            statedb.ChangeIterator[*loadbalancer.Frontend]
 	FrontendChangesInitialized bool
 }
@@ -175,19 +178,29 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, p ReconcileParams) er
 	metadata := r.getMetadata(p.BGPInstance)
 	reqFullReconcile := r.modifiedServiceAdvertisements(&metadata, desiredPeerAdverts)
 
-	// if frontend changes iterator has not been initialized yet (first reconcile), perform full reconciliation
+	// if frontend changes iterator has not been initialized (first reconcile or a retry), perform full reconciliation
 	if !metadata.FrontendChangesInitialized {
 		reqFullReconcile = true
 	}
 
 	err = r.reconcileServices(ctx, p, &metadata, desiredPeerAdverts, reqFullReconcile)
+	if err != nil {
+		// Preserve partial router state without committing desired advertisements or other metadata.
+		currentMetadata := r.getMetadata(p.BGPInstance)
+		currentMetadata.ServicePaths = metadata.ServicePaths
+		currentMetadata.ServiceRoutePolicies = metadata.ServiceRoutePolicies
 
-	if err == nil {
-		// update svc advertisements in metadata only if the reconciliation was successful
-		metadata.ServiceAdvertisements = desiredPeerAdverts
-		r.setMetadata(p.BGPInstance, metadata)
+		// As the frontend change iterator may have advanced before the failure, force full reconciliation
+		// for the next retry, as otherwise we may miss some events.
+		currentMetadata.FrontendChangesInitialized = false
+		r.setMetadata(p.BGPInstance, currentMetadata)
+		return err
 	}
-	return err
+
+	// update svc advertisements in metadata only if the reconciliation was successful
+	metadata.ServiceAdvertisements = desiredPeerAdverts
+	r.setMetadata(p.BGPInstance, metadata)
+	return nil
 }
 
 func (r *ServiceReconciler) reconcileServices(
@@ -255,29 +268,64 @@ func (r *ServiceReconciler) reconcileServices(
 }
 
 func (r *ServiceReconciler) reconcileSvcRoutePolicies(ctx context.Context, p ReconcileParams, metadata *ServiceReconcilerMetadata, desiredSvcRoutePolicies ResourceRoutePolicyMap) error {
-	var err error
-	for svcKey, desiredSvcRoutePolicies := range desiredSvcRoutePolicies {
-		currentSvcRoutePolicies, exists := metadata.ServiceRoutePolicies[svcKey]
-		if !exists && len(desiredSvcRoutePolicies) == 0 {
+	if len(desiredSvcRoutePolicies) == 0 {
+		return nil
+	}
+
+	currentPolicies := make(RoutePolicyMap)
+	desiredPolicies := make(RoutePolicyMap)
+
+	for svcKey, desiredSvcPolicies := range desiredSvcRoutePolicies {
+		currentSvcPolicies, exists := metadata.ServiceRoutePolicies[svcKey]
+		if !exists && len(desiredSvcPolicies) == 0 {
 			continue
 		}
+		maps.Copy(currentPolicies, currentSvcPolicies)
+		maps.Copy(desiredPolicies, desiredSvcPolicies)
+	}
 
-		updatedSvcRoutePolicies, rErr := ReconcileRoutePolicies(&ReconcileRoutePoliciesParams{
-			Logger:          r.logger.With(types.InstanceLogField, p.DesiredConfig.Name),
-			Ctx:             ctx,
-			Router:          p.BGPInstance.Router,
-			DesiredPolicies: desiredSvcRoutePolicies,
-			CurrentPolicies: currentSvcRoutePolicies,
-		})
+	updatedPolicies, err := ReconcileRoutePolicies(&ReconcileRoutePoliciesParams{
+		Logger:          r.logger.With(types.InstanceLogField, p.DesiredConfig.Name),
+		Ctx:             ctx,
+		Router:          p.BGPInstance.Router,
+		DesiredPolicies: desiredPolicies,
+		CurrentPolicies: currentPolicies,
+	})
 
-		if rErr == nil && len(desiredSvcRoutePolicies) == 0 {
-			delete(metadata.ServiceRoutePolicies, svcKey)
-		} else {
-			metadata.ServiceRoutePolicies[svcKey] = updatedSvcRoutePolicies
+	// Update per-service policy metadata even if reconciliation failed.
+	// The returned updatedPolicies map reflects router state changes that completed before the error.
+	for svcKey, desiredSvcPolicies := range desiredSvcRoutePolicies {
+		currentSvcPolicies, exists := metadata.ServiceRoutePolicies[svcKey]
+		if !exists && len(desiredSvcPolicies) == 0 {
+			continue
 		}
-		err = errors.Join(err, rErr)
+		updatedSvcPolicies := updatedSvcRoutePolicies(updatedPolicies, currentSvcPolicies, desiredSvcPolicies)
+		if len(updatedSvcPolicies) == 0 && len(desiredSvcPolicies) == 0 {
+			delete(metadata.ServiceRoutePolicies, svcKey)
+			continue
+		}
+		metadata.ServiceRoutePolicies[svcKey] = updatedSvcPolicies
 	}
 	return err
+}
+
+// updatedSvcRoutePolicies reconstructs the policies that were installed for a service during policy reconciliation.
+// Both currentSvcPolicies and desiredSvcPolicies needs to be considered:
+//   - currentSvcPolicies cover policies that may still be installed after failed removals or failed updates,
+//   - desiredSvcPolicies cover successfully added or updated policies.
+func updatedSvcRoutePolicies(updatedPolicies, currentSvcPolicies, desiredSvcPolicies RoutePolicyMap) RoutePolicyMap {
+	updatedSvcPolicies := make(RoutePolicyMap, len(currentSvcPolicies)+len(desiredSvcPolicies))
+	for policyName := range currentSvcPolicies {
+		if policy, exists := updatedPolicies[policyName]; exists {
+			updatedSvcPolicies[policyName] = policy
+		}
+	}
+	for policyName := range desiredSvcPolicies {
+		if policy, exists := updatedPolicies[policyName]; exists {
+			updatedSvcPolicies[policyName] = policy
+		}
+	}
+	return updatedSvcPolicies
 }
 
 func (r *ServiceReconciler) getDesiredRoutePolicies(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, toUpdate []*loadbalancer.Service, toRemove []loadbalancer.ServiceName, rx statedb.ReadTxn) (ResourceRoutePolicyMap, error) {
@@ -367,13 +415,16 @@ func (r *ServiceReconciler) modifiedServiceAdvertisements(metadata *ServiceRecon
 }
 
 // hasBackends loops through Frontend backends and returns:
-// 1) true, false - backends > 0, no local backend
-// 2) true, true - backends > 0, at least 1 local backend
-// 3) false, false - no backends, no local backend
+// 1) true, false - active backends > 0, no local backend
+// 2) true, true - active backends > 0, at least 1 local backend
+// 3) false, false - no active backends, no local backend
 func hasBackends(p ReconcileParams, fe *loadbalancer.Frontend) (hasBackends, hasLocalBackends bool) {
 	for backend := range fe.Backends {
+		if backend.State != loadbalancer.BackendStateActive {
+			continue
+		}
 		hasBackends = true
-		if backend.NodeName == p.CiliumNode.Name && backend.State == loadbalancer.BackendStateActive {
+		if backend.NodeName == p.CiliumNode.Name {
 			hasLocalBackends = true
 			return
 		}
@@ -475,7 +526,10 @@ func (r *ServiceReconciler) getServiceAFPaths(p ReconcileParams, desiredPeerAdve
 					for _, prefix := range prefixes.UnsortedList() {
 						// we only add path corresponding to the family of the prefix.
 						if agentFamily.Afi == types.AfiIPv4 && prefix.Addr().Is4() {
-							path := types.NewPathForPrefix(prefix)
+							path, err := types.NewPathForPrefix(prefix)
+							if err != nil {
+								return nil, fmt.Errorf("failed to create path for prefix %s: %w", prefix, err)
+							}
 							// For LoadBalancer IP prefixes, set origin to INCOMPLETE for legacy compatibility.
 							if r.legacyOriginAttributeEnabled && advertType == v2.BGPLoadBalancerIPAddr {
 								path = types.SetPathOriginAttrIncomplete(path)
@@ -484,7 +538,10 @@ func (r *ServiceReconciler) getServiceAFPaths(p ReconcileParams, desiredPeerAdve
 							addPathToAFPathsMap(desiredFamilyAdverts, agentFamily, path)
 						}
 						if agentFamily.Afi == types.AfiIPv6 && prefix.Addr().Is6() {
-							path := types.NewPathForPrefix(prefix)
+							path, err := types.NewPathForPrefix(prefix)
+							if err != nil {
+								return nil, fmt.Errorf("failed to create path for prefix %s: %w", prefix, err)
+							}
 							// For LoadBalancer IP prefixes, set origin to INCOMPLETE for legacy compatibility.
 							if r.legacyOriginAttributeEnabled && advertType == v2.BGPLoadBalancerIPAddr {
 								path = types.SetPathOriginAttrIncomplete(path)
@@ -595,10 +652,10 @@ func (r *ServiceReconciler) getLoadBalancerIPPaths(p ReconcileParams, svc *loadb
 	}
 
 	// Check if this service has a local proxy (Envoy) handling its traffic.
-	// ProxyRedirect is non-nil when the local Envoy proxy is running and configured
+	// ProxyRedirects is non-empty when the local Envoy proxy is running and configured
 	// to handle this service (e.g., Gateway API or Ingress services).
 	// This handles deployments where cilium-envoy has a nodeSelector that excludes some nodes.
-	hasLocalProxy := svc.ProxyRedirect != nil
+	hasLocalProxy := !svc.ProxyRedirects.Empty()
 
 	for _, fe := range frontends {
 		if fe.Type != loadbalancer.SVCTypeLoadBalancer {

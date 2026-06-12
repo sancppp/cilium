@@ -34,6 +34,7 @@ import (
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/revert"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -206,6 +207,9 @@ func (mgr *endpointManager) UpdatePolicyMaps(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, mgr.config.EndpointPolicyUpdateTimeout)
 	defer cancel()
 
+	var guard lock.Mutex
+	var finalizeList revert.FinalizeList
+	var revertStack revert.RevertStack
 	proxyWaitGroup := completion.NewWaitGroup(ctx)
 
 	eps := mgr.GetEndpoints()
@@ -213,7 +217,13 @@ func (mgr *endpointManager) UpdatePolicyMaps(ctx context.Context) error {
 
 	for _, ep := range eps {
 		go func(ep *endpoint.Endpoint) {
-			if err := ep.ApplyPolicyMapChanges(proxyWaitGroup); err != nil && !errors.Is(err, endpoint.ErrNotAlive) {
+			err, rf, ff := ep.ApplyPolicyMapChanges(proxyWaitGroup)
+			guard.Lock()
+			revertStack.Push(rf)
+			finalizeList.Append(ff)
+			guard.Unlock()
+
+			if err != nil && !errors.Is(err, endpoint.ErrNotAlive) {
 				ep.Logger("endpointmanager").Warn("Failed to apply policy map changes. These will be re-applied in future updates.", logfields.Error, err)
 			}
 			wg.Done()
@@ -224,9 +234,18 @@ func (mgr *endpointManager) UpdatePolicyMaps(ctx context.Context) error {
 	// changes before waiting for the changes to be ACKed
 	wg.Wait()
 
+	// wait for proxy completions can return with no error immediately without waiting for
+	// anything if all Endpoint updates failed synchronously, but even in that case calling the
+	// finalize functions is the right thing to do.
 	err := mgr.waitForProxyCompletions(proxyWaitGroup)
+
+	// no endpoint locks needed here, as ApplyPolicyMapChanges currently collects
+	// revert/finalize functions only from UpdateNetworkPolicy
 	if err != nil {
+		revertStack.Revert()
 		mgr.logger.Warn("Failed to apply L7 proxy policy changes. These will be re-applied in future updates.", logfields.Error, err)
+	} else {
+		finalizeList.Finalize()
 	}
 
 	// Perform policy update call if required.
@@ -454,37 +473,43 @@ func (mgr *endpointManager) unexpose(ep *endpoint.Endpoint) {
 	defer ep.Close()
 	identifiers := ep.Identifiers()
 
-	previousState := ep.GetState()
-
 	mgr.mutex.Lock()
 	defer mgr.mutex.Unlock()
 
-	// This must be done before the ID is released for the endpoint!
 	delete(mgr.endpoints, ep.ID)
 	mgr.mcastManager.RemoveAddress(ep.IPv6)
-
-	// We haven't yet allocated the ID for a restoring endpoint, so no
-	// need to release it.
-	if previousState != endpoint.StateRestoring {
-		if err := mgr.epIDAllocator.release(ep.ID); err != nil {
-			mgr.logger.Warn(
-				"Unable to release endpoint ID",
-				logfields.Error, err,
-				logfields.State, previousState,
-				logfields.CNIAttachmentID, identifiers[endpointid.CNIAttachmentIdPrefix],
-				logfields.CEPName, identifiers[endpointid.CEPNamePrefix],
-			)
-		}
-	}
-
 	mgr.removeReferencesLocked(identifiers)
+}
+
+// releaseID returns the endpoint ID to the allocator pool. It must be called
+// only after ep.Delete has removed the endpoint's state directories, so a new
+// endpoint cannot reuse the ID before cleanup completes.
+func (mgr *endpointManager) releaseID(ep *endpoint.Endpoint) {
+	if err := mgr.epIDAllocator.release(ep.ID); err != nil {
+		identifiers := ep.Identifiers()
+		mgr.logger.Warn(
+			"Unable to release endpoint ID",
+			logfields.Error, err,
+			logfields.State, ep.GetState(),
+			logfields.CNIAttachmentID, identifiers[endpointid.CNIAttachmentIdPrefix],
+			logfields.CEPName, identifiers[endpointid.CEPNamePrefix],
+		)
+	}
 }
 
 // removeEndpoint stops the active handling of events by the specified endpoint,
 // and prevents the endpoint from being globally accessible via other packages.
 func (mgr *endpointManager) removeEndpoint(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) []error {
+	// Capture before ep.Delete moves the state to StateDisconnecting.
+	isRestored := ep.GetState() == endpoint.StateRestoring
+
 	mgr.unexpose(ep)
 	result := ep.Delete(conf)
+
+	// Restored endpoints never had an ID allocated.
+	if !isRestored {
+		mgr.releaseID(ep)
+	}
 
 	if !option.Config.DryMode {
 		_ = mgr.monitorAgent.SendEvent(monitorAPI.MessageTypeAgent, monitorAPI.EndpointDeleteMessage(ep))
@@ -632,6 +657,21 @@ func (mgr *endpointManager) TriggerRegenerateAllEndpoints() {
 	mgr.controllers.TriggerController(regenEndpointControllerName)
 
 	// Trigger regeneration of all Endpoint Policies
+	mgr.policyUpdateCallback(&sync.WaitGroup{}, nil, false)
+}
+
+// RegenerateAllForPolicy regenerates all endpoints against the given policy
+// revision. Each endpoint's regeneration blocks until the compute cell has
+// published the SelectorPolicy for its identity at waitFor, ensuring
+// endpoints pick up the new policy instead of the stale one.
+func (mgr *endpointManager) RegenerateAllForPolicy(waitFor uint64) {
+	go mgr.RegenerateAllEndpoints(&regeneration.ExternalRegenerationMetadata{
+		Reason:                  regeneration.ReasonPolicyUpdate,
+		Message:                 "policy rules updated",
+		RegenerationLevel:       regeneration.RegenerateWithoutDatapath,
+		PolicyRevisionToWaitFor: waitFor,
+	})
+
 	mgr.policyUpdateCallback(&sync.WaitGroup{}, nil, false)
 }
 

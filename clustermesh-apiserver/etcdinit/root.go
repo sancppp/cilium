@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -96,7 +96,7 @@ func InitEtcdLocal(log *slog.Logger) (returnErr error) {
 	defer cancelFn()
 
 	if debug {
-		logging.SetLogLevelToDebug()
+		logging.SetLogLevel(slog.LevelDebug)
 	}
 	log.Debug("Debug logging enabled")
 
@@ -125,7 +125,7 @@ func InitEtcdLocal(log *slog.Logger) (returnErr error) {
 			logfields.EtcdDataDir, etcdDataDir,
 			logfields.Path, d.Name(),
 		)
-		err = os.RemoveAll(path.Join(etcdDataDir, d.Name()))
+		err = os.RemoveAll(filepath.Join(etcdDataDir, d.Name()))
 		if err != nil {
 			log.Error(
 				"Failed to remove pre-existing file/directory in etcd data directory",

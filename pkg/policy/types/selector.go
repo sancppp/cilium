@@ -154,6 +154,8 @@ func ToSelector[T APISelector](peer T) Selector {
 		return newCIDRRuleSelector(v)
 	case api.FQDNSelector:
 		return newFqdnSelector(v)
+	case api.Groups:
+		return NewLabelSelector(v.GetAsEndpointSelector())
 	}
 
 	return nil
@@ -427,6 +429,7 @@ type CIDRSelector struct {
 	key          string
 	requirements Requirements
 	generated    bool // only needed for current unit tests via Selectors.CIDRRules()
+	encoded      bool // true for CIDRGroupSelector: use key+value encoded matching
 }
 
 func (p *CIDRSelector) MarshalJSON() ([]byte, error) {
@@ -481,6 +484,7 @@ func newCIDRRuleSelector(rule api.CIDRRule) (ps *CIDRSelector) {
 		es := rule.CIDRGroupSelector
 		requirements := LabelSelectorToRequirements(es.LabelSelector)
 		ps = newCIDRSelectorFromRequirements(key, requirements, rule.ExceptCIDRs)
+		ps.encoded = true
 	default: // rule.Cidr != ""
 		ps = NewCIDRSelector(key, rule.Cidr, rule.ExceptCIDRs)
 	}
@@ -507,6 +511,9 @@ func (p *CIDRSelector) SelectedNamespaces() []string {
 }
 
 func (p *CIDRSelector) Matches(ls labels.LabelArray) bool {
+	if p.encoded {
+		return matchesEncodedRequirements(p.requirements, ls)
+	}
 	return MatchesRequirements(p.requirements, ls)
 }
 

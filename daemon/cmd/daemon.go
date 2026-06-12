@@ -154,7 +154,8 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 		}
 
 		if params.DaemonConfig.IPAM == ipamOption.IPAMClusterPool ||
-			params.DaemonConfig.IPAM == ipamOption.IPAMMultiPool {
+			params.DaemonConfig.IPAM == ipamOption.IPAMMultiPool ||
+			params.DaemonConfig.IPAM == ipamOption.IPAMENI {
 			// Create the CiliumNode custom resource. This call will block until
 			// the custom resource has been created
 			params.NodeDiscovery.UpdateCiliumNodeResource()
@@ -249,7 +250,7 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 		return err
 	}
 
-	if err := params.IPsecAgent.StartBackgroundJobs(params.NodeHandler); err != nil {
+	if err := params.IPsecAgent.StartBackgroundJobs(params.NodeHandler, params.Orchestrator.DatapathInitialized()); err != nil {
 		params.Logger.Error("Unable to start IPsec key watcher", logfields.Error, err)
 	}
 
@@ -322,11 +323,12 @@ func unloadDNSPolicies(params daemonParams) {
 			"Triggering policy recalculation to remove DNS rules due to option",
 			logfields.Option, option.DNSPolicyUnloadOnShutdown,
 		)
-		params.Policy.BumpRevision()
 		regenerationMetadata := &regeneration.ExternalRegenerationMetadata{
 			Reason:            regeneration.ReasonDaemonConfigUpdate,
 			Message:           "unloading DNS rules on graceful shutdown",
 			RegenerationLevel: regeneration.RegenerateWithoutDatapath,
+
+			PolicyRevisionToWaitFor: params.Policy.BumpRevision(),
 		}
 		wg := params.EndpointManager.RegenerateAllEndpoints(regenerationMetadata)
 		wg.Wait()

@@ -33,7 +33,6 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
@@ -81,9 +80,7 @@ type nodeEntry struct {
 type IPCache interface {
 	GetMetadataSourceByPrefix(prefix cmtypes.PrefixCluster) source.Source
 	UpsertMetadata(prefix cmtypes.PrefixCluster, src source.Source, resource ipcacheTypes.ResourceID, aux ...ipcache.IPMetadata)
-	OverrideIdentity(prefix cmtypes.PrefixCluster, identityLabels labels.Labels, src source.Source, resource ipcacheTypes.ResourceID)
 	RemoveMetadata(prefix cmtypes.PrefixCluster, resource ipcacheTypes.ResourceID, aux ...ipcache.IPMetadata)
-	RemoveIdentityOverride(prefix cmtypes.PrefixCluster, identityLabels labels.Labels, resource ipcacheTypes.ResourceID)
 	UpsertMetadataBatch(updates ...ipcache.MU) (revision uint64)
 	RemoveMetadataBatch(updates ...ipcache.MU) (revision uint64)
 }
@@ -620,8 +617,8 @@ func (m *manager) endpointEncryptionKey(n *nodeTypes.Node) ipcacheTypes.EncryptK
 	return ipcacheTypes.EncryptKey(n.EncryptionKey)
 }
 
-func (m *manager) nodeIdentityLabels(n nodeTypes.Node) (nodeLabels labels.Labels, hasOverride bool) {
-	nodeLabels = labels.NewFrom(labels.LabelRemoteNode)
+func (m *manager) nodeIdentityLabels(n nodeTypes.Node) labels.Labels {
+	nodeLabels := labels.NewFrom(labels.LabelRemoteNode)
 	if n.IsLocal() {
 		nodeLabels = labels.NewFrom(labels.LabelHost)
 		if m.conf.PolicyCIDRMatchesNodes() {
@@ -640,21 +637,18 @@ func (m *manager) nodeIdentityLabels(n nodeTypes.Node) (nodeLabels labels.Labels
 				}
 			}
 		}
-	} else if !identity.NumericIdentity(n.NodeIdentity).IsReservedIdentity() {
-		// This needs to match clustermesh-apiserver's VMManager.AllocateNodeIdentity
-		nodeLabels = labels.Map2Labels(n.Labels, labels.LabelSourceK8s)
-		hasOverride = true
 	}
 
 	if option.Config.PerNodeLabelsEnabled() {
 		lbls := labels.Map2Labels(n.Labels, labels.LabelSourceNode)
-		clusterLabel := labels.NewLabel(k8sConst.PolicyLabelCluster, n.Cluster, labels.LabelSourceK8s)
-		lbls[clusterLabel.Key] = clusterLabel
 		filteredLbls, _ := labelsfilter.FilterNodeLabels(lbls)
 		nodeLabels.MergeLabels(filteredLbls)
+		nodeLabels.MergeLabels(labels.Map2Labels(map[string]string{
+			k8sConst.PolicyLabelCluster: n.Cluster,
+		}, labels.LabelSourceK8s))
 	}
 
-	return nodeLabels, hasOverride
+	return nodeLabels
 }
 
 // worldLabelForPrefix returns the labels which will resolve to
@@ -698,7 +692,7 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 	}
 
 	resource := ipcacheTypes.NewResourceID(ipcacheTypes.ResourceKindNode, "", n.Name)
-	nodeLabels, nodeIdentityOverride := m.nodeIdentityLabels(n)
+	nodeLabels := m.nodeIdentityLabels(n)
 
 	var ipsetEntries []netip.Prefix
 	var nodeIPsAdded, healthIPsAdded, ingressIPsAdded, podCIDRsAdded []netip.Prefix
@@ -764,9 +758,6 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 			ipcacheTypes.TunnelPeer{Addr: tunnelIP},
 			ipcacheTypes.EncryptKey(key),
 			endpointFlags)
-		if nodeIdentityOverride {
-			m.ipcache.OverrideIdentity(prefixCluster, nodeLabels, n.Source, resource)
-		}
 		nodeIPsAdded = append(nodeIPsAdded, prefixCluster.AsPrefix())
 	}
 
@@ -969,7 +960,7 @@ func (m *manager) removeNodeFromIPCache(oldNode nodeTypes.Node, resource ipcache
 		// See comment in NodeUpdated().
 		oldNodeIP, _ = netipx.FromStdIP(nIP)
 	}
-	oldNodeLabels, oldNodeIdentityOverride := m.nodeIdentityLabels(oldNode)
+	oldNodeLabels := m.nodeIdentityLabels(oldNode)
 
 	// Delete the old node IP addresses if they have changed in this node.
 	var v4Addrs, v6Addrs []netip.Addr
@@ -1022,9 +1013,6 @@ func (m *manager) removeNodeFromIPCache(oldNode nodeTypes.Node, resource ipcache
 			ipcacheTypes.TunnelPeer{Addr: oldTunnelIP},
 			ipcacheTypes.EncryptKey(oldKey),
 			oldEndpointFlags)
-		if oldNodeIdentityOverride {
-			m.ipcache.RemoveIdentityOverride(oldPrefixCluster, oldNodeLabels, resource)
-		}
 	}
 
 	m.ipsetMgr.RemoveFromIPSet(ipset.CiliumNodeIPSetV4, v4Addrs...)
